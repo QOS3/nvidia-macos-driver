@@ -1141,6 +1141,14 @@ uint32_t nvmtl_function_spv_fnv(id f)
 uint64_t nvmtl_function_air_key(id f)
 {
     if (![f isKindOfClass:[NVMTLFunction class]]) return 0;
+#if NVMTL_RELEASE
+    // Both readers are diagnostic: the pipeline key line (written only for a process that opted in to logging) and the
+    // device-loss dispatch record (NVMTL_LOSS_RECORDS=1). The sha256 runs over the whole AIR text of every new function
+    // object, and VideoToolbox makes new ones all the time: ~4.8 s of CPU in DisplaysExt per visit to Displays.
+    static int want = -1;
+    if (want < 0) { const char *e = getenv("NVMTL_LOSS_RECORDS"); want = nvmtl_process_env_on() || (e && e[0] == '1'); }
+    if (!want) return 0;
+#endif
     NVMTLFunction *fn = f; static char kKey;
     NSNumber *h = objc_getAssociatedObject(fn, &kKey);
     if (h) return h.unsignedLongLongValue;
