@@ -1041,8 +1041,16 @@ static OSStatus d_startTileSession(VTVideoDecoderRef o, VTVideoDecoderSession se
     free(pp);
     CFTypeRef frExt = CMFormatDescriptionGetExtension(fmt, kCMFormatDescriptionExtension_FullRangeVideo);
     if (frExt && CFGetTypeID(frExt) == CFBooleanGetTypeID()) full = CFBooleanGetValue((CFBooleanRef)frExt);
-    const bool ok = cf >= 0 && (cf == 1 || cf == 3) && (depth == 8 || depth == 10) && cdepth == depth && W >= 64 && H >= 64 && W <= 8192 && H <= 8192;
-    DLOG("startTileSession: HEVC tile %dx%d (coded %ux%u), %d-bit, chroma %d, %s range%s", cw, ch, W, H, depth, cf, full ? "full" : "video", ok ? "" : " - NOT SUPPORTED");
+    // Small single-tile HEIC thumbnails (e.g. App Store / web cards 450x256..1640x1024) open a whole session for
+    // 1 tile: NVDEC open/close (~15-20 ms of NVRM ioctls) + BAR1 CPU untile is slower than AVX2 VCPHEVC (~1-3 ms)
+    // and stalls scrolling. Keep NVDEC for standard multi-tile HEIC grids (512x512 / 1024x1024) and large >= 2 MP
+    // single tiles. NVDEC_TILE_ALL=1 forces NVDEC for every tile >= 64x64.
+    const bool bigOrGrid = (W == 512 && H == 512) || (W == 1024 && H == 1024)
+                        || ((uint64_t)W * (uint64_t)H >= 2000000ull)
+                        || getenv("NVDEC_TILE_ALL") != NULL;
+    const bool ok = bigOrGrid && cf >= 0 && (cf == 1 || cf == 3) && (depth == 8 || depth == 10) && cdepth == depth && W >= 64 && H >= 64 && W <= 8192 && H <= 8192;
+    DLOG("startTileSession: HEVC tile %dx%d (coded %ux%u), %d-bit, chroma %d, %s range%s", cw, ch, W, H, depth, cf, full ? "full" : "video",
+         ok ? "" : (!bigOrGrid ? " - small single-tile, routing to SW" : " - NOT SUPPORTED"));
     if (!ok) { pthread_mutex_unlock(&s->lock); return kVTVideoDecoderUnsupportedDataFormatErr; }
     s->w = cw; s->h = ch;
     if (!(s->hevc = calloc(1, sizeof *s->hevc)) || rm_open(&s->rm) || rm_va_init(&s->rm) || hevcdec_open(s->hevc, &s->rm, W, H, depth, cf)) {
