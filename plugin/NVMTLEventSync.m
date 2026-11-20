@@ -890,7 +890,16 @@ static void nvmtl_ahead_kick(void) {
 static void nvmtl_pump_buffers(void) {
     static dispatch_once_t once; static dispatch_queue_t worker;
     const BOOL async = nvmtl_async_commit_on();
-    if (async) dispatch_once(&once, ^{ worker = dispatch_queue_create("nvmtl.execution", DISPATCH_QUEUE_SERIAL); });
+    // The worker marks command buffers scheduled and completed, and WindowServer's and every app's main thread wait for
+    // that (commitAndWaitUntilSubmitted, waitUntilScheduled). With no QoS it ran at priority 31-37 while those waiters
+    // ran at 47-79, so under load a frame waited for a low-priority thread: 35 of 1501 WindowServer main-thread samples
+    // in waitUntilScheduled during an App Store scroll. User-interactive like nvmtl.ahead and nvmtl.present.
+    // NVMTL_EXEC_QOS=0: the old default-QoS queue.
+    if (async) dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_EXEC_QOS"); const BOOL hi = !(e && e[0] == '0');
+        worker = dispatch_queue_create("nvmtl.execution", hi ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0) : DISPATCH_QUEUE_SERIAL);
+        nvlog("commit: execution worker QoS %s (NVMTL_EXEC_QOS=%s)", hi ? "user-interactive" : "default", e ? e : "unset");
+    });
     if (!async) { nvmtl_vk_clock_refresh(); nvmtl_pump_buffers_sync(); return; }
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_pending_buffers.count) return;
