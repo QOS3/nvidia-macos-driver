@@ -51,7 +51,9 @@ typedef struct {
     OSStatus (*copySerializableProperties)(VTVideoDecoderRef, CFAllocatorRef, CFDictionaryRef *);
     Boolean  (*canAcceptFormatDescription)(VTVideoDecoderRef, CMFormatDescriptionRef);
     OSStatus (*finishDelayedFrames)(VTVideoDecoderRef);
-    void *reserved[3];
+    OSStatus (*startTileSession)(VTVideoDecoderRef, VTVideoDecoderSession, CMVideoFormatDescriptionRef);
+    OSStatus (*decodeTile)(VTVideoDecoderRef, VTVideoDecoderFrame, CMSampleBufferRef, uint64_t, uint64_t, CVPixelBufferRef, uint64_t, VTDecodeFrameFlags, VTDecodeInfoFlags *);
+    void *reserved[1];
 } DecoderClass;
 #pragma pack(pop)
 typedef struct { CMBaseVTable base; const DecoderClass *decoderClass; } DecoderVTable;
@@ -913,6 +915,252 @@ static OSStatus d_finishDelayed(VTVideoDecoderRef o)
     return noErr;
 }
 
+// ---- HEVC tile decoder (VTTileDecompressionSession / HEIC still images) ----
+// VideoToolbox discovers tile decoding via DecoderClass version 3 (slots 7 & 8: startTileSession / decodeTile) on the
+// same VTVideoDecoder class. Each HEIC tile is an independent HEVC IDR picture decoded by NVDEC and untiled directly
+// into the caller's destination canvas CVPixelBuffer at (dstX, dstY).
+// Kill switch: NVENCVT_NO_TILE=1 or /Library/GPUBundles/nvmtl/no-heic-tile.
+typedef OSStatus (*VTTileSetReqsFn)(VTVideoDecoderSession, CFDictionaryRef, CFDictionaryRef);
+typedef OSStatus (*VTTileEmitFn)(VTVideoDecoderSession, VTVideoDecoderFrame, OSStatus, VTDecodeInfoFlags, CVImageBufferRef);
+
+static bool tile_syms_ready(VTTileSetReqsFn *setReqs, VTTileEmitFn *emitTile)
+{
+    static VTTileSetReqsFn sSet = NULL;
+    static VTTileEmitFn sEmit = NULL;
+    static bool done = false;
+    if (!done) {
+        sSet = (VTTileSetReqsFn)dlsym(RTLD_DEFAULT, "VTTileDecoderSessionSetTileDecodeRequirements");
+        sEmit = (VTTileEmitFn)dlsym(RTLD_DEFAULT, "VTTileDecoderSessionEmitDecodedTile");
+        if (!sEmit) sEmit = (VTTileEmitFn)dlsym(RTLD_DEFAULT, "VTDecoderSessionEmitDecodedTile");
+        done = true;
+    }
+    if (setReqs) *setReqs = sSet;
+    if (emitTile) *emitTile = sEmit;
+    return sSet != NULL && sEmit != NULL;
+}
+
+static bool heic_tile_enabled(void)
+{
+    if (getenv("NVENCVT_NO_TILE")) return false;
+    if (nvencvt_flag("/Library/GPUBundles/nvmtl/no-heic-tile") == 0) return false;
+    return tile_syms_ready(NULL, NULL);
+}
+
+static void dict_add_sym_int(CFMutableDictionaryRef dict, const char *symName, int32_t val)
+{
+    CFStringRef *keyPtr = (CFStringRef *)dlsym(RTLD_DEFAULT, symName);
+    if (!keyPtr || !*keyPtr) return;
+    CFNumberRef num = CFNumberCreate(NULL, kCFNumberSInt32Type, &val);
+    if (num) { CFDictionarySetValue(dict, *keyPtr, num); CFRelease(num); }
+}
+
+static void dict_add_sym_bool(CFMutableDictionaryRef dict, const char *symName, Boolean val)
+{
+    CFStringRef *keyPtr = (CFStringRef *)dlsym(RTLD_DEFAULT, symName);
+    if (!keyPtr || !*keyPtr) return;
+    CFDictionarySetValue(dict, *keyPtr, val ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+static OSStatus d_startTileSession(VTVideoDecoderRef o, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt)
+{
+    DState *s = dstate(o);
+    if (!s || s->codec != kCMVideoCodecType_HEVC || !NV_HEVC_HDR) return kVTVideoDecoderUnsupportedDataFormatErr;
+    VTTileSetReqsFn setReqs = NULL; VTTileEmitFn emitTile = NULL;
+    if (!tile_syms_ready(&setReqs, &emitTile)) return kVTVideoDecoderUnsupportedDataFormatErr;
+    pthread_mutex_lock(&s->lock);
+    s->session = session;
+    if (s->fmt) CFRelease(s->fmt);
+    s->fmt = (CMVideoFormatDescriptionRef)CFRetain(fmt);
+    size_t count = 0; int nalLen = 4;
+    OSStatus st = NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 0, NULL, NULL, &count, &nalLen), kVTVideoDecoderUnsupportedDataFormatErr);
+    if (st || !count) { DLOG("startTileSession: no HEVC parameter sets (%d)", (int)st); pthread_mutex_unlock(&s->lock); return kVTVideoDecoderBadDataErr; }
+    s->nalLen = nalLen;
+    HevcParams *pp = calloc(1, sizeof *pp);
+    if (!pp) { pthread_mutex_unlock(&s->lock); return kVTVideoDecoderMalfunctionErr; }
+    unsigned W = 0, H = 0; int depth = 0, cdepth = 0, cf = -1, cw = 0, ch = 0; bool full = false;
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *ps; size_t n;
+        if (NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &ps, &n, NULL, NULL), 1) || n < 2 || ((ps[0] >> 1) & 63) != HEVC_NAL_SPS) continue;
+        const int id = hevc_parse_sps(pp, ps, n); if (id < 0) continue;
+        const HevcSps *sp = &pp->sps[id];
+        if ((unsigned)sp->width > W) W = (unsigned)sp->width;
+        if ((unsigned)sp->height > H) H = (unsigned)sp->height;
+        if (cf < 0) {
+            depth = sp->bit_depth_luma; cdepth = sp->bit_depth_chroma; cf = sp->chroma_format_idc; full = sp->video_full_range_flag;
+            cw = sp->width - sp->conf_win_left - sp->conf_win_right; ch = sp->height - sp->conf_win_top - sp->conf_win_bottom;
+        }
+    }
+    free(pp);
+    CFTypeRef frExt = CMFormatDescriptionGetExtension(fmt, kCMFormatDescriptionExtension_FullRangeVideo);
+    if (frExt && CFGetTypeID(frExt) == CFBooleanGetTypeID()) full = CFBooleanGetValue((CFBooleanRef)frExt);
+    const bool ok = cf >= 0 && (cf == 1 || cf == 3) && (depth == 8 || depth == 10) && cdepth == depth && W >= 64 && H >= 64 && W <= 8192 && H <= 8192;
+    DLOG("startTileSession: HEVC tile %dx%d (coded %ux%u), %d-bit, chroma %d, %s range%s", cw, ch, W, H, depth, cf, full ? "full" : "video", ok ? "" : " - NOT SUPPORTED");
+    if (!ok) { pthread_mutex_unlock(&s->lock); return kVTVideoDecoderUnsupportedDataFormatErr; }
+    s->w = cw; s->h = ch;
+    if (!(s->hevc = calloc(1, sizeof *s->hevc)) || rm_open(&s->rm) || rm_va_init(&s->rm) || hevcdec_open(s->hevc, &s->rm, W, H, depth, cf)) {
+        DLOG("startTileSession: NVDEC session failed"); free(s->hevc); s->hevc = NULL; pthread_mutex_unlock(&s->lock); return kVTVideoDecoderMalfunctionErr;
+    }
+    s->opened = true;
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *ps; size_t n;
+        if (!NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &ps, &n, NULL, NULL), 1) && n) hevcdec_nal(s->hevc, ps, n);
+    }
+    const OSType pfFull = cf == 3 ? (depth == 8 ? kCVPixelFormatType_444YpCbCr8BiPlanarFullRange : kCVPixelFormatType_444YpCbCr10BiPlanarFullRange)
+                                  : (depth == 8 ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
+    const OSType pfVid  = cf == 3 ? (depth == 8 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange)
+                                  : (depth == 8 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange);
+    s->pf = full ? pfFull : pfVid;
+
+    CFMutableArrayRef pfs = CFArrayCreateMutable(NULL, 2, &kCFTypeArrayCallBacks);
+    OSType order[2] = { full ? pfFull : pfVid, full ? pfVid : pfFull };
+    for (int i = 0; i < 2; i++) {
+        CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &order[i]);
+        if (n) { CFArrayAppendValue(pfs, n); CFRelease(n); }
+    }
+    CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef pbAttrs = CFDictionaryCreateMutable(NULL, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(pbAttrs, kCVPixelBufferPixelFormatTypeKey, pfs);
+    CFDictionarySetValue(pbAttrs, kCVPixelBufferIOSurfacePropertiesKey, ios);
+    CFDictionarySetValue(pbAttrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+
+    CFMutableDictionaryRef reqs = CFDictionaryCreateMutable(NULL, 10, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MinimumTileWidth", 64);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MinimumTileHeight", 64);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumTileWidth", 4096);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumTileHeight", 4096);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_TileWidthPixelAlignment", cf == 1 ? 2 : 1);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_TileHeightPixelAlignment", cf == 1 ? 2 : 1);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_TileByteAlignment", depth > 8 ? 2 : 1);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumCanvasWidth", 32768);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumCanvasHeight", 32768);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumCanvasRowBytes", 131072);
+    dict_add_sym_bool(reqs, "kVTTileDecoderRequirement_DecoderCanClipEdges", true);
+
+    st = setReqs(session, pbAttrs, reqs);
+    CFRelease(pfs); CFRelease(ios); CFRelease(pbAttrs); CFRelease(reqs);
+
+    if (s->colour) CFRelease(s->colour);
+    CFMutableDictionaryRef col = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const CFStringRef ck[] = { kCMFormatDescriptionExtension_ColorPrimaries, kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix,
+                               NV13_DO(kCMFormatDescriptionExtension_MasteringDisplayColorVolume, kCMFormatDescriptionExtension_ContentLightLevelInfo) };
+    for (int i = 0; i < (int)(sizeof ck / sizeof ck[0]); i++) { CFTypeRef x = CMFormatDescriptionGetExtension(fmt, ck[i]); if (x) CFDictionarySetValue(col, ck[i], x); }
+    s->colour = col;
+    DLOG("startTileSession: SetTileDecodeRequirements -> %d", (int)st);
+    pthread_mutex_unlock(&s->lock);
+    return st;
+}
+
+static bool tile_pf_matches(OSType pf, int bps, int cf)
+{
+    if (cf == 1 && bps == 1) return pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    if (cf == 1 && bps == 2) return pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange || pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    if (cf == 3 && bps == 1) return pf == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange || pf == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange;
+    if (cf == 3 && bps == 2) return pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange || pf == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange;
+    return false;
+}
+
+static OSStatus d_decodeTile(VTVideoDecoderRef o, VTVideoDecoderFrame tileFrame, CMSampleBufferRef sb,
+                             uint64_t a4, uint64_t a5, CVPixelBufferRef dstCanvas, uint64_t dstXY,
+                             VTDecodeFrameFlags flags, VTDecodeInfoFlags *infoOut)
+{
+    (void)a4; (void)a5; (void)flags;
+    DState *s = dstate(o);
+    if (infoOut) *infoOut = 0;
+    VTTileEmitFn emitTile = NULL;
+    if (!s || !tile_syms_ready(NULL, &emitTile)) return kVTVideoDecoderMalfunctionErr;
+    const double tA = nowms();
+    pthread_mutex_lock(&s->lock);
+    OSStatus res = noErr;
+    const uint32_t dstX = (uint32_t)(dstXY & 0xffffffffu);
+    const uint32_t dstY = (uint32_t)(dstXY >> 32);
+    CMBlockBufferRef bb = sb ? CMSampleBufferGetDataBuffer(sb) : NULL;
+    size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0, avail = 0; char *p = NULL;
+    if (!len || !s->opened || !s->hevc || !dstCanvas) res = kVTVideoDecoderBadDataErr;
+    else if (!tile_pf_matches(CVPixelBufferGetPixelFormatType(dstCanvas), s->hevc->bps, s->hevc->chroma_format)) res = kVTVideoDecoderUnsupportedDataFormatErr;
+    else if (CMBlockBufferGetDataPointer(bb, 0, &avail, NULL, &p) || avail < len) {
+        if (s->tmpCap < len) { free(s->tmp); s->tmp = malloc(len); s->tmpCap = s->tmp ? len : 0; }
+        if (!s->tmp || CMBlockBufferCopyDataBytes(bb, 0, len, s->tmp)) res = kVTVideoDecoderBadDataErr; else p = (char *)s->tmp;
+    }
+    // If the sample carries a different format description, feed its HEVC parameter sets before decoding the tile.
+    if (!res && sb) {
+        CMVideoFormatDescriptionRef sfmt = CMSampleBufferGetFormatDescription(sb);
+        if (sfmt && (!s->fmt || !CFEqual(sfmt, s->fmt))) {
+            size_t cnt = 0; int nl = s->nalLen;
+            if (!NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(sfmt, 0, NULL, NULL, &cnt, &nl), 1) && cnt) {
+                s->nalLen = nl;
+                for (size_t i = 0; i < cnt; i++) {
+                    const uint8_t *ps; size_t n;
+                    if (!NV13(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(sfmt, i, &ps, &n, NULL, NULL), 1) && n) hevcdec_nal(s->hevc, ps, n);
+                }
+            }
+            if (s->fmt) CFRelease(s->fmt);
+            s->fmt = (CMVideoFormatDescriptionRef)CFRetain(sfmt);
+        }
+    }
+    int r = 0;
+    if (!res) {
+        HevcDec *d = s->hevc;
+        size_t pos = 0; const uint8_t *nal; size_t n;
+        while (r >= 0 && hevc_next_lenpfx((const uint8_t *)p, len, s->nalLen, &pos, &nal, &n)) { int q = hevcdec_nal(d, nal, n); if (q) r = q; }
+        if (r >= 0) { int q = hevcdec_flush(d); if (q) r = q; }
+        if (r < 0) res = kVTVideoDecoderBadDataErr;
+    }
+    if (!res && r == 1) {
+        HevcDec *d = s->hevc;
+        s->tEngine += d->engine_ms;
+        const double tc = nowms();
+        const size_t canvasW = CVPixelBufferGetWidth(dstCanvas);
+        const size_t canvasH = CVPixelBufferGetHeight(dstCanvas);
+        const size_t bps = (size_t)d->bps;
+        const unsigned sx = d->chroma_format == 3 ? 0 : 1;
+        const unsigned sy = d->chroma_format == 1 ? 1 : 0;
+        if ((dstX & sx) || (dstY & sy) || dstX >= canvasW || dstY >= canvasH) {
+            res = kVTParameterErr;
+        } else {
+            unsigned copyW = (unsigned)d->cur_w;
+            unsigned copyH = (unsigned)d->cur_h;
+            if ((size_t)dstX + copyW > canvasW) copyW = (unsigned)(canvasW - dstX);
+            if ((size_t)dstY + copyH > canvasH) copyH = (unsigned)(canvasH - dstY);
+            if (CVPixelBufferLockBaseAddress(dstCanvas, 0) == kCVReturnSuccess) {
+                uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dstCanvas, 0);
+                uint8_t *uvBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dstCanvas, 1);
+                const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(dstCanvas, 0);
+                const size_t uvs = CVPixelBufferGetBytesPerRowOfPlane(dstCanvas, 1);
+                if (yBase && uvBase) {
+                    uint8_t *yDst = yBase + (size_t)dstY * ys + (size_t)dstX * bps;
+                    uint8_t *uvDst = uvBase + (size_t)(dstY >> sy) * uvs + (size_t)(dstX >> sx) * 2 * bps;
+                    hevcdec_read_nv12(d, d->cur_surf, yDst, ys, uvDst, uvs, copyW, copyH, (unsigned)d->cur_crop[0], (unsigned)d->cur_crop[2]);
+                } else {
+                    res = kVTVideoDecoderMalfunctionErr;
+                }
+                CVPixelBufferUnlockBaseAddress(dstCanvas, 0);
+            } else {
+                res = kVTVideoDecoderMalfunctionErr;
+            }
+        }
+        hevcdec_release(d, d->cur_surf);
+        s->tCopy += nowms() - tc;
+        if (!res && s->frames == 0 && s->colour && !getenv("NVDEC_NOCOLOUR"))
+            CVBufferSetAttachments(dstCanvas, s->colour, kCVAttachmentMode_ShouldPropagate);
+        s->frames++;
+    } else if (!res) {
+        res = kVTVideoDecoderBadDataErr;
+    }
+    if (res) s->errors++;
+    if (gDLog && (s->frames <= 4 || res))
+        DLOG("decodeTile %p: %zu B at (%u,%u) into %zux%zu (pf=0x%x) -> %d, r=%d, %.2f ms",
+             tileFrame, len, dstX, dstY, dstCanvas ? CVPixelBufferGetWidth(dstCanvas) : 0, dstCanvas ? CVPixelBufferGetHeight(dstCanvas) : 0,
+             dstCanvas ? (unsigned)CVPixelBufferGetPixelFormatType(dstCanvas) : 0, (int)res, r, s->hevc ? s->hevc->engine_ms : 0.0);
+    const double te = nowms();
+    VTVideoDecoderSession sess = s->session;
+    s->tIn += te - tA;
+    pthread_mutex_unlock(&s->lock);
+    const VTDecodeInfoFlags outFl = 0;
+    if (infoOut) *infoOut = outFl;
+    emitTile(sess, tileFrame, res, outFl, res ? NULL : dstCanvas);
+    return res;
+}
+
 // CMBaseClass is packed to 4 bytes (CoreMedia's layout), so its function pointers sit at offsets 12 + 8n. Held 4 bytes
 // into an 8-byte-aligned wrapper they fall on 8-byte boundaries, which lets the linker bind them with chained fixups;
 // the class itself is unchanged.
@@ -925,6 +1173,12 @@ static const struct { uint32_t pad; DecoderClass c; } __attribute__((aligned(8))
                                    .copySerializableProperties = d_copySerializable, .canAcceptFormatDescription = d_canAccept,
                                    .finishDelayedFrames = d_finishDelayed } };
 static const DecoderVTable gDVT = { .base = { NULL, &gDBaseHeld.c }, .decoderClass = &gDecHeld.c };
+static const struct { uint32_t pad; DecoderClass c; } __attribute__((aligned(8))) gDecHeldTile = { 0, { .version = 3, .startSession = d_startSession, .decodeFrame = d_decodeFrame,
+                                   .copySupportedPropertyDictionary = d_copySupported, .setProperties = d_setProperties,
+                                   .copySerializableProperties = d_copySerializable, .canAcceptFormatDescription = d_canAccept,
+                                   .finishDelayedFrames = d_finishDelayed,
+                                   .startTileSession = d_startTileSession, .decodeTile = d_decodeTile } };
+static const DecoderVTable gDVT_Tile = { .base = { NULL, &gDBaseHeld.c }, .decoderClass = &gDecHeldTile.c };
 
 __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharCode codec, CFAllocatorRef al, VTVideoDecoderRef *out)
 {
@@ -933,7 +1187,8 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     if (!NV_HEVC_HDR && codec == kCMVideoCodecType_HEVC) return kVTCouldNotFindVideoDecoderErr;   // a system before macOS 10.13 has no HEVC
     if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC && codec != CODEC_VP9 && codec != CODEC_AV1 && !is_mpeg12(codec) && codec != kCMVideoCodecType_MPEG4Video) return kVTCouldNotFindVideoDecoderErr;
     CMBaseObjectRef obj = NULL;
-    OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
+    const CMBaseVTable *vt = (codec == kCMVideoCodecType_HEVC && heic_tile_enabled()) ? &gDVT_Tile.base : &gDVT.base;
+    OSStatus st = CMDerivedObjectCreate(al, vt, VTVideoDecoderGetClassID(), &obj);
     if (st) return st;
     DState *s = calloc(1, sizeof *s);
     pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
