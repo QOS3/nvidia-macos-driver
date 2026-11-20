@@ -551,8 +551,11 @@ __attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
     if (!nvmtl_is_decode_service(me)) return;
     nvmtl_conf_settle();   // nvrm610.conf's NVMTL_NO_NVDEC and NVMTL_NVENCVT apply here as in every other process
     if (getenv("NVMTL_NO_NVDEC")) return;
-    // Off the loader's thread: the registration dlopens the decoder library. Not a utility queue: a client that opens its
-    // first decode session while the machine is busy would find no hardware decoder and keep Apple's software one.
+    // Register libnvencvt synchronously first so VTDecoderXPCService never races ahead onto Apple's software VCPHEVC
+    // decoder on the very first HEIC tile / video XPC request (libnvencvt links only Apple frameworks + IOKit).
+    // NVMTL_SYNC_VTDEC_OFF=1 restores the old async-only registration order.
+    if (!getenv("NVMTL_SYNC_VTDEC_OFF")) nvmtl_nvencvt_register(true);
+    // Off the loader's thread for the remaining legacy decoder libraries.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         uint32_t dev = 0;
         io_iterator_t it = IO_OBJECT_NULL;
