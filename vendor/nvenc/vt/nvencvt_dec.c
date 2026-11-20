@@ -1062,23 +1062,22 @@ static OSStatus d_startTileSession(VTVideoDecoderRef o, VTVideoDecoderSession se
         if (n) { CFArrayAppendValue(pfs, n); CFRelease(n); }
     }
     CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFMutableDictionaryRef pbAttrs = CFDictionaryCreateMutable(NULL, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef pbAttrs = CFDictionaryCreateMutable(NULL, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFDictionarySetValue(pbAttrs, kCVPixelBufferPixelFormatTypeKey, pfs);
     CFDictionarySetValue(pbAttrs, kCVPixelBufferIOSurfacePropertiesKey, ios);
-    CFDictionarySetValue(pbAttrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
 
     CFMutableDictionaryRef reqs = CFDictionaryCreateMutable(NULL, 10, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MinimumTileWidth", 64);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MinimumTileHeight", 64);
-    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumTileWidth", 4096);
-    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumTileHeight", 4096);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumTileWidth", 8192);
+    dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumTileHeight", 8192);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_TileWidthPixelAlignment", cf == 1 ? 2 : 1);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_TileHeightPixelAlignment", cf == 1 ? 2 : 1);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_TileByteAlignment", depth > 8 ? 2 : 1);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumCanvasWidth", 32768);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumCanvasHeight", 32768);
     dict_add_sym_int(reqs, "kVTTileDecoderRequirement_MaximumCanvasRowBytes", 131072);
-    dict_add_sym_bool(reqs, "kVTTileDecoderRequirement_DecoderCanClipEdges", true);
+    dict_add_sym_bool(reqs, "kVTTileDecoderRequirement_DecoderCanClipEdges", false);
 
     st = setReqs(session, pbAttrs, reqs);
     CFRelease(pfs); CFRelease(ios); CFRelease(pbAttrs); CFRelease(reqs);
