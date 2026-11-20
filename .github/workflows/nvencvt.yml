@@ -1,0 +1,62 @@
+name: nvencvt
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['vendor/nvenc/**', '.github/workflows/nvencvt.yml']
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: Fetch pinned headers
+        run: |
+          mkdir -p hdr/webkit-spi
+          fetch() {
+            d=$1; u=$2; r=$3; shift 3
+            git clone -q --filter=blob:none --no-checkout "$u" "hdr/$d"
+            git -C "hdr/$d" sparse-checkout set "$@"
+            git -C "hdr/$d" fetch -q --tags origin
+            git -C "hdr/$d" checkout -q "$r"
+          }
+          fetch ogkm https://github.com/NVIDIA/open-gpu-kernel-modules.git 610.57.04 src/common/sdk/nvidia/inc src/nvidia/arch/nvalloc/unix/include
+          fetch ogd https://github.com/NVIDIA/open-gpu-doc.git 9fdf5c4062007929d9f4e6cbad9c9771fe61b880 classes/video
+          for f in CMBaseObjectSPI.h VTVideoDecoderSPI.h; do
+            curl -fsSL -o "hdr/webkit-spi/$f" "https://raw.githubusercontent.com/WebKit/WebKit/3bfbc200370710495ffa440abdd31b943c83ad7a/Source/ThirdParty/libwebrtc/Source/webrtc/webkit_sdk/WebKit/$f"
+          done
+      - name: Build base (3.0, main) and loq-perf libnvencvt
+        run: |
+          build() {
+            rev=$1; tag=$2
+            rm -rf "src-$tag" && mkdir -p "src-$tag" "out/$tag"
+            git archive "$rev" vendor/nvenc | tar x -C "src-$tag"
+            VER=$(git describe --tags --always "$rev" 2>/dev/null || git rev-parse --short "$rev")
+            ( cd "src-$tag/vendor/nvenc" && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -fvisibility=hidden -dynamiclib \
+                -DNVENC_VERSION="\"$VER\"" \
+                -o "$GITHUB_WORKSPACE/out/$tag/libnvencvt.dylib" vt/nvencvt.c vt/nvencvt_dec.c src/*.c \
+                -I src -I "$GITHUB_WORKSPACE/hdr/webkit-spi" \
+                -I "$GITHUB_WORKSPACE/hdr/ogkm/src/common/sdk/nvidia/inc" \
+                -I "$GITHUB_WORKSPACE/hdr/ogkm/src/nvidia/arch/nvalloc/unix/include" \
+                -I "$GITHUB_WORKSPACE/hdr/ogd/classes/video" \
+                -Werror=unguarded-availability-new \
+                -framework IOKit -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
+                -framework Accelerate -framework IOSurface \
+                2>"$GITHUB_WORKSPACE/out/$tag/build.err" ) || { grep -A3 ' error:' "out/$tag/build.err" | head -60; return 1; }
+            echo "$tag: warnings $(grep -c ': warning:' "out/$tag/build.err" || true), minos $(vtool -show-build "out/$tag/libnvencvt.dylib" | awk '/minos/{print $2; exit}')"
+            git rev-parse "$rev" > "out/$tag/rev.txt"
+            nm -gU "out/$tag/libnvencvt.dylib" | awk '{print $3}' | sort > "out/$tag/exports.txt"
+            shasum -a 256 "out/$tag/libnvencvt.dylib"
+          }
+          build origin/main base
+          build HEAD loq
+          ls -la out/*
+          echo "exports diff:"
+          diff -u out/base/exports.txt out/loq/exports.txt || true
+      - uses: actions/upload-artifact@v4
+        with: { name: libnvencvt, path: out/ }
