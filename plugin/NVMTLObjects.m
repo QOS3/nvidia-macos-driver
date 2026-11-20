@@ -3019,12 +3019,18 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = nil; f->_fname = name; f->_stage = _stages[name];
         f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
     }
+    // the same library, name and constant values again: the function made the first time (nvmtl_obj_memo.h)
+    const void *fmlib = (__bridge const void *)self;
+    NSMutableData *fmkey = nvmtl_obj_memo_on() ? [NSMutableData dataWithBytes:&fmlib length:sizeof fmlib] : nil;
+    [fmkey appendData:[name dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data]]; [fmkey appendBytes:"" length:1];
+    if (vals.count == 0) { id hit = nvmtl_obj_memo_get(NVMTL_MEMO_FN, fmkey); if (hit) return hit; }
     if (vals.count == 0) {
         spv = [self nvmtlEntrySpirv:name error:error]; if (!spv) return nil;
         NVMTLFunction *f0 = [NVMTLFunction new];
         f0->_spirv = spv; f0->_fname = name; f0->_stage = (_stages[name] ?: @""); f0->_air = _airs[name]; f0->_lib = self; f0->_fcv = cv;
         nvlog("newFunctionWithName:constantValues: \"%s\" - no constants, unspecialized module (%lu B)",
               name.UTF8String, (unsigned long)spv.length);
+        nvmtl_obj_memo_put(NVMTL_MEMO_FN, fmkey, f0);
         return f0;
     }
     NSUInteger capacity = vals.count;
@@ -3048,6 +3054,9 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
             return nil; }
         idx[n] = (uint32_t)index; sz[n] = (uint32_t)w; pay[n] = data; n++;
     }
+    if (!vals) fmkey = nil;   // a constant this driver could not read: not memoized
+    for (size_t k = 0; fmkey && k < n; k++) { const uint32_t h[2] = { idx[k], sz[k] }; [fmkey appendBytes:h length:sizeof h]; [fmkey appendBytes:pay[k] length:sz[k]]; }
+    if (fmkey) { id hit = nvmtl_obj_memo_get(NVMTL_MEMO_FN, fmkey); if (hit) return hit; }
     NSString *e = nil;
     NSMutableDictionary *constants=[NSMutableDictionary new];
     for(size_t k=0;k<n;k++){NSMutableArray *bytes=[NSMutableArray new];for(uint32_t j=0;j<sz[k];j++)[bytes addObject:@(pay[k][j])];constants[[@(idx[k]) stringValue]]=bytes;}
@@ -3083,7 +3092,8 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
         return nil;
     }
     nvlog("newFunctionWithName:constantValues: \"%s\" specialized with %zu constant(s)", name.UTF8String, n);
-    NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = spec; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
+    NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = spec; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self; f->_fcv = cv;
+    nvmtl_obj_memo_put(NVMTL_MEMO_FN, fmkey, f); return f;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)cv
           completionHandler:(void (^)(id<MTLFunction>, NSError *))handler {
