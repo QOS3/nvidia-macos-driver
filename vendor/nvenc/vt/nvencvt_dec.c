@@ -89,8 +89,8 @@ typedef struct {
     unsigned frames, errors;
     double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
-    // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
-    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
+    // asynchronous output (T8.09): pictures/tiles waiting for the output thread (copy, emit, release), in decode order
+    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; bool isTile; uint32_t dstX, dstY; } q[4];
     unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
 } DState;
 typedef struct OutJob OutJob;
@@ -565,11 +565,50 @@ static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRe
 // asynchronous decompression (kVTDecodeFrame_EnableAsynchronousDecompression: AVFoundation) get that from an output
 // thread while the engine decodes the next picture; synchronous ones (ffmpeg) inside decodeFrame. Every frame of an
 // asynchronous run goes through the queue (errors and dropped frames too), so they come out in decode order.
+typedef OSStatus (*VTTileSetReqsFn)(VTVideoDecoderSession, CFDictionaryRef, CFDictionaryRef);
+typedef OSStatus (*VTTileEmitFn)(VTVideoDecoderSession, VTVideoDecoderFrame, OSStatus, VTDecodeInfoFlags, CVImageBufferRef);
+static bool tile_syms_ready(VTTileSetReqsFn *setReqs, VTTileEmitFn *emitTile);
+
 static void out_copy(DState *s, OutJob *j)
 {
     if (!j->pb || j->surf < 0 || j->res) return;
     const double tc = nowms();
     CVPixelBufferRef pb = j->pb;
+    if (j->isTile) {
+        HevcDec *d = s->hevc;
+        const size_t canvasW = CVPixelBufferGetWidth(pb);
+        const size_t canvasH = CVPixelBufferGetHeight(pb);
+        const size_t bps = (size_t)d->bps;
+        const unsigned sx = d->chroma_format == 3 ? 0 : 1;
+        const unsigned sy = d->chroma_format == 1 ? 1 : 0;
+        if ((j->dstX & sx) || (j->dstY & sy) || j->dstX >= canvasW || j->dstY >= canvasH) {
+            j->res = kVTParameterErr;
+        } else {
+            unsigned copyW = j->w, copyH = j->h;
+            if ((size_t)j->dstX + copyW > canvasW) copyW = (unsigned)(canvasW - j->dstX);
+            if ((size_t)j->dstY + copyH > canvasH) copyH = (unsigned)(canvasH - j->dstY);
+            if (CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
+                uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+                uint8_t *uvBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+                const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+                const size_t uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+                if (yBase && uvBase) {
+                    uint8_t *yDst = yBase + (size_t)j->dstY * ys + (size_t)j->dstX * bps;
+                    uint8_t *uvDst = uvBase + (size_t)(j->dstY >> sy) * uvs + (size_t)(j->dstX >> sx) * 2 * bps;
+                    hevcdec_read_nv12(d, j->surf, yDst, ys, uvDst, uvs, copyW, copyH, j->cx, j->cy);
+                } else {
+                    j->res = kVTVideoDecoderMalfunctionErr;
+                }
+                CVPixelBufferUnlockBaseAddress(pb, 0);
+            } else {
+                j->res = kVTVideoDecoderMalfunctionErr;
+            }
+        }
+        if (!j->res && j->dstX == 0 && j->dstY == 0 && s->colour && !getenv("NVDEC_NOCOLOUR"))
+            CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
+        j->usCopy = (unsigned)((nowms() - tc) * 1000);
+        return;
+    }
     CVPixelBufferLockBaseAddress(pb, 0);
     uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
@@ -598,7 +637,13 @@ static void out_release(DState *s, const OutJob *j)   // lock held
 static void out_emit(DState *s, OutJob *j)
 {
     const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, j->frame, j->res, j->fl, j->pb);
+    if (j->isTile) {
+        VTTileEmitFn emitTile = NULL;
+        if (tile_syms_ready(NULL, &emitTile))
+            emitTile(s->session, j->frame, j->res, j->fl, j->res ? NULL : j->pb);
+    } else {
+        VTDecoderSessionEmitDecodedFrame(s->session, j->frame, j->res, j->fl, j->pb);
+    }
     if (j->pb) CVPixelBufferRelease(j->pb);
     j->pb = NULL; j->usEmit = (unsigned)((nowms() - te) * 1000);
 }
@@ -633,7 +678,8 @@ static void out_deliver(DState *s, OutJob *j)
     if (s->async) {
         if (!s->thrOn) { s->stop = false; s->thrOn = pthread_create(&s->thr, NULL, out_thread, s) == 0; }
         if (s->thrOn) {
-            while (s->qt - s->qh >= 2) pthread_cond_wait(&s->cv, &s->lock);   // at most two pictures waiting
+            const unsigned limit = j->isTile ? 3 : 2;
+            while (s->qt - s->qh >= limit) pthread_cond_wait(&s->cv, &s->lock);
             s->q[s->qt % 4] = *j; s->qt++;
             pthread_cond_broadcast(&s->cv);
             return;
@@ -918,10 +964,8 @@ static OSStatus d_finishDelayed(VTVideoDecoderRef o)
 // ---- HEVC tile decoder (VTTileDecompressionSession / HEIC still images) ----
 // VideoToolbox discovers tile decoding via DecoderClass version 3 (slots 7 & 8: startTileSession / decodeTile) on the
 // same VTVideoDecoder class. Each HEIC tile is an independent HEVC IDR picture decoded by NVDEC and untiled directly
-// into the caller's destination canvas CVPixelBuffer at (dstX, dstY).
+// into the caller's destination canvas CVPixelBuffer at (dstX, dstY) (pipelined through out_thread when async).
 // Kill switch: NVENCVT_NO_TILE=1 or /Library/GPUBundles/nvmtl/no-heic-tile.
-typedef OSStatus (*VTTileSetReqsFn)(VTVideoDecoderSession, CFDictionaryRef, CFDictionaryRef);
-typedef OSStatus (*VTTileEmitFn)(VTVideoDecoderSession, VTVideoDecoderFrame, OSStatus, VTDecodeInfoFlags, CVImageBufferRef);
 
 static bool tile_syms_ready(VTTileSetReqsFn *setReqs, VTTileEmitFn *emitTile)
 {
@@ -1063,13 +1107,16 @@ static OSStatus d_decodeTile(VTVideoDecoderRef o, VTVideoDecoderFrame tileFrame,
                              uint64_t a4, uint64_t a5, CVPixelBufferRef dstCanvas, uint64_t dstXY,
                              VTDecodeFrameFlags flags, VTDecodeInfoFlags *infoOut)
 {
-    (void)a4; (void)a5; (void)flags;
+    (void)a4; (void)a5;
     DState *s = dstate(o);
     if (infoOut) *infoOut = 0;
     VTTileEmitFn emitTile = NULL;
     if (!s || !tile_syms_ready(NULL, &emitTile)) return kVTVideoDecoderMalfunctionErr;
     const double tA = nowms();
     pthread_mutex_lock(&s->lock);
+    s->async = (flags & kVTDecodeFrame_EnableAsynchronousDecompression) && s->opened && !getenv("NVDEC_SYNC") && !getenv("NVDEC_TILE_SYNC") && out_async_ok(s);
+    if (s->async && infoOut) *infoOut |= kVTDecodeInfo_Asynchronous;
+    if (s->tLast > 0) s->tOut += tA - s->tLast;
     OSStatus res = noErr;
     const uint32_t dstX = (uint32_t)(dstXY & 0xffffffffu);
     const uint32_t dstY = (uint32_t)(dstXY >> 32);
@@ -1081,7 +1128,6 @@ static OSStatus d_decodeTile(VTVideoDecoderRef o, VTVideoDecoderFrame tileFrame,
         if (s->tmpCap < len) { free(s->tmp); s->tmp = malloc(len); s->tmpCap = s->tmp ? len : 0; }
         if (!s->tmp || CMBlockBufferCopyDataBytes(bb, 0, len, s->tmp)) res = kVTVideoDecoderBadDataErr; else p = (char *)s->tmp;
     }
-    // If the sample carries a different format description, feed its HEVC parameter sets before decoding the tile.
     if (!res && sb) {
         CMVideoFormatDescriptionRef sfmt = CMSampleBufferGetFormatDescription(sb);
         if (sfmt && (!s->fmt || !CFEqual(sfmt, s->fmt))) {
@@ -1105,59 +1151,28 @@ static OSStatus d_decodeTile(VTVideoDecoderRef o, VTVideoDecoderFrame tileFrame,
         if (r >= 0) { int q = hevcdec_flush(d); if (q) r = q; }
         if (r < 0) res = kVTVideoDecoderBadDataErr;
     }
+    OutJob j = { .frame = tileFrame, .surf = -1, .rel = -1, .isTile = true, .dstX = dstX, .dstY = dstY };
     if (!res && r == 1) {
         HevcDec *d = s->hevc;
         s->tEngine += d->engine_ms;
-        const double tc = nowms();
-        const size_t canvasW = CVPixelBufferGetWidth(dstCanvas);
-        const size_t canvasH = CVPixelBufferGetHeight(dstCanvas);
-        const size_t bps = (size_t)d->bps;
-        const unsigned sx = d->chroma_format == 3 ? 0 : 1;
-        const unsigned sy = d->chroma_format == 1 ? 1 : 0;
-        if ((dstX & sx) || (dstY & sy) || dstX >= canvasW || dstY >= canvasH) {
-            res = kVTParameterErr;
-        } else {
-            unsigned copyW = (unsigned)d->cur_w;
-            unsigned copyH = (unsigned)d->cur_h;
-            if ((size_t)dstX + copyW > canvasW) copyW = (unsigned)(canvasW - dstX);
-            if ((size_t)dstY + copyH > canvasH) copyH = (unsigned)(canvasH - dstY);
-            if (CVPixelBufferLockBaseAddress(dstCanvas, 0) == kCVReturnSuccess) {
-                uint8_t *yBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dstCanvas, 0);
-                uint8_t *uvBase = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dstCanvas, 1);
-                const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(dstCanvas, 0);
-                const size_t uvs = CVPixelBufferGetBytesPerRowOfPlane(dstCanvas, 1);
-                if (yBase && uvBase) {
-                    uint8_t *yDst = yBase + (size_t)dstY * ys + (size_t)dstX * bps;
-                    uint8_t *uvDst = uvBase + (size_t)(dstY >> sy) * uvs + (size_t)(dstX >> sx) * 2 * bps;
-                    hevcdec_read_nv12(d, d->cur_surf, yDst, ys, uvDst, uvs, copyW, copyH, (unsigned)d->cur_crop[0], (unsigned)d->cur_crop[2]);
-                } else {
-                    res = kVTVideoDecoderMalfunctionErr;
-                }
-                CVPixelBufferUnlockBaseAddress(dstCanvas, 0);
-            } else {
-                res = kVTVideoDecoderMalfunctionErr;
-            }
-        }
-        hevcdec_release(d, d->cur_surf);
-        s->tCopy += nowms() - tc;
-        if (!res && s->frames == 0 && s->colour && !getenv("NVDEC_NOCOLOUR"))
-            CVBufferSetAttachments(dstCanvas, s->colour, kCVAttachmentMode_ShouldPropagate);
+        j.surf = d->cur_surf; j.rel = d->cur_surf;
+        j.w = (unsigned)d->cur_w; j.h = (unsigned)d->cur_h;
+        j.cx = (unsigned)d->cur_crop[0]; j.cy = (unsigned)d->cur_crop[2];
+        j.pb = CVPixelBufferRetain(dstCanvas);
         s->frames++;
     } else if (!res) {
         res = kVTVideoDecoderBadDataErr;
     }
     if (res) s->errors++;
     if (gDLog && (s->frames <= 4 || res))
-        DLOG("decodeTile %p: %zu B at (%u,%u) into %zux%zu (pf=0x%x) -> %d, r=%d, %.2f ms",
+        DLOG("decodeTile %p: %zu B at (%u,%u) into %zux%zu (pf=0x%x, async=%d) -> %d, r=%d, %.2f ms",
              tileFrame, len, dstX, dstY, dstCanvas ? CVPixelBufferGetWidth(dstCanvas) : 0, dstCanvas ? CVPixelBufferGetHeight(dstCanvas) : 0,
-             dstCanvas ? (unsigned)CVPixelBufferGetPixelFormatType(dstCanvas) : 0, (int)res, r, s->hevc ? s->hevc->engine_ms : 0.0);
-    const double te = nowms();
-    VTVideoDecoderSession sess = s->session;
-    s->tIn += te - tA;
+             dstCanvas ? (unsigned)CVPixelBufferGetPixelFormatType(dstCanvas) : 0, (int)s->async, (int)res, r, s->hevc ? s->hevc->engine_ms : 0.0);
+    j.res = res;
+    j.fl = s->async ? kVTDecodeInfo_Asynchronous : 0;
+    out_deliver(s, &j);
+    s->tLast = nowms(); s->tIn += s->tLast - tA;
     pthread_mutex_unlock(&s->lock);
-    const VTDecodeInfoFlags outFl = 0;
-    if (infoOut) *infoOut = outFl;
-    emitTile(sess, tileFrame, res, outFl, res ? NULL : dstCanvas);
     return res;
 }
 
