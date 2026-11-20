@@ -1691,7 +1691,7 @@ static char nvmtl_surface_cache_key;
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NSArray *key = (surf && cache.count > 0) ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
@@ -1714,7 +1714,10 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage == 1;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (surf && !t->_vramOn) {
+        if (!key) key = @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
+        [cache setObject:t forKey:key];
+    }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
@@ -2676,18 +2679,69 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     NVMTLSamplerState *s = [NVMTLSamplerState new];
     s->_label = [sd.label copy];
     if (!sd.normalizedCoordinates) {
-        NSArray *addresses=@[@"ClampToEdge",@"MirrorClampToEdge",@"Repeat",@"MirroredRepeat",@"ClampToZero",@"ClampToBorder"];
-        NSArray *compare=@[@"None",@"Less",@"Equal",@"LessEqual",@"Greater",@"NotEqual",@"GreaterEqual",@"Always"];
-        if(sd.sAddressMode>=addresses.count || sd.tAddressMode>=addresses.count || sd.rAddressMode>=addresses.count || sd.compareFunction>=compare.count) return nil;
-        s->_pixelState=@{@"min_filter":sd.minFilter==MTLSamplerMinMagFilterLinear?@"Linear":@"Nearest",
-            @"mag_filter":sd.magFilter==MTLSamplerMinMagFilterLinear?@"Linear":@"Nearest",
-            @"mip_filter":(@[@"None",@"Nearest",@"Linear"])[MIN((NSUInteger)sd.mipFilter,2u)],
-            @"address_mode_s":addresses[sd.sAddressMode],@"address_mode_t":addresses[sd.tAddressMode],@"address_mode_r":addresses[sd.rAddressMode],
-            @"coordinates":@"Pixel",@"compare_function":compare[sd.compareFunction],@"max_anisotropy":@(sd.maxAnisotropy),
-            @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
-            @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN(NVMTL_SINCE(10.12, NSUInteger, sd.borderColor, 0),2u)],
-            @"reduction":@"WeightedAverage",@"lod_bias":@0};
-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+        static NSString *const addresses[6] = {@"ClampToEdge",@"MirrorClampToEdge",@"Repeat",@"MirroredRepeat",@"ClampToZero",@"ClampToBorder"};
+        static NSString *const compare[8] = {@"None",@"Less",@"Equal",@"LessEqual",@"Greater",@"NotEqual",@"GreaterEqual",@"Always"};
+        static NSString *const mips[3] = {@"None",@"Nearest",@"Linear"};
+        static NSString *const borders[3] = {@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"};
+        if (sd.sAddressMode >= 6 || sd.tAddressMode >= 6 || sd.rAddressMode >= 6 || sd.compareFunction >= 8) return nil;
+        typedef struct {
+            uint32_t minf, magf, mipf, as, at, ar, cmp, border, lminb, lmaxb;
+            NSUInteger aniso;
+        } nvmtl_px_key;
+        static nvmtl_px_key px_keys[32];
+        static CFTypeRef px_dicts[32];
+        static uint32_t px_count;
+        static os_unfair_lock px_lock = OS_UNFAIR_LOCK_INIT;
+        float lmin = sd.lodMinClamp, lmax = sd.lodMaxClamp;
+        uint32_t lminb = 0, lmaxb = 0;
+        memcpy(&lminb, &lmin, sizeof lminb);
+        memcpy(&lmaxb, &lmax, sizeof lmaxb);
+        nvmtl_px_key pk = {
+            .minf = sd.minFilter == MTLSamplerMinMagFilterLinear ? 1u : 0u,
+            .magf = sd.magFilter == MTLSamplerMinMagFilterLinear ? 1u : 0u,
+            .mipf = (uint32_t)MIN((NSUInteger)sd.mipFilter, 2u),
+            .as = (uint32_t)sd.sAddressMode, .at = (uint32_t)sd.tAddressMode, .ar = (uint32_t)sd.rAddressMode,
+            .cmp = (uint32_t)sd.compareFunction,
+            .border = (uint32_t)MIN(NVMTL_SINCE(10.12, NSUInteger, sd.borderColor, 0), 2u),
+            .lminb = lminb, .lmaxb = lmaxb, .aniso = sd.maxAnisotropy
+        };
+        NSDictionary *cached = nil;
+        if (!getenv("NVMTL_PIXEL_SAMPLER_CACHE_OFF")) {
+            os_unfair_lock_lock(&px_lock);
+            for (uint32_t i = 0; i < px_count; i++) {
+                if (memcmp(&px_keys[i], &pk, sizeof pk) == 0) { cached = (__bridge NSDictionary *)px_dicts[i]; break; }
+            }
+            os_unfair_lock_unlock(&px_lock);
+        }
+        if (cached) {
+            s->_pixelState = cached;
+        } else {
+            NSDictionary *ps = @{@"min_filter": pk.minf ? @"Linear" : @"Nearest",
+                @"mag_filter": pk.magf ? @"Linear" : @"Nearest",
+                @"mip_filter": mips[pk.mipf],
+                @"address_mode_s": addresses[pk.as], @"address_mode_t": addresses[pk.at], @"address_mode_r": addresses[pk.ar],
+                @"coordinates": @"Pixel", @"compare_function": compare[pk.cmp], @"max_anisotropy": @(pk.aniso),
+                @"lod_min_clamp": @(lmin), @"lod_max_clamp": @(lmax),
+                @"border_color": borders[pk.border],
+                @"reduction": @"WeightedAverage", @"lod_bias": @0};
+            s->_pixelState = ps;
+            if (!getenv("NVMTL_PIXEL_SAMPLER_CACHE_OFF")) {
+                os_unfair_lock_lock(&px_lock);
+                uint32_t found = px_count;
+                for (uint32_t i = 0; i < px_count; i++) {
+                    if (memcmp(&px_keys[i], &pk, sizeof pk) == 0) { found = i; break; }
+                }
+                if (found == px_count && px_count < 32) {
+                    px_keys[px_count] = pk;
+                    px_dicts[px_count] = CFBridgingRetain(ps);
+                    px_count++;
+                }
+                os_unfair_lock_unlock(&px_lock);
+            }
+            static _Atomic uint32_t px_logged;
+            if (atomic_fetch_add(&px_logged, 1) < 4)
+                nvlog("pixel sampler: %s", ps.description.UTF8String);
+        }
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
