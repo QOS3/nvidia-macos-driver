@@ -68,8 +68,12 @@ typedef struct { CMBaseVTable base; const DecoderClass *decoderClass; } DecoderV
 static bool is_mpeg12(FourCharCode c) { return c == kCMVideoCodecType_MPEG2Video || c == kCMVideoCodecType_MPEG1Video; }
 enum { CODEC_VP9 = 0x76703039, CODEC_AV1 = 0x61763031 };   // 'vp09', 'av01' (kCMVideoCodecType_VP9 / _AV1)
 enum { CODEC_HEV1 = 0x68657631, CODEC_AVC3 = 0x61766333 };  // 'hev1', 'avc3': sample entries macOS has no decoder for
-static bool gDLog; static FILE *gDLogF;
-#define DLOG(...) do { if (gDLog) { FILE *lf_ = gDLogF ? gDLogF : stderr; fprintf(lf_, "nvdecvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
+#include <os/log.h>
+// gDLogOS: the unified log (log show --predicate 'eventMessage BEGINSWITH "nvdecvt"'), the only log a sandboxed process
+// such as VTDecoderXPCService can write. On with the root-owned flag file /Library/GPUBundles/nvmtl/nvencvt-oslog.
+static bool gDLog, gDLogOS; static FILE *gDLogF;
+#define DLOG(...) do { if (gDLog) { if (gDLogOS) { char lb_[512]; snprintf(lb_, sizeof lb_, __VA_ARGS__); os_log(OS_LOG_DEFAULT, "nvdecvt: %{public}s", lb_); } \
+    else { FILE *lf_ = gDLogF ? gDLogF : stderr; fprintf(lf_, "nvdecvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } } while (0)
 
 typedef struct {
     pthread_mutex_t lock;
@@ -1238,6 +1242,7 @@ static NvU32 nvdec_class(void)
 OSStatus NVDecVT_Register(int rating)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL;
+    if (!gDLog && nvencvt_flag("/Library/GPUBundles/nvmtl/nvencvt-oslog") == 0) gDLog = gDLogOS = true;
     if (!gDLog && nvencvt_flag("/tmp/nvencvt.log") == 0) { char p[64]; snprintf(p, sizeof p, "/tmp/nvencvt-%d.log", (int)getpid()); if ((gDLogF = nvencvt_out(p, "a"))) gDLog = true; }
     if (getenv("NVENCVT_NO_DEC")) return kVTCouldNotFindVideoDecoderErr;
     extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
