@@ -70,6 +70,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;
+  NSArray *_staticSamplersCached; NSArray *_embeddedPlanCached;
   id _lib; id _fcv; NSString *_specName; BOOL _needsLink; } @end
 NSDictionary *nvmtl_function_reflection(NVMTLFunction *function);
 NSDictionary *nvmtl_air_names(NVMTLFunction *function);
@@ -238,6 +239,8 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
   // Apple's GL rebinds buffers for every draw, and a dictionary of (buffer, offset) arrays allocated on each one
   NVMTLBuffer *_vbufAt[NVMTL_NBUFAT], *_fbufAt[NVMTL_NBUFAT]; NSUInteger _vbufOff[NVMTL_NBUFAT], _fbufOff[NVMTL_NBUFAT];
   NVMTLRenderPipelineState *_ps;
+  NVMTLRenderPipelineState *_lastRetainedPs;
+  NVMTLRenderPipelineState *_psFnFor; NVMTLFunction *_psVF, *_psFF;
   NSMutableArray *_scratch;
   NVMTLDepthStencilState *_ds;
   NVMTLBuffer *_tfb; NSUInteger _tfbOff, _tfbStride; float _tfScale; BOOL _tfScaleSet;
