@@ -608,8 +608,8 @@ uint32_t nvmtl_air_text_flags(NSString *ll) {
     NSNumber *have = keep ? objc_getAssociatedObject(ll, NVMTL_AIRFLAGS_KEY) : nil;
     if (have) return have.unsignedIntValue;
     uint32_t f = NVMTL_AIRF_KNOWN;
-    if ([ll rangeOfString:@"@air.dyld_lib_table"].location != NSNotFound) f |= NVMTL_AIRF_DYLD_TABLE;
-    if ([ll rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound) f |= NVMTL_AIRF_ISECT_TABLE;
+    if ([ll rangeOfString:@"@air.dyld_lib_table" options:NSLiteralSearch].location != NSNotFound) f |= NVMTL_AIRF_DYLD_TABLE;
+    if ([ll rangeOfString:@"!\"air.intersection_function_table\"" options:NSLiteralSearch].location != NSNotFound) f |= NVMTL_AIRF_ISECT_TABLE;
     if (keep) objc_setAssociatedObject(ll, NVMTL_AIRFLAGS_KEY, @(f), OBJC_ASSOCIATION_RETAIN);
     return f;
 }
@@ -2451,6 +2451,12 @@ static BOOL nvmtl_air_grid_only_scan(NSString *ll, NSString *fname)
 // pixel-transfer session builds a new pipeline for every frame it converts: Photo Booth's camera thread spent 854 of its
 // samples in this scan (issue #568), each scan a walk over the whole module text. The answer is kept per AIR string
 // object (weak key, so it goes with the text) and kernel name.
+static int nvmtl_analcache_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = !getenv("NVMTL_ANALCACHE_OFF") && !getenv("NVMTL_SPVCACHE_OFF");
+    return on;
+}
 static NSMapTable<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *g_gridonly_memo;
 static os_unfair_lock g_gridonly_memo_lock = OS_UNFAIR_LOCK_INIT;
 BOOL nvmtl_air_grid_only(NVMTLFunction *fn)
@@ -2463,12 +2469,39 @@ BOOL nvmtl_air_grid_only(NVMTLFunction *fn)
     NSNumber *hit = [g_gridonly_memo objectForKey:air][name];
     os_unfair_lock_unlock(&g_gridonly_memo_lock);
     if (hit) return hit.boolValue;
+    NSString *path = nil;
+    if (nvmtl_analcache_on() && nvmtl_xlate_ready()) {
+        NVMTLAirDigest *ad = nvmtl_air_state(air);
+        NSData *tail = [name dataUsingEncoding:NSUTF8StringEncoding];
+        if (ad && tail.length) {
+            path = nvmtl_spvcache_path_air(ad, tail, @"grid1");
+            NSData *disk = nvmtl_cache_read(path);
+            if (disk.length == 1) {
+                const uint8_t b = ((const uint8_t *)disk.bytes)[0];
+                if (b == '0' || b == '1') {
+                    const BOOL r = (b == '1');
+                    os_unfair_lock_lock(&g_gridonly_memo_lock);
+                    NSMutableDictionary *per = [g_gridonly_memo objectForKey:air];
+                    if (!per) { per = [NSMutableDictionary new]; [g_gridonly_memo setObject:per forKey:air]; }
+                    per[[name copy]] = @(r);
+                    os_unfair_lock_unlock(&g_gridonly_memo_lock);
+                    return r;
+                }
+            }
+        }
+    }
     const BOOL r = nvmtl_air_grid_only_scan(air, name);
     os_unfair_lock_lock(&g_gridonly_memo_lock);
     NSMutableDictionary *per = [g_gridonly_memo objectForKey:air];
     if (!per) { per = [NSMutableDictionary new]; [g_gridonly_memo setObject:per forKey:air]; }
     per[[name copy]] = @(r);
     os_unfair_lock_unlock(&g_gridonly_memo_lock);
+    if (path) {
+        const uint8_t b = r ? '1' : '0';
+        NSData *stored = [NSData dataWithBytes:&b length:1];
+        NSString *file = [path copy];
+        nvmtl_cache_io(^{ nvmtl_cache_write(file, stored); });
+    }
     return r;
 }
 
@@ -3014,7 +3047,7 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.intersection_function_table\""];
     });
     for (NSString *f in forms)
-        if ([air rangeOfString:f].location != NSNotFound) return YES;
+        if ([air rangeOfString:f options:NSLiteralSearch].location != NSNotFound) return YES;
     return NO;
 }
 
@@ -3041,12 +3074,38 @@ BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
     NSNumber *hit = [g_vlink_memo objectForKey:air];
     os_unfair_lock_unlock(&g_vlink_memo_lock);
     if (hit) return hit.boolValue;
+    NSString *path = nil;
+    if (nvmtl_analcache_on() && nvmtl_xlate_ready()) {
+        NVMTLAirDigest *ad = nvmtl_air_state(air);
+        if (ad) {
+            static const uint8_t vtag = 'v';
+            NSData *tail = [NSData dataWithBytesNoCopy:(void *)&vtag length:1 freeWhenDone:NO];
+            path = nvmtl_spvcache_path_air(ad, tail, @"vlink1");
+            NSData *disk = nvmtl_cache_read(path);
+            if (disk.length == 1) {
+                const uint8_t b = ((const uint8_t *)disk.bytes)[0];
+                if (b == '0' || b == '1') {
+                    const BOOL r = (b == '1');
+                    os_unfair_lock_lock(&g_vlink_memo_lock);
+                    [g_vlink_memo setObject:@(r) forKey:air];
+                    os_unfair_lock_unlock(&g_vlink_memo_lock);
+                    return r;
+                }
+            }
+        }
+    }
     BOOL definite = NO;
     const BOOL r = nvmtl_needs_visible_link_uncached(air, why, &definite);
     if (definite) {
         os_unfair_lock_lock(&g_vlink_memo_lock);
         [g_vlink_memo setObject:@(r) forKey:air];
         os_unfair_lock_unlock(&g_vlink_memo_lock);
+        if (path) {
+            const uint8_t b = r ? '1' : '0';
+            NSData *stored = [NSData dataWithBytes:&b length:1];
+            NSString *file = [path copy];
+            nvmtl_cache_io(^{ nvmtl_cache_write(file, stored); });
+        }
     }
     return r;
 }
