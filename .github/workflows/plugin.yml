@@ -6,7 +6,8 @@ on:
     paths: ['plugin/**', '.github/workflows/plugin.yml']
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
