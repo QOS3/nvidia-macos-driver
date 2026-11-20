@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Pick the newest Xcode 16 (DEVELOPING.md: plugin needs Xcode 16)
+      - name: Pick the newest Xcode 16 (DEVELOPING.md asks for Xcode 16)
         run: |
           ls -d /Applications/Xcode*.app
           X=$(ls -d /Applications/Xcode_16.*.app | sort -V | tail -1); echo "using $X"
