@@ -199,6 +199,7 @@ static void nvmtl_alloc_failed(const char *what) {
 @end
 #import "NVMTLObjects.h"
 #import "NVMTLLibraryLoad.h"
+#include "nvmtl_obj_memo.h"
 void nvmtl_vendor_compile_airs(NSDictionary<NSString *, NSString *> *airs,
                                NSDictionary<NSString *, NSString *> *stages);
 void nvmtl_vendor_attach_sass(id device, id pipelineState, id function);
@@ -2046,6 +2047,8 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)err {
     if (err) *err = nil;
     NSString *fp = url.isFileURL ? url.absoluteURL.path : nil; struct stat s0; int st0 = fp ? stat(fp.fileSystemRepresentation, &s0) : -1;
+    NSString *mkey = st0 == 0 ? nvmtl_obj_memo_file_key(fp, &s0) : nil;   // the same file again: the library made from it (nvmtl_obj_memo.h)
+    { id hit = nvmtl_obj_memo_get(NVMTL_MEMO_LIB, mkey); if (hit) return hit; }
     NSData *d = [NSData dataWithContentsOfURL:url];
     if (!d && url.path.length) {
         fp = url.path; st0 = stat(fp.fileSystemRepresentation, &s0);
@@ -2063,12 +2066,16 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
     objc_setAssociatedObject(lib, &gNVMTLLibKeyAssoc, ckey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (st0 == 0) objc_setAssociatedObject(lib, &gNVMTLLibFileAssoc, @[[fp copy], [NSData dataWithBytes:&s0 length:sizeof s0]], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     nvmtl_pretranslate_library(lib);
+    { struct stat s1;   // only a file that did not change while it was read, and the one the key names
+      if (mkey && [fp isEqualToString:url.absoluteURL.path ?: @""] && stat(fp.fileSystemRepresentation, &s1) == 0 && nvmtl_stat_same(&s0, &s1)) nvmtl_obj_memo_put(NVMTL_MEMO_LIB, mkey, lib); }
     return lib; }
 
 - (id<MTLLibrary>)nvmtlLibraryFromPath:(NSString *)path error:(NSError **)err {
     if (err) *err = nil;
     if (!path) return nvmtl_fail(err, @"newLibraryWithFile: nil path");
     struct stat s0; const int st0 = stat(path.fileSystemRepresentation, &s0);
+    NSString *mkey = st0 == 0 ? nvmtl_obj_memo_file_key(path, &s0) : nil;
+    { id hit = nvmtl_obj_memo_get(NVMTL_MEMO_LIB, mkey); if (hit) return hit; }
     NSData *d = [NSData dataWithContentsOfFile:path];
     if (!d) return nvmtl_fail(err, [NSString stringWithFormat:@"newLibraryWithFile: cannot read %@", path]);
     NSDictionary *stages = nil, *airs = nil;
@@ -2081,6 +2088,7 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
     objc_setAssociatedObject(lib, &gNVMTLLibKeyAssoc, ckey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (st0 == 0) objc_setAssociatedObject(lib, &gNVMTLLibFileAssoc, @[lib->_rawPath, [NSData dataWithBytes:&s0 length:sizeof s0]], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     nvmtl_pretranslate_library(lib);
+    { struct stat s1; if (mkey && stat(path.fileSystemRepresentation, &s1) == 0 && nvmtl_stat_same(&s0, &s1)) nvmtl_obj_memo_put(NVMTL_MEMO_LIB, mkey, lib); }
     return lib; }
 
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)err {
@@ -2451,7 +2459,7 @@ id nvmtl_tile_compute_pipeline(NVMTLRenderPipelineState *tp, uint32_t tw, uint32
         id<MTLComputePipelineState> cps = nil;
         if (spv) {
             NVMTLFunction *v = [NVMTLFunction new]; v->_air = text; v->_spirv = spv; v->_fc = tp->_tileFn->_fc; v->_fname = tp->_tileFn->_fname; v->_stage = @"kernel";
-            NSError *e = nil; cps = [(id<MTLDevice>)gNVMTLMainDevice newComputePipelineStateWithFunction:v error:&e];
+            NSError *e = nil; cps = [(NVMTLDevice *)gNVMTLMainDevice nvmtlComputePSOUncached:v error:&e];
             if (!cps) w = e.localizedDescription ?: @"the compute pipeline for the tile function was refused";
         }
         if (!tp->_tileCps) tp->_tileCps = [NSMutableDictionary new];
@@ -2562,7 +2570,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     }
     NSString *tgWhy = nvmtl_tg_mismatch(kfn, NVMTL_SINCE(10.14, NSUInteger, d.maxTotalThreadsPerThreadgroup, 0), "compute pipeline");
     if (tgWhy) { if (r) *r = nil; return nvmtl_fail(err, tgWhy); }
-    id<MTLComputePipelineState> ps = [self newComputePipelineStateWithFunction:kfn error:err];
+    id<MTLComputePipelineState> ps = [self nvmtlComputePSOUncached:kfn error:err];   // never the memo: the descriptor state below is set on it
     if ([(id)ps isKindOfClass:[NVMTLComputePipelineState class]]) { ((NVMTLComputePipelineState *)ps)->_icb = NVMTL_SINCE(11.0, BOOL, d.supportIndirectCommandBuffers, NO);
         if (NVMTL_SINCE(11.0, BOOL, d.supportIndirectCommandBuffers, NO)) nvmtl_icb_register_pipeline(ps, YES);
         ((NVMTLComputePipelineState *)ps)->_askT = NVMTL_SINCE(10.14, NSUInteger, d.maxTotalThreadsPerThreadgroup, 0);
@@ -2764,6 +2772,17 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     return s; }
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)fn error:(NSError **)err {
+    // a pipeline asked again for the same function object is the one made the first time (nvmtl_obj_memo.h)
+    if (err) *err = nil;
+    const BOOL memo = [(id)fn isKindOfClass:[NVMTLFunction class]] && !((NVMTLFunction *)fn)->_needsLink;
+    NSValue *mk = memo ? [NSValue valueWithNonretainedObject:fn] : nil;
+    id<MTLComputePipelineState> hit = nvmtl_obj_memo_get(NVMTL_MEMO_CPS, mk);
+    if (hit) return hit;
+    id<MTLComputePipelineState> ps = [self nvmtlComputePSOUncached:fn error:err];
+    if (ps && [(id)ps isKindOfClass:[NVMTLComputePipelineState class]] && ((NVMTLComputePipelineState *)ps)->_function == (id)fn) nvmtl_obj_memo_put(NVMTL_MEMO_CPS, mk, ps);
+    return ps;
+}
+- (id<MTLComputePipelineState>)nvmtlComputePSOUncached:(id<MTLFunction>)fn error:(NSError **)err {
     if (err) *err = nil;
     if (nvmtl_vk_init()) return nvmtl_fail(err, @"newComputePipelineState: Vulkan is not up in this process");
     if (fn && ![(id)fn isKindOfClass:[NVMTLFunction class]])
@@ -3233,7 +3252,7 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
         if (!ospv) { *why = [NSString stringWithFormat:@"object \"%@\" lowered kernel did not translate: %@", of->_fname, w]; return nil; }
         NVMTLFunction *okf = [NVMTLFunction new];
         okf->_spirv = ospv; okf->_fname = of->_fname; okf->_stage = @"kernel"; okf->_air = oll; okf->_lib = of->_lib;
-        NVMTLComputePipelineState *op = (NVMTLComputePipelineState *)[self newComputePipelineStateWithFunction:okf error:&pe];
+        NVMTLComputePipelineState *op = (NVMTLComputePipelineState *)[self nvmtlComputePSOUncached:okf error:&pe];
         if (!op) { *why = [NSString stringWithFormat:@"object \"%@\": no compute pipeline (%@)", of->_fname, pe.localizedDescription ?: @"?"]; return nil; }
         *oout = op;
     }
@@ -3243,7 +3262,7 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
     if (!vspv) { *why = [NSString stringWithFormat:@"\"%@\" generated vertex (mode %u) did not translate: %@", mf->_fname, mode, w]; return nil; }
     NVMTLFunction *kf = [NVMTLFunction new];
     kf->_spirv = kspv; kf->_fname = mf->_fname; kf->_stage = @"kernel"; kf->_air = kll; kf->_lib = mf->_lib;
-    NVMTLComputePipelineState *kp = (NVMTLComputePipelineState *)[self newComputePipelineStateWithFunction:kf error:&pe];
+    NVMTLComputePipelineState *kp = (NVMTLComputePipelineState *)[self nvmtlComputePSOUncached:kf error:&pe];
     if (!kp) { *why = [NSString stringWithFormat:@"\"%@\" lowered kernel: no compute pipeline (%@)", mf->_fname, pe.localizedDescription ?: @"?"]; return nil; }
     NVMTLFunction *vf = [NVMTLFunction new];
     vf->_spirv = vspv; vf->_fname = @"m2v_mesh_vs"; vf->_stage = @"vertex"; vf->_air = vll; vf->_lib = mf->_lib;
