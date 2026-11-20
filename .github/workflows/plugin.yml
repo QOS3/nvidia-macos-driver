@@ -1,0 +1,44 @@
+name: plugin
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['plugin/**', '.github/workflows/plugin.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: Vulkan headers
+        run: |
+          git clone -q --depth 1 --branch v1.4.362 https://github.com/KhronosGroup/Vulkan-Headers.git vkh \
+            || git clone -q --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git vkh
+          git -C vkh log -1 --format='Vulkan-Headers %H %s'
+      - name: Build base (3.0, main) and loq-perf
+        run: |
+          build() {  # $1 = git rev, $2 = out dir; the release command from build/build_plugin_release.sh
+            rm -rf src-$2 && mkdir -p src-$2 out/$2 && git archive "$1" plugin | tar x -C src-$2
+            ( cd src-$2/plugin && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 -DNVMTL_RELEASE=1 \
+                -Wno-protocol -Wno-incomplete-implementation -Werror=unguarded-availability-new \
+                -I"$GITHUB_WORKSPACE/vkh/include" -o "$GITHUB_WORKSPACE/out/$2/NVMTLDriver" NVMTLDevice.m nvmtl_dlss.c dlss/elfhost.c dlss/lnxlibc.c \
+                -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework MetalFX -liconv \
+                2>"$GITHUB_WORKSPACE/out/$2/build.err" ) || { grep -A3 ' error:' out/$2/build.err | head -60; return 1; }
+            echo "$2: warnings $(grep -c ': warning:' out/$2/build.err || true), minos $(vtool -show-build out/$2/NVMTLDriver | awk '/minos/{print $2; exit}')"
+            git rev-parse "$1" > out/$2/rev.txt
+            nm -gU out/$2/NVMTLDriver | awk '{print $3}' | sort > out/$2/exports.txt
+            strings -a out/$2/NVMTLDriver | sort -u > out/$2/strings.txt
+            shasum -a 256 out/$2/NVMTLDriver
+          }
+          build origin/main base
+          build HEAD loq
+          ls -la out/*
+          echo "exports only in base:"; comm -23 out/base/exports.txt out/loq/exports.txt | head
+          echo "exports only in loq:";  comm -13 out/base/exports.txt out/loq/exports.txt | head
+      - uses: actions/upload-artifact@v4
+        with: { name: NVMTLDriver, path: out/ }
