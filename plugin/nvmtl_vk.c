@@ -9516,12 +9516,14 @@ int nvmtl_vk_image_write_region_level_layer(nvk_queue *q, nvk_image *img, const 
     uint8_t *dst = (uint8_t *)stageb->map;
     for (uint32_t r = 0; r < rows; r++) memcpy(dst + (size_t)r * cols * bpp, (const uint8_t *)src + (size_t)r * row_bytes, (size_t)cols * bpp);
     if (nvmtl_vk_cmd_begin(q, c)) { if (au) { nvmtl_vk_buffer_destroy(&au->stage); free(au); } return -1; }
-    img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const int surfin_ord = g_up_force_async && nvmtl_surfin_ordered_on();
+    img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+           surfin_ord ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+           surfin_ord ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), level, img->mtl_type == 7 ? 0u : layer, 1 }, { (int32_t)x, (int32_t)y, img->mtl_type == 7 ? (int32_t)layer : 0 }, { w, h, 1 } };
     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)stageb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     img_to(c, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     if (au) {
         // submit without waiting; queue order + the SHADER_READ barrier above order the copy before any later
         // draw that samples this image, and the handle is finished before a readback, destroy or re-upload.
