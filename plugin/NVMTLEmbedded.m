@@ -164,14 +164,13 @@ static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st, id<MTLDev
     if (bad) return nil;
     return [device newSamplerStateWithDescriptor:d];
 }
-static const void *NVMTL_SSAMP_KEY = &NVMTL_SSAMP_KEY;
 static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
 {
-    NSArray *cached = objc_getAssociatedObject(fn, NVMTL_SSAMP_KEY);
+    NSArray *cached = fn->_staticSamplersCached;
     if (cached) return cached;
     NSMutableArray *out = [NSMutableArray new];
     @synchronized (fn) {
-        cached = objc_getAssociatedObject(fn, NVMTL_SSAMP_KEY);
+        cached = fn->_staticSamplersCached;
         if (cached) return cached;
         char e[512] = { 0 };
         NSData *d = (fn->_air && fn->_stage.length && nvmtl_xlate_ready() && xlate_refl)
@@ -187,9 +186,9 @@ static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
             else nvlog("static sampler: %s slot %@ NOT created - it keeps the dummy sampler", fn->_fname.UTF8String, slot);
         }
         if (out.count) nvlog("static sampler: %s binds %lu constexpr sampler(s) with their own state", fn->_fname.UTF8String, (unsigned long)out.count);
-        objc_setAssociatedObject(fn, NVMTL_SSAMP_KEY, out, OBJC_ASSOCIATION_RETAIN);
+        fn->_staticSamplersCached = [out copy];
     }
-    return out;
+    return fn->_staticSamplersCached;
 }
 static int nvmtl_static_samplers_on(void)
 {
@@ -211,7 +210,6 @@ static int nvmtl_static_samplers_on(void)
 @end
 @implementation NVMTLEmbeddedPlan
 @end
-static char nvmtl_embedded_plan_key;
 static BOOL nvmtl_spirv_declared(NSData *spv, uint64_t decl[2][8])
 {
     memset(decl, 0, 2 * 8 * sizeof(uint64_t));
@@ -234,10 +232,10 @@ static BOOL nvmtl_spirv_declared(NSData *spv, uint64_t decl[2][8])
     free(set); free(bind); return YES;
 }
 static NSArray<NVMTLEmbeddedPlan *> *nvmtl_embedded_plan(NVMTLFunction *fn) {
-    NSArray *cached = objc_getAssociatedObject(fn, &nvmtl_embedded_plan_key);
+    NSArray *cached = fn->_embeddedPlanCached;
     if (cached) return cached;
     @synchronized(fn) {
-        cached = objc_getAssociatedObject(fn, &nvmtl_embedded_plan_key);
+        cached = fn->_embeddedPlanCached;
         if (cached) return cached;
         NSMutableArray *plans = [NSMutableArray new];
         uint64_t decl[2][8]; const BOOL haveDecl = nvmtl_spirv_declared(fn->_spirv, decl); unsigned heapRouted = 0;
@@ -264,7 +262,7 @@ static NSArray<NVMTLEmbeddedPlan *> *nvmtl_embedded_plan(NVMTLFunction *fn) {
             nvlog("tier2: %s reads %u argument-buffer texture(s) through the bindless heap; %lu field(s) still bound per draw",
                   fn->_fname.UTF8String, heapRouted, (unsigned long)plans.count); }
         cached = [plans copy];
-        objc_setAssociatedObject(fn, &nvmtl_embedded_plan_key, cached, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        fn->_embeddedPlanCached = cached;
         return cached;
     }
 }
