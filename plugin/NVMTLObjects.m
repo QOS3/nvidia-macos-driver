@@ -1543,11 +1543,33 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
-// NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages
-static bool nvmtl_surfin_import(void) {
-    static int on = -1;
-    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
-    return on;
+// NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages.
+// In apps (not WindowServer), planes <= NVMTL_SURFIN_HOST_MIN_KB (default 4096 KB = NVMTL_POOL_MAX) use the async
+// pooled staging upload in nvmtl_vk_image_write (zero NVRM kernel page-pinning, zero synchronous GPU fence wait);
+// larger planes (>= 4 MiB, e.g. 4K frames) keep host-page DMA import. NVMTL_SURFIN_UPLOAD=host or
+// NVMTL_SURFIN_HOST_MIN_KB=0 restores host-page import for every size.
+static size_t nvmtl_surfin_host_min_bytes(void) {
+    static int decided;
+    static size_t min_bytes;
+    if (!decided) {
+        const char *u = getenv("NVMTL_SURFIN_UPLOAD");
+        const char *mk = getenv("NVMTL_SURFIN_HOST_MIN_KB");
+        const char *me = getprogname();
+        const bool is_ws = me && !strcmp(me, "WindowServer");
+        if (u && !strcmp(u, "cpu")) min_bytes = SIZE_MAX;
+        else if (u && !strcmp(u, "host")) min_bytes = 0;
+        else if (mk && *mk) { long long v = atoll(mk); min_bytes = v <= 0 ? 0 : (size_t)v << 10; }
+        else min_bytes = is_ws ? 0 : (4u << 20);
+        decided = 1;
+        nvlog("surface-in host-import threshold: %s (NVMTL_SURFIN_UPLOAD=%s, NVMTL_SURFIN_HOST_MIN_KB=%s)",
+              min_bytes == SIZE_MAX ? "off (cpu)" : min_bytes == 0 ? "all sizes" : "4096 KB (small planes async pooled)",
+              u ? u : "unset", mk ? mk : "unset");
+    }
+    return min_bytes;
+}
+static bool nvmtl_surfin_import(size_t plane_bytes) {
+    const size_t lim = nvmtl_surfin_host_min_bytes();
+    return lim != SIZE_MAX && plane_bytes >= lim;
 }
 // NVMTL_SURFOUT_READBACK=cpu: surface-out reads back through the staging buffer and a CPU copy (nvmtl_vk_image_read)
 // instead of the GPU writing the surface's own pages
@@ -1640,7 +1662,7 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
     int rc = -1;
-    if (base && row && nvmtl_surfin_import()) {
+    if (base && row && nvmtl_surfin_import((size_t)r->_i.h * row)) {
         const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
         nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID(r->_surf), nvmtl_host_pages_cookie(r->_surf));
         rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off, &r->_hostPages);
