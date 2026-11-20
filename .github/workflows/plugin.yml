@@ -6,15 +6,15 @@ on:
     paths: ['plugin/**', '.github/workflows/plugin.yml']
 jobs:
   build:
-    runs-on: macos-15-intel
+    runs-on: macos-26
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Pick the newest Xcode 16 (DEVELOPING.md asks for Xcode 16)
+      - name: Pick the newest Xcode (the plugin uses macOS 26.4 SDK API)
         run: |
           ls -d /Applications/Xcode*.app
-          X=$(ls -d /Applications/Xcode_16.*.app | sort -V | tail -1); echo "using $X"
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
           sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
       - name: Vulkan headers
         run: |
