@@ -4092,11 +4092,20 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         selected=[self nvmtlSamplerPipeline];
         if (!selected) return NO;
     }
-    if(!_cb->_resources)_cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:selected];
+    if (selected != _lastRetainedPs) {
+        if(!_cb->_resources)_cb->_resources=[NVMTLResSet new];
+        [_cb->_resources addObject:selected];
+        _lastRetainedPs = selected;
+    }
     if (selected->_p.fetch_copy && _begun && ![self nvmtlFetchCopy:&selected->_p]) return NO;
     nvmtl_vk_cmd_bind_pipeline(&_cb->_c,&selected->_p);
-    nvmtl_bind_embedded(_cb, NVMTL_SET_VERTEX,   (NVMTLFunction *)_ps->_descriptor.vertexFunction,   _vbufAt, _vbufOff);
-    nvmtl_bind_embedded(_cb, NVMTL_SET_FRAGMENT, (NVMTLFunction *)_ps->_descriptor.fragmentFunction, _fbufAt, _fbufOff);
+    if (_psFnFor != _ps) {
+        _psFnFor = _ps;
+        _psVF = (NVMTLFunction *)_ps->_descriptor.vertexFunction;
+        _psFF = (NVMTLFunction *)_ps->_descriptor.fragmentFunction;
+    }
+    nvmtl_bind_embedded(_cb, NVMTL_SET_VERTEX,   _psVF, _vbufAt, _vbufOff);
+    nvmtl_bind_embedded(_cb, NVMTL_SET_FRAGMENT, _psFF, _fbufAt, _fbufOff);
     nvmtl_vk_cmd_bind_set(&_cb->_c,&selected->_p);
     return YES;
 }
