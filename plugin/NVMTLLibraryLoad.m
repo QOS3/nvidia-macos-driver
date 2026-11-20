@@ -911,8 +911,35 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
     return result;
 }
 
+/* One text object per AIR module in this process. Every answer about a module is kept on its text object (the
+ * digest state, the marker flags, grid-only, visible-link), but a library that is loaded again read its text from
+ * the disk cache again and got a new string, so all of them were lost and computed again over megabytes of text.
+ * VideoToolbox loads its pixel-transfer library again for every session: System Settings > Displays spent about six
+ * seconds of CPU per visit rescanning the same modules. The text is never edited, so the same object is handed out
+ * again while it is kept here (by its cache name, which is the module digest; dropped under memory pressure).
+ * NVMTL_NO_AIRTEXT_MEMO=1 reads the disk cache on every load as before. */
+static NSCache<NSString *, NSString *> *nvmtl_air_text_memo(void) {
+    static NSCache *c; static dispatch_once_t once;
+    dispatch_once(&once, ^{ c = [NSCache new]; c.name = @"nvmtl.airtext"; c.totalCostLimit = 64u << 20; });
+    return c;
+}
+static int nvmtl_air_text_memo_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("NVMTL_NO_AIRTEXT_MEMO");
+    return on;
+}
+static NSString *nvmtl_air_text_keep(NSString *name, NSString *s) {
+    if (s.length >= 4096 && name && nvmtl_air_text_memo_on()) [nvmtl_air_text_memo() setObject:s forKey:name cost:s.length];
+    return s;
+}
+static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache);
 static NSString *nvmtl_air_to_text(NSData *air) {
     NSString *cache = nvmtl_aircache_path(air);
+    NSString *kept = (cache && nvmtl_air_text_memo_on()) ? [nvmtl_air_text_memo() objectForKey:cache] : nil;
+    if (kept) { gAirHit++; return kept; }
+    return nvmtl_air_text_keep(cache, nvmtl_air_to_text_uncached(air, cache));
+}
+static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache) {
     NSString *hit = [NSString stringWithContentsOfFile:cache encoding:NSUTF8StringEncoding error:nil];
     if (hit.length) { gAirHit++; return nvmtl_air_text_made(hit); }
     gAirMiss++;
