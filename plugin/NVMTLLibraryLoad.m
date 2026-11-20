@@ -526,6 +526,34 @@ static NSString *nvmtl_spvcache_dir(void) {
     });
     return dir;
 }
+// Shared read-only cache (loq-perf). Each sandboxed process caches in its own container, so every app and every Settings
+// pane translates the same Apple shaders again on first use, and the shared folder stays empty because no process can
+// write it (on one machine: 0 files shared, ~1.2 GB of duplicates in ten folders). A miss in this process's own folder
+// is retried in the shared folder, which a root step fills from the per-process caches (patch/merge-shared-cache.sh).
+// Entries carry the same names and footers as everywhere else, so a stale or torn file is still a miss. Nothing is ever
+// written there from a process. NVMTL_NO_SHARED_CACHE=1, or the file /Library/GPUBundles/nvmtl/no-shared-cache, turns it off.
+static _Atomic unsigned long gSharedHit;
+static NSString *nvmtl_shared_twin(NSString *path) {
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("NVMTL_NO_SHARED_CACHE");
+        off = (e && *e && *e != '0') || access("/Library/GPUBundles/nvmtl/no-shared-cache", F_OK) == 0;
+    }
+    if (off || !path.length) return nil;
+    NSString *dir = path.stringByDeletingLastPathComponent, *shared = nil;
+    NSString *air = nvmtl_aircache_dir(), *spv = nvmtl_spvcache_dir();
+    if (air && [dir isEqualToString:air]) shared = @NVMTL_AIRCACHE_DIR;
+    else if (spv && [dir isEqualToString:spv])
+        shared = [[@NVMTL_AIRCACHE_DIR stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"spvcache"];
+    if (!shared || [dir isEqualToString:shared]) return nil;
+    return [shared stringByAppendingPathComponent:path.lastPathComponent];
+}
+static NSData *nvmtl_shared_data(NSString *path) {
+    NSString *tw = nvmtl_shared_twin(path);
+    NSData *d = tw ? [NSData dataWithContentsOfFile:tw] : nil;
+    if (d) gSharedHit++;
+    return d;
+}
 static NSString *nvmtl_spvcache_path_digest(const unsigned char h[CC_SHA256_DIGEST_LENGTH], NSString *stage) {
     // No tag, no file: an entry named without its modes could be served to a process in another mode.
     if (!strcmp(gXlateTag, "untagged")) return nil;
@@ -942,6 +970,9 @@ static NSString *nvmtl_air_to_text(NSData *air) {
 static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache) {
     NSString *hit = [NSString stringWithContentsOfFile:cache encoding:NSUTF8StringEncoding error:nil];
     if (hit.length) { gAirHit++; return nvmtl_air_text_made(hit); }
+    NSString *twin = nvmtl_shared_twin(cache);
+    hit = twin ? [NSString stringWithContentsOfFile:twin encoding:NSUTF8StringEncoding error:nil] : nil;
+    if (hit.length) { gAirHit++; gSharedHit++; return nvmtl_air_text_made(hit); }
     gAirMiss++;
     NSString *memoryIR = nvmtl_air_in_memory(air);
     if (memoryIR.length) {
@@ -1171,6 +1202,12 @@ static NSData *nvmtl_cache_read(NSString *path) {
     if (!path) return nil;
     size_t n = 0; nvmtl_cf_status st = NVMTL_CF_MISSING;
     uint8_t *b = nvmtl_cf_read(path.fileSystemRepresentation, &n, &st);
+    if (!b && st == NVMTL_CF_MISSING) {   // not in this process's folder: the shared one (its bad files are not ours to remove)
+        NSString *tw = nvmtl_shared_twin(path);
+        nvmtl_cf_status st2 = NVMTL_CF_MISSING;
+        if (tw) b = nvmtl_cf_read(tw.fileSystemRepresentation, &n, &st2);
+        if (b) gSharedHit++;
+    }
     if (!b) {
         if (st != NVMTL_CF_MISSING) {
             unsigned long k = atomic_fetch_add(&gCacheRefused, 1) + 1;
@@ -1395,9 +1432,9 @@ NSDictionary<NSString *, NSData *> *nvmtl_index_metallib_uncached(NSData *lib, N
         i += off + size - 1;
     }
     nvlog("library: metallib %lu bytes, %lu bitcode blobs, %lu entries indexed, %lu visible"
-          " | aircache %lu hit, %lu miss, %lu stored | spvcache %lu hit, %lu miss, %lu stored (%s)",
+          " | aircache %lu hit, %lu miss, %lu stored | spvcache %lu hit, %lu miss, %lu stored | shared %lu hit (%s)",
           (unsigned long)n, (unsigned long)found, (unsigned long)out.count, (unsigned long)visible,
-          gAirHit, gAirMiss, gAirStored, gSpvHit, gSpvMiss, gSpvStored, nvmtl_aircache_dir().UTF8String);
+          gAirHit, gAirMiss, gAirStored, gSpvHit, gSpvMiss, gSpvStored, gSharedHit, nvmtl_aircache_dir().UTF8String);
     if (stageOut) *stageOut = [stages copy];
     if (airOut) *airOut = [airs copy];
     return (out.count || visible) ? [out copy] : nil;
@@ -1492,6 +1529,7 @@ static NSDictionary *nvmtl_index_from_record(NSData *lib, NSDictionary *rec, NSD
 static NSDictionary *nvmtl_index_metallib_disk(NSData *lib, NSData *key, NSDictionary **stageOut, NSDictionary **airOut) {
     NSString *p = getenv("NVMTL_IDXCACHE_OFF") ? nil : nvmtl_idx_path(key);
     NSData *d = p ? [NSData dataWithContentsOfFile:p] : nil;
+    if (!d && p) d = nvmtl_shared_data(p);
     if (d) {
         NSDictionary *rec = [NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:NULL];
         NSDictionary *st = nil, *ai = nil; NSArray *ext = nil;
@@ -1554,6 +1592,7 @@ NSData *nvmtl_libkey_for_file(NSString *path, NSData *lib, const struct stat *be
     NSString *rp = [nvmtl_aircache_dir() stringByAppendingPathComponent:@(name)];
     uint8_t edge[32]; nvmtl_lk1_edge(lib, edge);
     nvmtl_lk1_rec r; NSData *rd = [NSData dataWithContentsOfFile:rp];
+    if (rd.length != sizeof r) { NSData *sd = nvmtl_shared_data(rp); if (sd.length == sizeof r) rd = sd; }
     if (rd.length == sizeof r) {
         memcpy(&r, rd.bytes, sizeof r);
         const int stat_eq = !memcmp(r.magic, "NVLK1\0\0\0", 8) && r.dev == (uint64_t)now.st_dev && r.ino == (uint64_t)now.st_ino &&
