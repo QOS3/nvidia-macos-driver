@@ -11,6 +11,8 @@ rm = (root / 'kexts/NVRM/nvrm_ddc.cpp').read_text()
 hook = (root / 'kexts/NVRM/NVRM.cpp').read_text()
 assert filecmp.cmp(root / 'kexts/NVRMFB/nvrm_ddc_abi.h', root / 'kexts/NVRM/nvrm_ddc_abi.h', shallow=False), 'the two copies of the DDC ABI header differ'
 assert 'IOReturn NVRMNVDAFramebuffer::doI2CRequest(' in fb and 'kIOFBI2CInterfaceInfoKey' in fb, 'the framebuffer no longer publishes an I2C bus'
+pub = fb[fb.index('void NVRMNVDAFramebuffer::publishDdcBus()'):fb.index('\n}\n', fb.index('void NVRMNVDAFramebuffer::publishDdcBus()')) + 3]
+assert 'kIOI2CInterfaceIDKey' in pub, 'publishDdcBus must set kIOI2CInterfaceIDKey so IOFramebufferI2CInterface::start succeeds'
 assert 'PE_parse_boot_argn("nvrmfbddc"' in fb and 'PE_parse_boot_argn("nvrmfbddc"' in rm, 'DDC must be opt-in on both kexts'
 assert fb.index('publishDdcBus();') < fb.index('if (!super::start(provider))'), 'the bus must be published before super::start'
 assert 'isEqualTo("NVRMDdcTransfer")' in hook and 'nvrm_ddc_transfer' in hook, 'NVRM does not answer NVRMDdcTransfer'

@@ -107,29 +107,49 @@ static uint32_t numberValue(OSDictionary *dict, const char *key) {
     auto number = OSDynamicCast(OSNumber, dict->getObject(key));
     return number ? number->unsigned32BitValue() : 0xFFFFFFFF;
 }
+static bool hasTranslationEntry(OSArray *entries, uint32_t layout, uint32_t sourceDid, uint32_t standInDid) {
+    if (!entries) return false;
+    for (unsigned i = 0; i < entries->getCount(); i++) {
+        auto entry = OSDynamicCast(OSDictionary, entries->getObject(i));
+        if (entry && numberValue(entry, "LayoutID") == layout && numberValue(entry, "VID") == 0x10DE &&
+            numberValue(entry, "SourceDID") == sourceDid && numberValue(entry, "StandInDID") == standInDid)
+            return true;
+    }
+    return false;
+}
 static bool restoreNvidiaDeviceId(IOService *self, IOService *provider) {
     uint32_t layout = readU32(provider, "layout-id");
     uint32_t device = readU32(provider, "device-id");
     // Without a layout, the native translation key cannot be built; keep the normal probe path.
     if (layout == 0xFFFFFFFF) return true;
     if (device == 0xFFFFFFFF) return false;
+    // AppleALC replaces AppleHDAController's PCI ID read with one of its shared Intel stand-ins (by PCH generation).
+    // Include all three so NVIDIA HDAU restores its real device-id regardless of which PCH onboard audio is present.
+    static const uint32_t kAppleAlcIntelSpoofs[] { 0x9D70, 0xA170, 0xA348 };
+    const uint32_t standIn = device & 0xFFFF;
     auto existing = OSDynamicCast(OSArray, self->getProperty("HwFactoryPrefixTranslation"));
-    if (existing) {
-        for (unsigned i = 0; i < existing->getCount(); i++) {
-            auto entry = OSDynamicCast(OSDictionary, existing->getObject(i));
-            if (entry && numberValue(entry, "LayoutID") == layout && numberValue(entry, "VID") == 0x10DE &&
-                numberValue(entry, "SourceDID") == 0x9D70 && numberValue(entry, "StandInDID") == (device & 0xFFFF))
-                return true;
+    bool missing = false;
+    for (auto sourceDid : kAppleAlcIntelSpoofs) {
+        if (!hasTranslationEntry(existing, layout, sourceDid, standIn)) {
+            missing = true;
+            break;
         }
     }
-    auto entries = existing ? OSArray::withArray(existing) : OSArray::withCapacity(1);
-    auto entry = OSDictionary::withCapacity(4);
-    bool ok = entries && entry && setNumber(entry, "LayoutID", layout) &&
-        setNumber(entry, "VID", 0x10DE) && setNumber(entry, "SourceDID", 0x9D70) &&
-        setNumber(entry, "StandInDID", device & 0xFFFF) && entries->setObject(entry) &&
-        self->setProperty("HwFactoryPrefixTranslation", entries);
-    if (entry) entry->release();
-    if (entries) entries->release();
+    if (!missing) return true;
+    auto entries = existing ? OSArray::withArray(existing) : OSArray::withCapacity(arrsize(kAppleAlcIntelSpoofs));
+    if (!entries) return false;
+    bool ok = true;
+    for (auto sourceDid : kAppleAlcIntelSpoofs) {
+        if (hasTranslationEntry(entries, layout, sourceDid, standIn)) continue;
+        auto entry = OSDictionary::withCapacity(4);
+        bool added = entry && setNumber(entry, "LayoutID", layout) &&
+            setNumber(entry, "VID", 0x10DE) && setNumber(entry, "SourceDID", sourceDid) &&
+            setNumber(entry, "StandInDID", standIn) && entries->setObject(entry);
+        if (entry) entry->release();
+        if (!added) { ok = false; break; }
+    }
+    if (ok) ok = self->setProperty("HwFactoryPrefixTranslation", entries);
+    entries->release();
     return ok;
 }
 static IOService *wrapProbe(IOService *self, IOService *provider, SInt32 *score) {
@@ -190,10 +210,7 @@ static void onHdaLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_ad
     if (orgProbe) return;
     auto probe = patcher.solveSymbol(index, "__ZN18AppleHDAController5probeEP9IOServicePi", address, size);
     patcher.clearError();
-    if (!probe) {
-        report("nmhda-controller", "could not find AppleHDAController probe in runtime image %lu", (unsigned long)index);
-        return;
-    }
+    if (!probe) return;
     report("nmhda-controller", "AppleHDAController runtime image %lu (registered %lu)",
            (unsigned long)index, (unsigned long)kHda.loadIndex);
     kHda.loadIndex = index;

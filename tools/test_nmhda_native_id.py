@@ -158,13 +158,17 @@ int main() {
     orgProbe = original;
     assert(wrapProbe(&controller, &nvidia, &score) == &controller && probeCalls == 1);
     auto entries = dynamic_cast<OSArray *>(controller.getProperty("HwFactoryPrefixTranslation"));
-    assert(entries && entries->getCount() == 2 && entries->getObject(0) == unrelated);
-    auto translation = dynamic_cast<OSDictionary *>(entries->getObject(1));
-    for (auto pair : std::map<std::string, uint32_t>{{"LayoutID", 7}, {"VID", 0x10de}, {"SourceDID", 0x9d70}, {"StandInDID", 0x22e9}})
-        assert(dynamic_cast<OSNumber *>(translation->getProperty(pair.first.c_str()))->value == pair.second);
+    assert(entries && entries->getCount() == 4 && entries->getObject(0) == unrelated);
+    const uint32_t expectedSpoofs[] = { 0x9d70, 0xa170, 0xa348 };
+    for (unsigned idx = 0; idx < 3; ++idx) {
+        auto translation = dynamic_cast<OSDictionary *>(entries->getObject(idx + 1));
+        assert(translation);
+        for (auto pair : std::map<std::string, uint32_t>{{"LayoutID", 7}, {"VID", 0x10de}, {"SourceDID", expectedSpoofs[idx]}, {"StandInDID", 0x22e9}})
+            assert(dynamic_cast<OSNumber *>(translation->getProperty(pair.first.c_str()))->value == pair.second);
+    }
     assert(entries != prior && prior->getCount() == 1);
     assert(wrapProbe(&controller, &nvidia, &score) == &controller && probeCalls == 2);
-    assert(dynamic_cast<OSArray *>(controller.getProperty("HwFactoryPrefixTranslation"))->getCount() == 2);
+    assert(dynamic_cast<OSArray *>(controller.getProperty("HwFactoryPrefixTranslation"))->getCount() == 4);
     prior->release();
 
     IOService noLayoutController;
