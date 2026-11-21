@@ -1445,7 +1445,10 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
 static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
-static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane); }
+static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) {
+    static const CFStringRef k[4] = { CFSTR("NVMTLVramAt:p0"), CFSTR("NVMTLVramAt:p1"), CFSTR("NVMTLVramAt:p2"), CFSTR("NVMTLVramAt:p3") };
+    return plane < 4 ? (CFStringRef)CFRetain(k[plane]) : CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane);
+}
 static int nvmtl_vram_tag_current(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
 {
     CFStringRef k = nvmtl_vram_tag_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
@@ -1484,7 +1487,10 @@ typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint
 #define NVMTL_BUSY_WAIT_NS  (10ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
-static CFStringRef nvmtl_busy_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane); }
+static CFStringRef nvmtl_busy_key(NSUInteger plane) {
+    static const CFStringRef k[4] = { CFSTR("NVMTLBusyAt:p0"), CFSTR("NVMTLBusyAt:p1"), CFSTR("NVMTLBusyAt:p2"), CFSTR("NVMTLBusyAt:p3") };
+    return plane < 4 ? (CFStringRef)CFRetain(k[plane]) : CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane);
+}
 static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *out)
 {
     CFStringRef k = nvmtl_busy_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
