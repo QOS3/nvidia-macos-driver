@@ -8769,6 +8769,14 @@ void nvmtl_vk_image_destroy(nvk_image *i)
     pthread_mutex_unlock(&g_fx_lock);
     t_fx_dying = NULL;
     if (nvmtl_image_grace_on()) {
+        pthread_mutex_lock(&g_grace_lock);
+        const uint64_t seq = nvmtl_grace_seq_locked();
+        const uint64_t fin = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
+        pthread_mutex_unlock(&g_grace_lock);
+        if (seq <= fin) {
+            nvmtl_vk_image_destroy_now(i);
+            return;
+        }
         nvmtl_grace_img *e = calloc(1, sizeof *e);
         if (e) {
             e->img = *i; memset(i, 0, sizeof *i);
@@ -11412,8 +11420,13 @@ static int private_pool_buffer_create(size_t size, nvk_buffer *out)
 static int image_pool_bind(nvk_image *out)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_IMAGE_POOL"); on = e && e[0] == '1';
-        if (on) nvlog("vk: optimal images of up to %u KB share %u MiB VRAM blocks (NVMTL_IMAGE_POOL=1)", NVMTL_POOL_MAX >> 10, NVMTL_POOL_BLOCK >> 20); }
+    if (on < 0) {
+        const char *e = getenv("NVMTL_IMAGE_POOL");
+        const char *me = getprogname();
+        const int is_ws = me && !strcmp(me, "WindowServer");
+        on = e && (e[0] == '2' || (e[0] == '1' && !is_ws));
+        if (on) nvlog("vk: optimal images of up to %u KB share %u MiB VRAM blocks (NVMTL_IMAGE_POOL=%s)", NVMTL_POOL_MAX >> 10, NVMTL_POOL_BLOCK >> 20, e);
+    }
     if (!on) return -1;
     VkMemoryDedicatedRequirements dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
     VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated };
