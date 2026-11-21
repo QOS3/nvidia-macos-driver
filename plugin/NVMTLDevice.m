@@ -1572,6 +1572,7 @@ static void nvmtl_ic_destroy_all(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
 {
     for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_vk_buffer_destroy(&b); }
 }
+static _Atomic uint64_t g_ic_next_expire;
 static void nvmtl_ic_expire_now(void)
 {
     unsigned char gone[NVMTL_IC_SLOTS][NVMTL_IC_PAYLOAD];
@@ -1586,12 +1587,17 @@ static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
 {
     const uint32_t sid = IOSurfaceGetID(surf);
     if (!nvmtl_ic_on() || need > nvmtl_ic_max_bytes()) return nvmtl_vk_surface_vram(sid, 0, need, out);
-    nvmtl_ic_expire_now();
     const uint64_t have = nvmtl_ic_cookie_read(surf);
-    os_unfair_lock_lock(&g_ic_lock);
-    const int hit = have && nvmtl_ic_acquire(&g_ic, sid, need, have, out, sizeof *out);
-    os_unfair_lock_unlock(&g_ic_lock);
-    if (hit) return 0;
+    if (have) {
+        os_unfair_lock_lock(&g_ic_lock);
+        const int hit = nvmtl_ic_acquire(&g_ic, sid, need, have, out, sizeof *out);
+        os_unfair_lock_unlock(&g_ic_lock);
+        if (hit) return 0;
+    }
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t next_exp = atomic_load_explicit(&g_ic_next_expire, memory_order_relaxed);
+    if (now >= next_exp && atomic_compare_exchange_strong(&g_ic_next_expire, &next_exp, now + 250000000ull))
+        nvmtl_ic_expire_now();
     if (nvmtl_vk_surface_vram(sid, 0, need, out)) return -1;
     static _Atomic uint64_t next = 1;
     const uint64_t cookie = ((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu);
