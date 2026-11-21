@@ -2,7 +2,9 @@
 #include "channel.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "class/cl0002.h"
 #include "class/clc56f.h"
 #include "class/clc361.h"
@@ -120,3 +122,25 @@ NV_STATUS chan_fault(Chan *c, NvU64 *addr, NvU32 *type, char str[32])
 }
 
 size_t chan_push_used(Chan *c) { return (size_t)((NvU8 *)c->cur - (NvU8 *)c->push.cpu); }
+
+void chan_wait_sem(volatile NvU32 *sv, NvU32 val, double t0, double limit_ms, double (*now_fn)(void))
+{
+    static int spin_only = -1;
+    if (spin_only < 0) { const char *e = getenv("NVDEC_WAIT_SPIN"); spin_only = e && e[0] == '1'; }
+    if (spin_only) {
+        while (sv[0] != val && now_fn() - t0 < limit_ms) { }
+        return;
+    }
+    for (int i = 0; i < 256; i++) {
+        if (sv[0] == val) return;
+#if defined(__x86_64__)
+        for (int p = 0; p < 32; p++) __builtin_ia32_pause();
+#endif
+    }
+    while (sv[0] != val) {
+        const double el = now_fn() - t0;
+        if (el >= limit_ms) break;
+        struct timespec ts = { 0, el < 2.0 ? 50000 : 200000 };
+        nanosleep(&ts, NULL);
+    }
+}
