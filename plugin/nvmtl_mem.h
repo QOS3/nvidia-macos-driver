@@ -11,8 +11,15 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef struct { const void *mem; uint64_t base, size, seq, died; uint32_t type; char kind[40]; } nvmtl_mm_entry;
-typedef struct { nvmtl_mm_entry *e; uint32_t n, cap; uint64_t live, unbased; } nvmtl_mm_state;
+typedef struct { const void *mem; uint64_t base, size, seq, died; uint32_t type, chain; char kind[40]; } nvmtl_mm_entry;
+enum { NVMTL_MM_BUCKETS = 16384 };
+typedef struct { nvmtl_mm_entry *e; uint32_t n, cap; uint64_t live, unbased; uint32_t heads[NVMTL_MM_BUCKETS]; } nvmtl_mm_state;
+static inline uint32_t nvmtl_mm_bucket(const void *mem)
+{
+    uint64_t key = (uint64_t)(uintptr_t)mem;
+    key ^= key >> 33; key *= UINT64_C(0xff51afd7ed558ccd); key ^= key >> 33;
+    return (uint32_t)key & (NVMTL_MM_BUCKETS - 1);
+}
 typedef struct { const void *img, *mem; uint64_t off; } nvmtl_mb_entry;
 enum { NVMTL_MB_N = 4096 };
 typedef struct { nvmtl_mb_entry e[NVMTL_MB_N]; uint32_t n; } nvmtl_mb_state;   /* the last image binds: image -> memory + offset */
@@ -25,6 +32,7 @@ static inline uint32_t nvmtl_mm_add(nvmtl_mm_state *s, const void *mem, uint64_t
     if (s->n == s->cap) { const uint32_t cap = s->cap ? s->cap * 2 : 1024; nvmtl_mm_entry *e = (nvmtl_mm_entry *)realloc(s->e, (size_t)cap * sizeof *e); if (!e) return 0; s->e = e; s->cap = cap; }
     nvmtl_mm_entry *e = &s->e[s->n++];
     e->mem = mem; e->base = base; e->size = size; e->type = type; e->seq = seq; e->died = 0; snprintf(e->kind, sizeof e->kind, "%s", kind ? kind : "?");
+    { const uint32_t b = nvmtl_mm_bucket(mem); e->chain = s->heads[b]; s->heads[b] = s->n; }
     s->live++; if (!base) s->unbased++;
     return s->n;
 }
@@ -32,7 +40,8 @@ static inline uint32_t nvmtl_mm_add(nvmtl_mm_state *s, const void *mem, uint64_t
 static inline nvmtl_mm_entry *nvmtl_mm_by_mem(const nvmtl_mm_state *s, const void *mem)
 {
     if (!mem) return NULL;
-    for (uint32_t i = s->n; i-- > 0;) if (s->e[i].mem == mem) return &s->e[i];
+    for (uint32_t i = s->heads[nvmtl_mm_bucket(mem)]; i && i <= s->n; i = s->e[i - 1].chain)
+        if (s->e[i - 1].mem == mem) return &s->e[i - 1];
     return NULL;
 }
 static inline void nvmtl_mm_died(nvmtl_mm_state *s, const void *mem, uint64_t seq)
