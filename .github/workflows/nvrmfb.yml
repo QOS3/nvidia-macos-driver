@@ -15,10 +15,18 @@ jobs:
           ls -d /Applications/Xcode*.app
           X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
           sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
-      - name: NVIDIA open-gpu-kernel-modules headers (620.70.06)
+      - name: NVIDIA open-gpu-kernel-modules headers (620.70.06 + NVRM patches)
         run: |
           mkdir -p ogkm
           curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm
+          for f in kexts/NVRM/patches/*.patch; do
+            ok=0
+            for root in "" "src/nvidia-modeset"; do
+              ( cd "ogkm/$root" && patch -p1 --fuzz=0 --dry-run < "$GITHUB_WORKSPACE/$f" >/dev/null 2>&1 && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$f" >/dev/null ) && { ok=1; break; }
+            done
+            [ "$ok" = 1 ] || { echo "STOP: $(basename "$f") failed on ogkm"; exit 2; }
+            echo "applied $(basename "$f")"
+          done
           ls -la ogkm/src/nvidia-modeset/interface
       - name: Build base (3.0, main) and loq-perf
         run: |
