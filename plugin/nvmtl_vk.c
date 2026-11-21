@@ -4258,6 +4258,40 @@ static int nvmtl_spirv_uses_set(const void *code, size_t words, uint32_t set)
     return 0;
 }
 
+#define NVMTL_DESC_FREE_CAP 512
+static nvk_setref g_desc_free[2][NVMTL_DESC_FREE_CAP];
+static unsigned   g_desc_nfree[2];
+static int nvmtl_desc_recycle_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_DESC_RECYCLE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static void nvmtl_desc_release_locked(const nvk_setref *refs, unsigned n, int recycle)
+{
+    const int can = recycle && g_state == 1 && nvmtl_desc_recycle_on();
+    VkDescriptorPool cur_pool = VK_NULL_HANDLE;
+    VkDescriptorSet run[256];
+    unsigned nrun = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (can && (refs[i].kind == 1u || refs[i].kind == 2u)) {
+            const unsigned gl = refs[i].kind - 1u;
+            if (g_desc_nfree[gl] < NVMTL_DESC_FREE_CAP) {
+                g_desc_free[gl][g_desc_nfree[gl]++] = refs[i];
+                continue;
+            }
+        }
+        VkDescriptorPool p = (VkDescriptorPool)refs[i].pool;
+        if (nrun && (p != cur_pool || nrun == 256)) {
+            pvkFreeDescriptorSets(g_dev, cur_pool, nrun, run);
+            nrun = 0;
+        }
+        cur_pool = p;
+        run[nrun++] = (VkDescriptorSet)refs[i].set;
+    }
+    if (nrun) pvkFreeDescriptorSets(g_dev, cur_pool, nrun, run);
+}
+
 #define NVMTL_DESC_BATCH_MAX 32
 static unsigned nvmtl_desc_batch(void)
 {
@@ -4291,60 +4325,69 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     VkDescriptorSet set = VK_NULL_HANDLE; VkDescriptorPool pool = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_POOL_MEMORY;
     const unsigned gl = uniform != NULL;
+    const unsigned kind = gl ? 2u : 1u;
     if (c->ndcache && c->dcache_gl_uniform != gl) {
-        VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
-        for (unsigned k = 0; k < c->ndcache; k++) back[k] = (VkDescriptorSet)c->dcache[k];
         pthread_mutex_lock(&g_desc_lock);
-        pvkFreeDescriptorSets(g_dev, (VkDescriptorPool)c->dcachepool, c->ndcache, back);
+        nvmtl_desc_release_locked(c->dcache, c->ndcache, 1);
         pthread_mutex_unlock(&g_desc_lock);
-        c->ndcache = 0; c->dcachepool = NULL;
+        c->ndcache = 0;
     }
     if (c->ndcache) {
-        set = (VkDescriptorSet)c->dcache[--c->ndcache];
-        pool = (VkDescriptorPool)c->dcachepool;
+        nvk_setref ref = c->dcache[--c->ndcache];
+        set = (VkDescriptorSet)ref.set;
+        pool = (VkDescriptorPool)ref.pool;
         r = VK_SUCCESS;
         if (c->nsets == c->capsets) {
             unsigned cap = c->capsets ? c->capsets * 2 : 64;
             nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
             if (grown) { c->sets = grown; c->capsets = cap; }
-            else { c->dcache[c->ndcache++] = (void *)set; c->skipped++; return VK_NULL_HANDLE; }
+            else { c->dcache[c->ndcache++] = ref; c->skipped++; return VK_NULL_HANDLE; }
         }
     } else {
         pthread_mutex_lock(&g_desc_lock);
         if (ensure_descriptors_locked()) { pthread_mutex_unlock(&g_desc_lock); c->skipped++; return VK_NULL_HANDLE; }
         unsigned n = nvmtl_desc_batch();
-        VkDescriptorSetLayout ls[NVMTL_DESC_BATCH_MAX];
-        VkDescriptorSet got[NVMTL_DESC_BATCH_MAX];
-        for (unsigned k = 0; k < NVMTL_DESC_BATCH_MAX; k++) ls[k] = gl ? g_glUniformLayout : g_setLayout;
-        for (;;) {
-            r = VK_ERROR_OUT_OF_POOL_MEMORY;
-            for (unsigned k = g_ndescPools; k-- > 0 && r != VK_SUCCESS;) {
-                VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[k], n, ls };
-                pool = g_descPools[k]; r = pvkAllocateDescriptorSets(g_dev, &ai, got);
+        if (nvmtl_desc_recycle_on() && g_desc_nfree[gl]) {
+            unsigned take = g_desc_nfree[gl] < n ? g_desc_nfree[gl] : n;
+            nvk_setref first = g_desc_free[gl][--g_desc_nfree[gl]];
+            set = (VkDescriptorSet)first.set;
+            pool = (VkDescriptorPool)first.pool;
+            c->dcache_gl_uniform = gl;
+            for (unsigned k = 1; k < take; k++) c->dcache[c->ndcache++] = g_desc_free[gl][--g_desc_nfree[gl]];
+            r = VK_SUCCESS;
+        } else {
+            VkDescriptorSetLayout ls[NVMTL_DESC_BATCH_MAX];
+            VkDescriptorSet got[NVMTL_DESC_BATCH_MAX];
+            for (unsigned k = 0; k < NVMTL_DESC_BATCH_MAX; k++) ls[k] = gl ? g_glUniformLayout : g_setLayout;
+            for (;;) {
+                r = VK_ERROR_OUT_OF_POOL_MEMORY;
+                for (unsigned k = g_ndescPools; k-- > 0 && r != VK_SUCCESS;) {
+                    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[k], n, ls };
+                    pool = g_descPools[k]; r = pvkAllocateDescriptorSets(g_dev, &ai, got);
+                }
+                if (r != VK_SUCCESS && nvmtl_desc_pool_open() == 0) {
+                    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[g_ndescPools - 1], n, ls };
+                    pool = g_descPools[g_ndescPools - 1]; r = pvkAllocateDescriptorSets(g_dev, &ai, got);
+                }
+                if (r == VK_SUCCESS || n == 1) break;
+                n = 1;
             }
-            if (r != VK_SUCCESS && nvmtl_desc_pool_open() == 0) {
-                VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[g_ndescPools - 1], n, ls };
-                pool = g_descPools[g_ndescPools - 1]; r = pvkAllocateDescriptorSets(g_dev, &ai, got);
+            if (r == VK_SUCCESS) {
+                set = got[0];
+                c->dcache_gl_uniform = gl;
+                for (unsigned k = 1; k < n; k++) c->dcache[c->ndcache++] = (nvk_setref){ (void *)pool, (void *)got[k], kind };
             }
-            if (r == VK_SUCCESS || n == 1) break;
-            n = 1;
-        }
-        if (r == VK_SUCCESS) {
-            set = got[0];
-            c->dcachepool = (void *)pool; c->dcache_gl_uniform = gl;
-            for (unsigned k = 1; k < n; k++) c->dcache[c->ndcache++] = (void *)got[k];
         }
         if (r == VK_SUCCESS && c->nsets == c->capsets) {
             unsigned cap = c->capsets ? c->capsets * 2 : 64;
             nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
             if (grown) { c->sets = grown; c->capsets = cap; }
             else {
-                pvkFreeDescriptorSets(g_dev, pool, 1, &set);
+                nvk_setref one = { (void *)pool, (void *)set, kind };
+                nvmtl_desc_release_locked(&one, 1, 1);
                 if (c->ndcache) {
-                    VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
-                    for (unsigned k = 0; k < c->ndcache; k++) back[k] = (VkDescriptorSet)c->dcache[k];
-                    pvkFreeDescriptorSets(g_dev, pool, c->ndcache, back);
-                    c->ndcache = 0; c->dcachepool = NULL;
+                    nvmtl_desc_release_locked(c->dcache, c->ndcache, 1);
+                    c->ndcache = 0;
                 }
                 r = VK_ERROR_OUT_OF_HOST_MEMORY;
             }
@@ -4355,7 +4398,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         nvlog("vk: descriptor set allocation FAILED (%d) with %u pools — this draw is SKIPPED, not recorded blind", r, g_ndescPools);
         c->skipped++; return VK_NULL_HANDLE;
     }
-    c->sets[c->nsets++] = (nvk_setref){ pool, set };
+    c->sets[c->nsets++] = (nvk_setref){ pool, set, kind };
     VkWriteDescriptorSet w[NVMTL_NBIND + 1];
     VkCopyDescriptorSet cp[NVMTL_NBIND]; uint32_t ncp = 0;
     if (!from) copym = NULL;
@@ -4757,7 +4800,7 @@ static VkDescriptorSet nvmtl_fetch_set_make(nvk_cmdbuf *c, uint32_t mask)
         if (!grown) { pthread_mutex_lock(&g_desc_lock); pvkFreeDescriptorSets(g_dev, pool, 1, &set); pthread_mutex_unlock(&g_desc_lock); return VK_NULL_HANDLE; }
         c->sets = grown; c->capsets = cap;
     }
-    c->sets[c->nsets++] = (nvk_setref){ pool, set };   // freed with the command buffer's other sets
+    c->sets[c->nsets++] = (nvk_setref){ pool, set, 0u };   // freed with the command buffer's other sets
     VkDescriptorImageInfo ii[NVMTL_NCOL]; VkWriteDescriptorSet w[NVMTL_NCOL]; uint32_t nw = 0;
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) {
         if (!(mask & (1u << i))) continue;
@@ -4936,7 +4979,7 @@ static VkDescriptorSet nvmtl_fcopy_set(nvk_cmdbuf *c, uint32_t mask)
         if (!grown) { pthread_mutex_lock(&g_desc_lock); pvkFreeDescriptorSets(g_dev, pool, 1, &set); pthread_mutex_unlock(&g_desc_lock); return VK_NULL_HANDLE; }
         c->sets = grown; c->capsets = cap;
     }
-    c->sets[c->nsets++] = (nvk_setref){ pool, set };
+    c->sets[c->nsets++] = (nvk_setref){ pool, set, 0u };
     VkDescriptorImageInfo ii[NVMTL_NCOL]; VkWriteDescriptorSet w[NVMTL_NCOL]; uint32_t nw = 0;
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) {
         if (!(mask & (1u << i))) continue;
@@ -8275,28 +8318,20 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
     free(c->fbs); c->fbs = NULL; c->nfb = c->capfb = 0; c->fb = NULL;
     for (unsigned i = 0; i < c->nrv; i++) pvkDestroyImageView(g_dev, (VkImageView)c->rvs[i], NULL);
     free(c->rvs); c->rvs = NULL; c->nrv = c->caprv = 0;
-    if (c->ndcache) {
+    const int keep = nvmtl_keep_verdict(c->wseq);
+    if (c->ndcache || c->nsets) {
         pthread_mutex_lock(&g_desc_lock);
-        VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
-        for (unsigned i = 0; i < c->ndcache && i < NVMTL_DESC_BATCH_MAX; i++) back[i] = (VkDescriptorSet)c->dcache[i];
-        pvkFreeDescriptorSets(g_dev, (VkDescriptorPool)c->dcachepool, c->ndcache, back);
-        pthread_mutex_unlock(&g_desc_lock);
-        c->ndcache = 0; c->dcachepool = NULL;
-    }
-    if (c->nsets) {
-        pthread_mutex_lock(&g_desc_lock);
-        for (unsigned i = 0; i < c->nsets;) {
-            VkDescriptorPool p = (VkDescriptorPool)c->sets[i].pool; VkDescriptorSet run[256]; unsigned n = 0;
-            while (i < c->nsets && c->sets[i].pool == (void *)p && n < 256) run[n++] = (VkDescriptorSet)c->sets[i++].set;
-            pvkFreeDescriptorSets(g_dev, p, n, run);
+        if (c->ndcache) {
+            nvmtl_desc_release_locked(c->dcache, c->ndcache, 1);
+            c->ndcache = 0;
         }
+        if (c->nsets) nvmtl_desc_release_locked(c->sets, c->nsets, keep > 0);
         pthread_mutex_unlock(&g_desc_lock);
     }
     free(c->sets); c->sets = NULL; c->nsets = c->capsets = 0; c->nobind = 0; c->skipped = 0;
     c->fetch_last_set = NULL;   // freed with the sets above
     free(c->table); c->table = NULL;
     nvmtl_address_page *page = c->address_pages;
-    const int keep = nvmtl_keep_verdict(c->wseq);
     // A page is reused or destroyed only once the queue has completed the highest submit that referenced it
     // (nvmtl_page_life.h). On the ordinary path that is this command buffer's own submit, already completed by the
     // fence wait above, so the page goes straight on; a page a later submit still reads cools until that completes.
