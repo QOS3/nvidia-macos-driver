@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define NVMTL_IC_SLOTS 128
+#define NVMTL_IC_SLOTS 256
 #define NVMTL_IC_PAYLOAD 160
 typedef struct {
     uint32_t sid; size_t need; uint64_t cookie;
