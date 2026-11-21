@@ -1,0 +1,45 @@
+name: nvrmfb
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['kexts/NVRMFB/**', '.github/workflows/nvrmfb.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: NVIDIA open-gpu-kernel-modules headers (620.70.06)
+        run: |
+          mkdir -p ogkm
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm
+          ls -la ogkm/src/nvidia-modeset/interface
+      - name: Build base (3.0, main) and loq-perf
+        run: |
+          build() {  # $1 = git rev, $2 = out dir
+            rm -rf "src-$2" "out/$2" && mkdir -p "src-$2" "out/$2"
+            git archive "$1" kexts/NVRMFB kexts/NMHDA build | tar x -C "src-$2"
+            OGKM="$GITHUB_WORKSPACE/ogkm" MINVER=15.0 bash "src-$2/build/fb_build.sh" "src-$2/kexts" "$GITHUB_WORKSPACE/out/$2" \
+              || { cat "$GITHUB_WORKSPACE/out/$2/fb.err" "$GITHUB_WORKSPACE/out/$2/fbld.err" 2>/dev/null; return 1; }
+            echo "$2: warnings $(grep -c ': warning:' out/$2/fb.err || true), minos $(vtool -show-build out/$2/NVRMFB.kext/Contents/MacOS/NVRMFB | awk '/minos/{print $2; exit}')"
+            git rev-parse "$1" > "out/$2/rev.txt"
+            nm -gU "out/$2/NVRMFB.kext/Contents/MacOS/NVRMFB" | awk '{print $3}' | sort > "out/$2/exports.txt"
+            nm -u  "out/$2/NVRMFB.kext/Contents/MacOS/NVRMFB" | sort -u > "out/$2/undefs.txt"
+            strings -a "out/$2/NVRMFB.kext/Contents/MacOS/NVRMFB" | sort -u > "out/$2/strings.txt"
+            shasum -a 256 "out/$2/NVRMFB.kext/Contents/MacOS/NVRMFB"
+          }
+          build origin/main base
+          build HEAD loq
+          ls -la out/*
+          echo "exports only in base:"; comm -23 out/base/exports.txt out/loq/exports.txt | head
+          echo "exports only in loq:";  comm -13 out/base/exports.txt out/loq/exports.txt | head
+          echo "undefs only in base:";  comm -23 out/base/undefs.txt  out/loq/undefs.txt  | head -30
+          echo "undefs only in loq:";   comm -13 out/base/undefs.txt  out/loq/undefs.txt  | head -30
+      - uses: actions/upload-artifact@v4
+        with: { name: NVRMFB, path: out/ }
