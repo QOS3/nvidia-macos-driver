@@ -45,6 +45,11 @@ int main(void)
     nvmtl_ic_release(c, 0x10000 + 7, 500, gone); nvmtl_ic_release(c, 0x10000 + 9, 100, gone);
     ARM("a full table gives up the idle entry unused longest",
         nvmtl_ic_insert(c, 900, 64, 1, (uintptr_t)extra.buf, &extra, sizeof extra, ev, &evid) == 1 && evid == 0x10000 + 9 && ((H *)ev)->tag == 9);
+    nvmtl_ic_release(c, (uintptr_t)extra.buf, 50, gone);
+    ARM("byte budget eviction reclaims oldest idle entries until within budget",
+        c->total_bytes == NVMTL_IC_SLOTS * 64 &&
+        nvmtl_ic_evict_budget(c, (NVMTL_IC_SLOTS - 2) * 64, list, 4) == 2 &&
+        c->total_bytes == (NVMTL_IC_SLOTS - 2) * 64);
     free(c);
     return fails ? 1 : 0;
 }
