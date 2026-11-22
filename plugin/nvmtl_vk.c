@@ -339,57 +339,116 @@ static int nvmtl_image_grace_on(void)
         if (on) nvlog("vk: dead images are released only after the submits in flight at their death complete (NVMTL_IMAGE_GRACE=1)"); }
     return on;
 }
+#define NVMTL_GRACE_MAX_HELD 64
+#define NVMTL_GRACE_MAX_PENDING 8
 typedef struct nvmtl_grace_img { nvk_image img; void *bufview, *alias; uint64_t seq; struct nvmtl_grace_img *next; } nvmtl_grace_img;
 static pthread_mutex_t g_grace_lock = PTHREAD_MUTEX_INITIALIZER;
-static nvmtl_grace_img *g_grace_head, *g_grace_tail; static uint64_t g_grace_n, g_grace_reaped, g_cmd_finished_seq;
+static nvmtl_grace_img *g_grace_head, *g_grace_tail; static _Atomic uint64_t g_grace_n; static uint64_t g_grace_reaped, g_cmd_finished_seq;
 static void nvmtl_vk_image_destroy_now(nvk_image *i);
 static void nvmtl_dlss_views_drop(VkImage img);   // DLSS Super Resolution section, near the end
-/* The lifetime horizon and all changes to its counts share g_grace_lock.
-   Diagnostic readers may read the atomic counts without that lock. Queue sequence
-   allocation additionally remains inside the queue submission critical section. */
+/* The lifetime horizon and all changes to its counts share g_grace_lock when IMAGE_GRACE=1.
+   When IMAGE_GRACE=0, cmd counters use lockless atomics. */
 static uint64_t nvmtl_life_begin(void)
 {
+    if (!nvmtl_image_grace_on())
+        return __atomic_add_fetch(&g_cmd_begun, 1, __ATOMIC_RELAXED);
     pthread_mutex_lock(&g_grace_lock);
-    uint64_t id = ++g_cmd_begun;
+    uint64_t id = __atomic_add_fetch(&g_cmd_begun, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_grace_lock);
     return id;
 }
 static void nvmtl_life_abandon(void)
 {
-    pthread_mutex_lock(&g_grace_lock); ++g_cmd_abandoned; pthread_mutex_unlock(&g_grace_lock);
+    if (!nvmtl_image_grace_on()) {
+        __atomic_add_fetch(&g_cmd_abandoned, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    pthread_mutex_lock(&g_grace_lock);
+    __atomic_add_fetch(&g_cmd_abandoned, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_grace_lock);
 }
 static uint64_t nvmtl_life_submit(void)
 {
+    if (!nvmtl_image_grace_on())
+        return __atomic_add_fetch(&g_cmd_submitted, 1, __ATOMIC_ACQ_REL);
     pthread_mutex_lock(&g_grace_lock);
-    uint64_t id = ++g_cmd_submitted;
+    uint64_t id = __atomic_add_fetch(&g_cmd_submitted, 1, __ATOMIC_ACQ_REL);
     pthread_mutex_unlock(&g_grace_lock);
     return id;
 }
 
-// The submit a dead resource must outlive: every submit in flight at its death AND every command buffer already begun
-// but not yet submitted - a command buffer records the handle, is committed after the app released the resource, and
-// only then reads the slot. Pending command buffers submit after the ones in flight, so the bound is the count begun
-// less the abandoned ones; a bound too high only holds the release a little longer.
+// The submit a dead resource must outlive: every submit in flight at its death plus bounded pending CBs.
+// Capping pending prevents an unsubmitted CB from pinning dead images forever.
 static uint64_t nvmtl_grace_seq_locked(void)
 {
-    const uint64_t pending = g_cmd_begun > g_cmd_submitted + g_cmd_abandoned ? g_cmd_begun - g_cmd_submitted - g_cmd_abandoned : 0;
-    return g_cmd_submitted + pending;
+    const uint64_t begun = __atomic_load_n(&g_cmd_begun, __ATOMIC_RELAXED);
+    const uint64_t sub = __atomic_load_n(&g_cmd_submitted, __ATOMIC_RELAXED);
+    const uint64_t abn = __atomic_load_n(&g_cmd_abandoned, __ATOMIC_RELAXED);
+    uint64_t pending = begun > sub + abn ? begun - sub - abn : 0;
+    if (pending > NVMTL_GRACE_MAX_PENDING) pending = NVMTL_GRACE_MAX_PENDING;
+    return sub + pending;
 }
 static void nvmtl_vk_texel_view_destroy_now(void *alias, void *view);
-static void nvmtl_image_grace_reap(void)
+static void nvmtl_grace_destroy_list(nvmtl_grace_img *due)
 {
-    nvmtl_grace_img *due = NULL, **tail = &due; uint64_t n = 0;
+    while (due) {
+        nvmtl_grace_img *e = due; due = e->next;
+        if (e->bufview || e->alias) nvmtl_vk_texel_view_destroy_now(e->alias, e->bufview);
+        else nvmtl_vk_image_destroy_now(&e->img);
+        free(e);
+    }
+}
+static int nvmtl_image_grace_enqueue(const nvk_image *img, void *bufview, void *alias)
+{
+    nvmtl_grace_img *due = NULL, **tail = &due;
     pthread_mutex_lock(&g_grace_lock);
-    while (g_grace_head && g_grace_head->seq <= g_cmd_finished_seq) {
-        nvmtl_grace_img *e = g_grace_head; g_grace_head = e->next; if (!g_grace_head) g_grace_tail = NULL;
-        e->next = NULL; *tail = e; tail = &e->next; g_grace_n--; g_grace_reaped++; n++;
+    const uint64_t seq = nvmtl_grace_seq_locked();
+    const uint64_t fin = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
+    if (seq <= fin) {
+        pthread_mutex_unlock(&g_grace_lock);
+        return 0;
+    }
+    nvmtl_grace_img *e = calloc(1, sizeof *e);
+    if (!e) {
+        pthread_mutex_unlock(&g_grace_lock);
+        return 0;
+    }
+    if (img) e->img = *img;
+    e->bufview = bufview; e->alias = alias; e->seq = seq;
+    if (g_grace_tail) g_grace_tail->next = e; else g_grace_head = e;
+    g_grace_tail = e;
+    __atomic_add_fetch(&g_grace_n, 1, __ATOMIC_RELAXED);
+    const uint64_t sub = __atomic_load_n(&g_cmd_submitted, __ATOMIC_RELAXED);
+    const uint64_t horizon = (fin >= sub) ? sub : fin;
+    while (g_grace_head && g_grace_head != e &&
+           (g_grace_head->seq <= horizon || __atomic_load_n(&g_grace_n, __ATOMIC_RELAXED) > NVMTL_GRACE_MAX_HELD)) {
+        nvmtl_grace_img *old = g_grace_head;
+        g_grace_head = old->next; if (!g_grace_head) g_grace_tail = NULL;
+        old->next = NULL; *tail = old; tail = &old->next;
+        __atomic_sub_fetch(&g_grace_n, 1, __ATOMIC_RELAXED);
+        g_grace_reaped++;
     }
     pthread_mutex_unlock(&g_grace_lock);
-    while (due) { nvmtl_grace_img *e = due; due = e->next;
-                  if (e->bufview || e->alias) nvmtl_vk_texel_view_destroy_now(e->alias, e->bufview);
-                  else nvmtl_vk_image_destroy_now(&e->img);
-                  free(e); }
-    if (n && (g_grace_reaped & 0xFFF) < n) nvlog("vk: image grace: %llu dead images released so far, %llu still held", (unsigned long long)g_grace_reaped, (unsigned long long)g_grace_n);
+    nvmtl_grace_destroy_list(due);
+    return 1;
+}
+static void nvmtl_image_grace_reap(void)
+{
+    if (!__atomic_load_n(&g_grace_n, __ATOMIC_ACQUIRE)) return;
+    nvmtl_grace_img *due = NULL, **tail = &due; uint64_t n = 0;
+    pthread_mutex_lock(&g_grace_lock);
+    const uint64_t fin = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
+    const uint64_t sub = __atomic_load_n(&g_cmd_submitted, __ATOMIC_RELAXED);
+    const uint64_t horizon = (fin >= sub) ? sub : fin;
+    while (g_grace_head && (g_grace_head->seq <= horizon || (__atomic_load_n(&g_grace_n, __ATOMIC_RELAXED) > NVMTL_GRACE_MAX_HELD && g_grace_head->seq <= sub))) {
+        nvmtl_grace_img *e = g_grace_head; g_grace_head = e->next; if (!g_grace_head) g_grace_tail = NULL;
+        e->next = NULL; *tail = e; tail = &e->next;
+        __atomic_sub_fetch(&g_grace_n, 1, __ATOMIC_RELAXED);
+        g_grace_reaped++; n++;
+    }
+    pthread_mutex_unlock(&g_grace_lock);
+    nvmtl_grace_destroy_list(due);
+    if (n && (g_grace_reaped & 0xFFF) < n) nvlog("vk: image grace: %llu dead images released so far, %llu still held", (unsigned long long)g_grace_reaped, (unsigned long long)__atomic_load_n(&g_grace_n, __ATOMIC_RELAXED));
 }
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned)
 {
@@ -8605,9 +8664,19 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
     }
     // Every submit up to this one has completed (one in-order queue): dead images whose last possible reader was
     // among them can go now (NVMTL_IMAGE_GRACE).
-    if (c->fx_seq) { pthread_mutex_lock(&g_grace_lock); if (c->fx_seq > g_cmd_finished_seq) __atomic_store_n(&g_cmd_finished_seq, c->fx_seq, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_grace_lock);
-                     nvmtl_image_grace_reap(); nvmtl_page_cool_reap(); nvmtl_buffer_grace_reap(); nvmtl_slot_drop_reap();
-                     nvmtl_tabshadow_tick(); }
+    if (c->fx_seq) {
+        if (nvmtl_image_grace_on() || __atomic_load_n(&g_grace_n, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_lock(&g_grace_lock);
+            if (c->fx_seq > g_cmd_finished_seq) __atomic_store_n(&g_cmd_finished_seq, c->fx_seq, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&g_grace_lock);
+            nvmtl_image_grace_reap();
+        } else {
+            uint64_t prev = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
+            while (c->fx_seq > prev && !__atomic_compare_exchange_weak(&g_cmd_finished_seq, &prev, c->fx_seq, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {}
+        }
+        nvmtl_page_cool_reap(); nvmtl_buffer_grace_reap(); nvmtl_slot_drop_reap();
+        nvmtl_tabshadow_tick();
+    }
     if (c->wseq && c->wseq != NVMTL_WSEQ_BLIND) {
         // The fence has already signalled, so the GPU is finished with this command buffer; the witness only certifies
         // its pool and address pages for reuse. A missing one used to switch the backend off for the whole process, and
@@ -8768,25 +8837,9 @@ void nvmtl_vk_image_destroy(nvk_image *i)
     nvmtl_fx_image_gone(&g_fx, g_cmd_submitted, i->view, i->w, i->h, i->fmt, i->storage, (i->pool ? NVMTL_FX_POOLED : 0) | (i->placed ? NVMTL_FX_PLACED : 0), t_fx_dying);
     pthread_mutex_unlock(&g_fx_lock);
     t_fx_dying = NULL;
-    if (nvmtl_image_grace_on()) {
-        pthread_mutex_lock(&g_grace_lock);
-        const uint64_t seq = nvmtl_grace_seq_locked();
-        const uint64_t fin = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
-        pthread_mutex_unlock(&g_grace_lock);
-        if (seq <= fin) {
-            nvmtl_vk_image_destroy_now(i);
-            return;
-        }
-        nvmtl_grace_img *e = calloc(1, sizeof *e);
-        if (e) {
-            e->img = *i; memset(i, 0, sizeof *i);
-            pthread_mutex_lock(&g_grace_lock);
-            e->seq = nvmtl_grace_seq_locked();   // the last submit that can still read it (in flight or begun)
-            if (g_grace_tail) g_grace_tail->next = e; else g_grace_head = e;
-            g_grace_tail = e; g_grace_n++;
-            pthread_mutex_unlock(&g_grace_lock);
-            return;
-        }
+    if (nvmtl_image_grace_on() && nvmtl_image_grace_enqueue(i, NULL, NULL)) {
+        memset(i, 0, sizeof *i);
+        return;
     }
     nvmtl_vk_image_destroy_now(i);
 }
@@ -10080,16 +10133,8 @@ void nvmtl_vk_image_view_destroy(void *view)
 {
     if (!view || g_state != 1) return;
     if (nvmtl_image_grace_on()) {
-        nvmtl_grace_img *e = calloc(1, sizeof *e);
-        if (e) {
-            e->img.view = view;   // img NULL: a view-only entry, nvmtl_vk_image_destroy_now destroys the view alone
-            pthread_mutex_lock(&g_grace_lock);
-            e->seq = nvmtl_grace_seq_locked();
-            if (g_grace_tail) g_grace_tail->next = e; else g_grace_head = e;
-            g_grace_tail = e; g_grace_n++;
-            pthread_mutex_unlock(&g_grace_lock);
-            return;
-        }
+        nvk_image tmp; memset(&tmp, 0, sizeof tmp); tmp.view = view;
+        if (nvmtl_image_grace_enqueue(&tmp, NULL, NULL)) return;
     }
     pvkDestroyImageView(g_dev, (VkImageView)view, NULL);
 }
@@ -10128,18 +10173,7 @@ int nvmtl_vk_texel_view_create(nvk_buffer *b, size_t offset, size_t range, uint3
 void nvmtl_vk_texel_view_destroy(void *alias, void *view)
 {
     if (!view && !alias) return;
-    if (g_state == 1 && nvmtl_image_grace_on()) {
-        nvmtl_grace_img *e = calloc(1, sizeof *e);
-        if (e) {
-            e->bufview = view; e->alias = alias;
-            pthread_mutex_lock(&g_grace_lock);
-            e->seq = nvmtl_grace_seq_locked();
-            if (g_grace_tail) g_grace_tail->next = e; else g_grace_head = e;
-            g_grace_tail = e; g_grace_n++;
-            pthread_mutex_unlock(&g_grace_lock);
-            return;
-        }
-    }
+    if (g_state == 1 && nvmtl_image_grace_on() && nvmtl_image_grace_enqueue(NULL, view, alias)) return;
     nvmtl_vk_texel_view_destroy_now(alias, view);
 }
 static void nvmtl_vk_texel_view_destroy_now(void *alias, void *view)
