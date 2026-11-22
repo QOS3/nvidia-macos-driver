@@ -1746,7 +1746,8 @@ static SInt64 gCntSurfMarks, gCntSurfWaits, gCntSurfTimeouts;
 static int gSurfWaitMaxUs;
 static const unsigned kSurfGpuWaitMs = 100;   // a GPU that has not finished a composite in 100 ms is hung; flip anyway
 struct NVSurfPending { unsigned int id; unsigned int seq; };
-static NVSurfPending gSurfPend[32];
+static const unsigned kSurfPendSlots = 64;
+static NVSurfPending gSurfPend[64];
 static unsigned int gSurfPendSeq;
 static IOLock *gSurfPendLock;
 static IOLock *nvSurfLock()
@@ -1759,16 +1760,16 @@ static void nvSurfMark(unsigned int id, bool pending)
     IOLock *l = nvSurfLock();
     if (!l || !id) return;
     IOLockLock(l);
-    unsigned slot = 32, oldest = 0;
-    for (unsigned i = 0; i < 32; i++) {
+    unsigned slot = kSurfPendSlots, oldest = 0;
+    for (unsigned i = 0; i < kSurfPendSlots; i++) {
         if (gSurfPend[i].id == id) { slot = i; break; }
-        if (slot == 32 && !gSurfPend[i].id) slot = i;
+        if (slot == kSurfPendSlots && !gSurfPend[i].id) slot = i;
         if (gSurfPend[i].seq < gSurfPend[oldest].seq) oldest = i;
     }
     if (pending) {
-        if (slot == 32) slot = oldest;   // 32 surfaces in flight at once is not a compositor; the oldest mark goes
+        if (slot == kSurfPendSlots) slot = oldest;   // 64 surfaces in flight at once is not a compositor; the oldest mark goes
         gSurfPend[slot].id = id; gSurfPend[slot].seq = ++gSurfPendSeq;
-    } else if (slot < 32 && gSurfPend[slot].id == id) {
+    } else if (slot < kSurfPendSlots && gSurfPend[slot].id == id) {
         gSurfPend[slot].id = 0;
         IOLockWakeup(l, gSurfPend, false);
     }
@@ -1785,8 +1786,8 @@ static bool nvSurfWaitReady(unsigned int id)
     IOLockLock(l);
     for (;;) {
         unsigned i = 0;
-        while (i < 32 && gSurfPend[i].id != id) i++;
-        if (i == 32) break;
+        while (i < kSurfPendSlots && gSurfPend[i].id != id) i++;
+        if (i == kSurfPendSlots) break;
         if (mach_absolute_time() >= deadline) { gSurfPend[i].id = 0; ready = false; break; }
         waited = true;
         IOLockSleepDeadline(l, gSurfPend, deadline, THREAD_UNINT);
@@ -1806,7 +1807,7 @@ static bool nvSurfIsPending(unsigned int id)
     if (!l || !id || !gSurfGpuOn) return false;
     bool p = false;
     IOLockLock(l);
-    for (unsigned i = 0; i < 32 && !p; i++) p = gSurfPend[i].id == id;
+    for (unsigned i = 0; i < kSurfPendSlots && !p; i++) p = gSurfPend[i].id == id;
     IOLockUnlock(l);
     return p;
 }
@@ -1814,8 +1815,8 @@ static bool nvSurfIsPending(unsigned int id)
 // NVResource::pageoff, which the family calls with the accelerator lock held; the wait (up to 100 ms) held that lock and
 // every RM call that needs it (VRAM imports, allocations, dirty marks) queued behind it. With this on, the page-off lets go
 // of the lock while it waits, only when the current thread owns it at one level, and takes it back before it goes on.
-// Off by default until it has run on a card: debug.nvaccel_pageoff_unlocked_wait=1 turns it on.
-static int gPoUnlocked = 0;
+// Enabled by default in Round 13; debug.nvaccel_pageoff_unlocked_wait=0 reverts live.
+static int gPoUnlocked = 1;
 static SInt64 gCntPoUnlocked, gCntPoNotOwner;
 static int gPoUnlockedMaxUs;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_unlocked_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &gPoUnlocked, 0, "1 = a page-off waits for the GPU without the accelerator lock");
