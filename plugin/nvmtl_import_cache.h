@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define NVMTL_IC_SLOTS 256
+#define NVMTL_IC_SLOTS 128
 #define NVMTL_IC_PAYLOAD 160
 typedef struct {
     uint32_t sid; size_t need; uint64_t cookie;
@@ -20,7 +20,7 @@ typedef struct {
     unsigned char payload[NVMTL_IC_PAYLOAD];
     int refs, stale; uint64_t idle_since;
 } nvmtl_ic_slot;
-typedef struct { nvmtl_ic_slot s[NVMTL_IC_SLOTS]; } nvmtl_ic;
+typedef struct { nvmtl_ic_slot s[NVMTL_IC_SLOTS]; size_t total_bytes; } nvmtl_ic;
 
 /* A live, unexpired entry for this surface and size whose cookie matches: its refcount goes up and its payload is copied
    out (1). An entry whose cookie no longer matches belongs to a reused surface id: it is marked stale, so it is never
@@ -50,11 +50,13 @@ static inline int nvmtl_ic_insert(nvmtl_ic *c, uint32_t sid, size_t need, uint64
         for (int i = 0; i < NVMTL_IC_SLOTS; i++) if (!c->s[i].refs && c->s[i].idle_since < oldest) { oldest = c->s[i].idle_since; slot = i; }
         if (slot < 0) return 0;
         *evicted_id = c->s[slot].id; memcpy(evicted, c->s[slot].payload, NVMTL_IC_PAYLOAD);
+        c->total_bytes = c->total_bytes >= c->s[slot].need ? c->total_bytes - c->s[slot].need : 0;
     }
     nvmtl_ic_slot *e = &c->s[slot];
     memset(e, 0, sizeof *e);
     e->sid = sid; e->need = need; e->cookie = cookie; e->id = id; e->refs = 1;
     memcpy(e->payload, payload, n < NVMTL_IC_PAYLOAD ? n : NVMTL_IC_PAYLOAD);
+    c->total_bytes += need;
     return 1;
 }
 /* A wrapper lets go of the import with identity `id`. 0 = the cache does not know it (the caller destroys it).
@@ -68,6 +70,7 @@ static inline int nvmtl_ic_release(nvmtl_ic *c, uintptr_t id, uint64_t now, void
         if (e->refs) return 1;
         e->idle_since = now;
         if (!e->stale) return 1;
+        c->total_bytes = c->total_bytes >= e->need ? c->total_bytes - e->need : 0;
         memcpy(gone, e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e);
         return 2;
     }
@@ -82,6 +85,27 @@ static inline int nvmtl_ic_expire(nvmtl_ic *c, uint64_t now, uint64_t idle_ns, i
         nvmtl_ic_slot *e = &c->s[i];
         if (!e->id || e->refs) continue;
         if (!(all || e->stale || (now >= e->idle_since && now - e->idle_since > idle_ns))) continue;
+        c->total_bytes = c->total_bytes >= e->need ? c->total_bytes - e->need : 0;
+        memcpy(out[n++], e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e);
+    }
+    return n;
+}
+/* Evict idle entries (preferring stale, then oldest idle_since) while total_bytes exceeds max_total_bytes. */
+static inline int nvmtl_ic_evict_budget(nvmtl_ic *c, size_t max_total_bytes, unsigned char (*out)[NVMTL_IC_PAYLOAD], int max)
+{
+    int n = 0;
+    while (c->total_bytes > max_total_bytes && n < max) {
+        int pick = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+            nvmtl_ic_slot *e = &c->s[i];
+            if (!e->id || e->refs) continue;
+            if (e->stale) { pick = i; break; }
+            if (e->idle_since < oldest) { oldest = e->idle_since; pick = i; }
+        }
+        if (pick < 0) break;
+        nvmtl_ic_slot *e = &c->s[pick];
+        c->total_bytes = c->total_bytes >= e->need ? c->total_bytes - e->need : 0;
         memcpy(out[n++], e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e);
     }
     return n;
