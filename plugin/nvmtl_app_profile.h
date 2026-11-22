@@ -116,17 +116,22 @@ static inline const nvmtl_app_profile *nvmtl_app_profile_for(const char *exe, co
 
 /* Built-in high-throughput ReBAR/VRAM profile for benchmarks, compute, and 3D tools (never applies to WindowServer,
    system daemons, or Electron UI helpers). The last NVMTL_PERF_COMPUTE_AC_ONLY entries apply on AC power only so
-   Battery mode keeps event-wait ON and lets NVK's battery policy drop PERF_BOOST. NVMTL_SHARED_VRAM=1 is intentionally
-   excluded: per-command-buffer VRAM->RAM readback and CPU page hashing regressed OpenCL by ~6,900 pts. */
+   Battery mode keeps event-wait ON, lets NVK's battery policy drop PERF_BOOST, and leaves default TSG timeslice.
+   NVMTL_SHARED_VRAM=1 is excluded (readback+hash regressed Metal -10.8k and OpenCL -6.9k). NVMTL_NO_ORDER_BARRIER=1
+   removes the Cyberpunk render-pass ordering barrier so Ada QMDv3 Dependent-QMD chaining (NVMTL_GDQ) links ~93% of
+   compute barriers in hardware. NVMTL_NO_RES2=1 avoids sparse VM binds on >=1 MiB Private buffers. */
 static const nvmtl_app_knob nvmtl_perf_compute_knobs[] = {
     { "NVK_LOCAL_MAP_SYSMEM", "0" },
     { "NVMTL_PRIVATE_POOL", "1" },
     { "NVMTL_IMAGE_POOL", "1" },
     { "NVMTL_PRETRANSLATE", "1" },
+    { "NVMTL_NO_ORDER_BARRIER", "1" },
+    { "NVMTL_NO_RES2", "1" },
     { "NVRM_EVENT_WAIT", "0" },
     { "NVRM_610_BOOST", "hold" },
+    { "NVRM_TSG_TIMESLICE_US", "8000" },
 };
-#define NVMTL_PERF_COMPUTE_AC_ONLY 2u
+#define NVMTL_PERF_COMPUTE_AC_ONLY 3u
 
 static inline int nvmtl_perf_system_process(const char *exe)
 {
