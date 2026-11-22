@@ -8672,7 +8672,7 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
             nvmtl_image_grace_reap();
         } else {
             uint64_t prev = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
-            while (c->fx_seq > prev && !__atomic_compare_exchange_weak(&g_cmd_finished_seq, &prev, c->fx_seq, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {}
+            while (c->fx_seq > prev && !__atomic_compare_exchange_n(&g_cmd_finished_seq, &prev, c->fx_seq, 1, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {}
         }
         nvmtl_page_cool_reap(); nvmtl_buffer_grace_reap(); nvmtl_slot_drop_reap();
         nvmtl_tabshadow_tick();
