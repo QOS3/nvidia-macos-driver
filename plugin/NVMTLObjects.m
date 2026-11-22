@@ -256,7 +256,7 @@ static void nvmtl_conf_settle(void)
     }
     if (!p && nvmtl_perf_app_match(me, bid, getenv("NVMTL_PERF_APPS"), getenv("NVMTL_APP_PROFILE"))) {
         const int batt = nvmtl_on_battery();
-        const unsigned applyN = batt ? (nPerf - 1u) : nPerf;
+        const unsigned applyN = (batt && nPerf >= NVMTL_PERF_COMPUTE_AC_ONLY) ? (nPerf - NVMTL_PERF_COMPUTE_AC_ONLY) : nPerf;
         const nvmtl_app_profile perfProf = { me, bid, nvmtl_perf_compute_knobs, applyN, 0, 0, NULL, 0, NULL, NULL, 0 };
         nvmtl_profile_ctx pctx = { &perfProf, perfEnvBits };
         char rec[3072]; const char *had = getenv("NVMTL_CONF_SET");

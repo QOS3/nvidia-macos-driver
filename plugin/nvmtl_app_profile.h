@@ -115,16 +115,18 @@ static inline const nvmtl_app_profile *nvmtl_app_profile_for(const char *exe, co
 }
 
 /* Built-in high-throughput ReBAR/VRAM profile for benchmarks, compute, and 3D tools (never applies to WindowServer,
-   system daemons, or Electron UI helpers). "NVRM_EVENT_WAIT" stays last so Battery mode can leave event-wait ON. */
+   system daemons, or Electron UI helpers). The last NVMTL_PERF_COMPUTE_AC_ONLY entries apply on AC power only so
+   Battery mode keeps event-wait ON and lets NVK's battery policy drop PERF_BOOST. NVMTL_SHARED_VRAM=1 is intentionally
+   excluded: per-command-buffer VRAM->RAM readback and CPU page hashing regressed OpenCL by ~6,900 pts. */
 static const nvmtl_app_knob nvmtl_perf_compute_knobs[] = {
     { "NVK_LOCAL_MAP_SYSMEM", "0" },
-    { "NVMTL_SHARED_VRAM", "1" },
-    { "NVMTL_SHARED_VRAM_BUDGET_MB", "1024" },
     { "NVMTL_PRIVATE_POOL", "1" },
     { "NVMTL_IMAGE_POOL", "1" },
     { "NVMTL_PRETRANSLATE", "1" },
     { "NVRM_EVENT_WAIT", "0" },
+    { "NVRM_610_BOOST", "hold" },
 };
+#define NVMTL_PERF_COMPUTE_AC_ONLY 2u
 
 static inline int nvmtl_perf_system_process(const char *exe)
 {
