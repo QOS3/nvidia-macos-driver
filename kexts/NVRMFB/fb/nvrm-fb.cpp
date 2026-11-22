@@ -786,6 +786,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // framebuffer through callPlatformFunction("NVRMGpuPower"). The head is lit again only once the GPU is back.
     bool fPowerOn = true;                 // this framebuffer's own power state (display sleep / system sleep)
     bool fSysSlept = false;               // NVRM put the GPU in standby since this framebuffer last powered on
+    uint8_t fWakeRetries = 0;
 
     thread_call_t fGpuWake = nullptr;
     static void gpuWakeFire(thread_call_param_t p0, thread_call_param_t);
@@ -4667,8 +4668,8 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOC
 
 #define NVRM_VRAM_POOL_MAX_SLOTS 64
 #define NVRM_VRAM_POOL_MAX_BYTES (128ull * 1024ull * 1024ull)
-#define NVRM_VRAM_POOL_MAX_ENTRY (8ull * 1024ull * 1024ull)
-#define NVRM_VRAM_POOL_COOLDOWN_NS (50ull * 1000ull * 1000ull)
+#define NVRM_VRAM_POOL_MAX_ENTRY (16ull * 1024ull * 1024ull)
+#define NVRM_VRAM_POOL_COOLDOWN_NS (20ull * 1000ull * 1000ull)
 struct NVRMVramPoolEntry {
     struct NvKmsKapiDevice *dev;
     struct NvKmsKapiMemory *mem;
@@ -4890,6 +4891,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     }
 
     struct NvKmsKapiMemory *mem = nullptr; void *kva = nullptr; NvU64 phys = 0;
+    bool poolRetried = false;
 
     for (int attempt = 0; attempt < 8 && !mem; attempt++) {
         struct NvKmsKapiAllocateMemoryParams mp; nvu_zero(&mp, sizeof mp);
@@ -4902,15 +4904,29 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         struct NvKmsKapiMemory *m = fKms->allocateMemory(fDev, &mp);
         // Both failures print what the budget counted at that moment: the real BAR1 limit of a 256 MB window is
         // somewhere under the budget, and only these lines can show where.
-        if (!m) { FBLOG("nvAllocVram(%llu): allocateMemory failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
-                        (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
-                        (unsigned long long)fBarLen); break; }
+        if (!m) {
+            if (!poolRetried && gVramPoolN > 0) {
+                poolRetried = true;
+                vramPoolDrain(fKms, fDev);
+                continue;
+            }
+            FBLOG("nvAllocVram(%llu): allocateMemory failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
+                  (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
+                  (unsigned long long)fBarLen);
+            break;
+        }
         void *k = nullptr;
         if (!fKms->mapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &k) || !k) {
+            fKms->freeMemory(fDev, m);
+            if (!poolRetried && gVramPoolN > 0) {
+                poolRetried = true;
+                vramPoolDrain(fKms, fDev);
+                continue;
+            }
             FBLOG("nvAllocVram(%llu): mapMemory(KERNEL) failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
                   (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
                   (unsigned long long)fBarLen);
-            fKms->freeMemory(fDev, m); break;
+            break;
         }
         NvU64 p = fPhysForVa ? fPhysForVa(k) : 0;
         bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + want) > fPhys;
@@ -5072,6 +5088,11 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         if (st == 0) {
             if (fModeSet && fSurf) fHeadSlept = true;   // nvKmsSuspend shuts every head down
             fSysSlept = true;                            // the next power-on is a system wake (familyDidWake)
+            fWakeRetries = 0;
+            if (gVramPoolN > 0 && fKms && fDev) {
+                NVRMDisplayGate gate;
+                if (gate.valid() && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
+            }
             FBLOG("GPU going to standby: head %u off with it", fHead);
         } else if (st == 1) {
             if (fGpuWake) scheduleCall(fGpuWake, 0);
@@ -5675,13 +5696,30 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
-    NVRMDisplayGate gate; if (!gate.valid()) return;
-    if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
-        FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
-        return;
+    bool ok = false, wakeFam = false;
+    {
+        NVRMDisplayGate gate; if (!gate.valid()) return;
+        if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
+            FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
+            return;
+        }
+        ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
+        FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
+        if (ok) {
+            me->fWakeRetries = 0;
+            if (!me->pagingState && me->fSysSlept) {
+                me->fSysSlept = false;
+                wakeFam = true;
+            }
+        } else if (me->fWakeRetries < 3) {
+            me->fWakeRetries++;
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(500u * me->fWakeRetries, kMillisecondScale, &deadline);
+            FBLOG("GPU back: head %u wake retry %u/3 scheduled in %u ms", me->fHead, (unsigned)me->fWakeRetries, 500u * me->fWakeRetries);
+            me->scheduleCall(me->fGpuWake, deadline);
+        }
     }
-    const bool ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
-    FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
+    if (wakeFam) me->familyDidWake();
 }
 IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value)
 {
