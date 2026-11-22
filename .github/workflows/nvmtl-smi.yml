@@ -37,6 +37,7 @@ jobs:
               "src/nouveau/vulkan/nvmtl_cfg.h",
               "src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c",
               "src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvrm_surfshare_abi.h",
               "src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c",
               "src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h",
           }
