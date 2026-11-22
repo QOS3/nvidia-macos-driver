@@ -1,0 +1,108 @@
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -2819,7 +2819,7 @@
+ 
+    /* Small per-thread arrays (up to 16 elements by default, NAK_B83_ARRAYS=8|16|32 to change, NVMTL_NO_SMALL_ARRAYS
+     * to turn off) are lowered to if-else trees so they live in registers rather than local memory. */
+-   if (nak->sm == 120 && nir->info.stage == MESA_SHADER_COMPUTE) {
++   if (nak->sm >= 80 && nir->info.stage == MESA_SHADER_COMPUTE) {
+       const unsigned limit = nvmtl_small_array_limit(getenv("NAK_B83_ARRAYS"));
+       if (limit) {
+          const bool lowered = OPT(nir, nir_lower_indirect_derefs_to_if_else_trees,   /* 26.3 name */
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+@@ -48,6 +48,9 @@
+     * boostRenewNs is the monotonic time before which a submit does not ask again. */
+    int boostMode;
+    uint64_t boostRenewNs;
++   bool boostActive;
++   uint64_t boostAcCheckNs;
++   int boostAcCached;
+ 
+    uint32_t numClasses;
+    uint32_t *classList;
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
+@@ -16,6 +16,8 @@
+ #include "vk_log.h"
+ 
+ #include <string.h>
++#include <sys/types.h>
++#include <sys/sysctl.h>
+ 
+ #include "class/cl0080.h" // NV01_DEVICE_0
+ #include "class/cl2080.h" // NV20_SUBDEVICE_0
+@@ -809,6 +811,41 @@
+ #define NVKMD_NVRM_BOOST_LEASE_S   3
+ #define NVKMD_NVRM_BOOST_RENEW_NS  1000000000ull
+ 
++static bool
++nvkmd_nvrm_on_battery(struct nvkmd_nvrm_pdev *pdev, uint64_t now)
++{
++   /* boostAcCached: 0 = uninit (treat as AC), 1 = battery, 2 = AC, 3 = NVRM_610_BOOST_BATT=1 override. */
++   int cached = __atomic_load_n(&pdev->boostAcCached, __ATOMIC_RELAXED);
++   if (cached == 3)
++      return false;
++
++   uint64_t due = __atomic_load_n(&pdev->boostAcCheckNs, __ATOMIC_RELAXED);
++   if (due == 0 || now >= due) {
++      /* Poll power source at most once every 2s across threads; check BOOST_BATT once per pdev. */
++      const uint64_t next = now + 2000000000ull;
++      if (__atomic_compare_exchange_n(&pdev->boostAcCheckNs, &due, next ? next : 1ull, false,
++                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++         if (cached == 0) {
++            const int ov = nvrm610_value("BOOST_BATT");
++            if (ov == '1' || ov == 'y' || ov == 'Y') {
++               __atomic_store_n(&pdev->boostAcCached, 3, __ATOMIC_RELAXED);
++               return false;
++            }
++         }
++         int ac = -1;
++         size_t sz = sizeof ac;
++         if (sysctlbyname("debug.nvrm_tgp_ac", &ac, &sz, NULL, 0) != 0 || (ac != 0 && ac != 1)) {
++            sz = sizeof ac;
++            if (sysctlbyname("debug.hwpfix_ac", &ac, &sz, NULL, 0) != 0 || (ac != 0 && ac != 1))
++               ac = 1;
++         }
++         __atomic_store_n(&pdev->boostAcCached, ac ? 2 : 1, __ATOMIC_RELAXED);
++      }
++      cached = __atomic_load_n(&pdev->boostAcCached, __ATOMIC_RELAXED);
++   }
++   return cached == 1;
++}
++
+ void
+ nvkmd_nvrm_boost_burst(struct nvkmd_nvrm_pdev *pdev)
+ {
+@@ -816,6 +853,20 @@
+       return;
+ 
+    const uint64_t now = os_time_get_nano();
++   if (nvkmd_nvrm_on_battery(pdev, now)) {
++      if (__atomic_exchange_n(&pdev->boostActive, false, __ATOMIC_RELAXED)) {
++         struct NvRmApi rm;
++         nvkmd_nvrm_dev_api_ctl(pdev, &rm);
++         NV2080_CTRL_PERF_BOOST_PARAMS bp = {
++            .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR,
++            .duration = 0,
++         };
++         nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
++         __atomic_store_n(&pdev->boostRenewNs, 0, __ATOMIC_RELAXED);
++      }
++      return;
++   }
++
+    uint64_t due = __atomic_load_n(&pdev->boostRenewNs, __ATOMIC_RELAXED);
+    if (now < due)
+       return;
+@@ -831,7 +882,9 @@
+       .duration = NVKMD_NVRM_BOOST_LEASE_S,
+    };
+    NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
+-   if (bs != NV_OK) {
++   if (bs == NV_OK) {
++      __atomic_store_n(&pdev->boostActive, true, __ATOMIC_RELAXED);
++   } else {
+       /* Not supported here: stop asking rather than fail every second. */
+       __atomic_store_n(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, __ATOMIC_RELAXED);
+       if (nvkmd_nvrm_diag_on())

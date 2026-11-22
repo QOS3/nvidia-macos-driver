@@ -114,6 +114,57 @@ static inline const nvmtl_app_profile *nvmtl_app_profile_for(const char *exe, co
     return NULL;
 }
 
+/* Built-in high-throughput ReBAR/VRAM profile for benchmarks, compute, and 3D tools (never applies to WindowServer,
+   system daemons, or Electron UI helpers). "NVRM_EVENT_WAIT" stays last so Battery mode can leave event-wait ON. */
+static const nvmtl_app_knob nvmtl_perf_compute_knobs[] = {
+    { "NVK_LOCAL_MAP_SYSMEM", "0" },
+    { "NVMTL_SHARED_VRAM", "1" },
+    { "NVMTL_SHARED_VRAM_BUDGET_MB", "1024" },
+    { "NVMTL_PRIVATE_POOL", "1" },
+    { "NVMTL_IMAGE_POOL", "1" },
+    { "NVMTL_PRETRANSLATE", "1" },
+    { "NVRM_EVENT_WAIT", "0" },
+};
+
+static inline int nvmtl_perf_system_process(const char *exe)
+{
+    static const char *const deny[] = {
+        "WindowServer", "loginwindow", "Dock", "SystemUIServer", "launchd", "coreaudiod",
+        "mediaanalysisd", "Finder", "ControlCenter", "NotificationCenter", "Spotlight",
+        "WallpaperAgent", "Discord Helper", "Antigravity Helper", "Claude Helper", "Safari",
+        "com.apple.WebKit.GPU", "com.apple.WebKit.WebContent", 0
+    };
+    if (!exe || !*exe) return 1;
+    for (int i = 0; deny[i]; i++) if (!strcmp(exe, deny[i])) return 1;
+    return 0;
+}
+
+static inline int nvmtl_perf_app_match(const char *exe, const char *bundle_id, const char *user_list, const char *profile_off)
+{
+    if ((profile_off && !strcmp(profile_off, "0")) || nvmtl_perf_system_process(exe)) return 0;
+    static const char *const cli_exes[] = { "geekbench_avx2", "geekbench7", "geekbench_x86_64", "geekbench6", 0 };
+    for (int i = 0; cli_exes[i]; i++) if (!strcmp(exe, cli_exes[i])) return 1;
+    if (bundle_id && *bundle_id) {
+        if ((!strcmp(exe, "Geekbench 7") || !strcmp(exe, "Geekbench 6")) && !strncmp(bundle_id, "com.primatelabs.", 16)) return 1;
+        if (!strcmp(exe, "Blender") && !strncmp(bundle_id, "org.blenderfoundation.", 22)) return 1;
+        if (!strcmp(exe, "Resolve") && !strncmp(bundle_id, "com.blackmagic-design.", 22)) return 1;
+    }
+    if (user_list && *user_list) {
+        const size_t elen = strlen(exe);
+        const char *p = user_list;
+        while (*p) {
+            const char *comma = strchr(p, ',');
+            const char *e = comma ? comma : p + strlen(p);
+            while (p < e && (*p == ' ' || *p == '\t')) p++;
+            while (e > p && (e[-1] == ' ' || e[-1] == '\t')) e--;
+            if ((size_t)(e - p) == elen && !memcmp(p, exe, elen)) return 1;
+            if (!comma) break;
+            p = comma + 1;
+        }
+    }
+    return 0;
+}
+
 /* "major[.minor[.patch]]" into v; 1 when the major is a plausible macOS version (14..99). */
 static inline int nvmtl_os_version_parse(const char *s, long v[3])
 {

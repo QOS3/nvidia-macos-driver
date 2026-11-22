@@ -1,0 +1,107 @@
+name: nvmtl-smi
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['tools/nvmtl-smi/**', 'nvk/nvk-macos.patch', 'nvk/nvk-fixes-after-def16.patch', 'nvk/nvk-620-kernel.patch', 'nvk/nvk-slab.patch', 'nvk/nvk-hubfix.patch', 'nvk/nvk-card-select.patch', 'nvk/ogkm-*.patch', '.github/workflows/nvmtl-smi.yml']
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+
+      - name: Fetch and patch open-gpu-kernel-modules 610.57.04
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/ogkm-610"
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.57.04.tar.gz \
+            | tar --strip-components=1 -xz -C "$GITHUB_WORKSPACE/ogkm-610"
+          for p in nvk/ogkm-nvos-620.patch nvk/ogkm-warnings.patch; do
+            patch -p1 --fuzz=0 --no-backup-if-mismatch -d "$GITHUB_WORKSPACE/ogkm-610" < "$p"
+          done
+
+      - name: Materialize NVRM userland files from NVK patches
+        run: |
+          python3 - "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/mesa-nvrm" <<'PY'
+          import os, subprocess, sys
+          repo, dest = sys.argv[1], sys.argv[2]
+          os.makedirs(dest, exist_ok=True)
+          targets = {
+              "src/nouveau/vulkan/nvmtl_cfg.h",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h",
+          }
+          def extract_hunks(patch_path, wanted):
+              lines = open(patch_path, encoding="utf-8", errors="replace").readlines()
+              out, cur, cur_file, i = [], [], None, 0
+              while i < len(lines):
+                  line = lines[i]
+                  if line.startswith("diff "):
+                      if cur and cur_file in wanted:
+                          out.extend(cur)
+                      cur, cur_file, i = [line], None, i + 1
+                      continue
+                  if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+                      if not (cur and cur[0].startswith("diff ") and not any(l.startswith("+++ ") for l in cur)):
+                          if cur and cur_file in wanted:
+                              out.extend(cur)
+                          cur = []
+                      b = lines[i + 1][4:].strip().split("\t")[0]
+                      if b.startswith("b/"):
+                          b = b[2:]
+                      cur_file = b
+                      cur.extend([line, lines[i + 1]])
+                      i += 2
+                      continue
+                  if cur:
+                      cur.append(line)
+                  i += 1
+              if cur and cur_file in wanted:
+                  out.extend(cur)
+              return "".join(out)
+
+          for name in ["nvk-macos", "nvk-fixes-after-def16", "nvk-620-kernel", "nvk-slab", "nvk-hubfix", "nvk-card-select"]:
+              sub = extract_hunks(os.path.join(repo, "nvk", f"{name}.patch"), targets)
+              if not sub:
+                  continue
+              r = subprocess.run(["patch", "-p1", "--fuzz=0", "--no-backup-if-mismatch"],
+                                 cwd=dest, input=sub, text=True, capture_output=True)
+              if r.returncode != 0:
+                  print(r.stdout, r.stderr, file=sys.stderr)
+                  sys.exit(r.returncode)
+          for t in sorted(targets):
+              p = os.path.join(dest, t)
+              assert os.path.isfile(p), f"missing {p}"
+          PY
+          ln -sfn "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/mesa-nvrm/src/nouveau/vulkan/nvkmd/nvrm/open-gpu-kernel-modules"
+
+      - name: Build and test nvmtl-smi
+        run: |
+          mkdir -p out
+          bash tools/nvmtl-smi/build.sh "$GITHUB_WORKSPACE/mesa-nvrm" out/nvmtl-smi
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -Wextra \
+            -I "$GITHUB_WORKSPACE/ogkm-610/src/common/sdk/nvidia/inc" -I tools/nvmtl-smi \
+            tools/nvmtl-smi/test_rusd_format.c -o /tmp/test_rusd_format
+          /tmp/test_rusd_format
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -Wextra -Werror \
+            -I tools/nvmtl-smi tools/nvmtl-smi/test_tgp_format.c -o /tmp/test_tgp_format
+          /tmp/test_tgp_format
+          file out/nvmtl-smi
+          file out/nvmtl-smi | grep -q "Mach-O 64-bit executable x86_64"
+          vtool -show-build out/nvmtl-smi | tee out/vtool.txt
+          grep -q "minos 15.0" out/vtool.txt
+          nm -m out/nvmtl-smi > out/nm.txt
+          git rev-parse HEAD > out/rev.txt
+          shasum -a 256 out/nvmtl-smi | tee out/SHA256
+
+      - uses: actions/upload-artifact@v4
+        with: { name: nvmtl-smi, path: out/ }

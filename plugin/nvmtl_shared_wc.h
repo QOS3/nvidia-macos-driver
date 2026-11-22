@@ -36,9 +36,23 @@ typedef struct nvmtl_swc_range { size_t lo, hi; } nvmtl_swc_range;
 
 static inline uint64_t nvmtl_swc_hash(const void *p, size_t n)
 {
-    /* 64-bit multiply-xorshift over 8-byte lanes (the tail zero-padded): not cryptographic, but a changed page
-       leaves the hash unchanged only with probability 2^-64 for data that is not adversarial to this function */
-    const uint8_t *b = (const uint8_t *)p; uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)n;
+    /* 4-lane parallel multiply-xorshift (32 B/iter): breaks serial dependency chains so page scans run at L1/ALU speed
+       while preserving single-bit avalanche across arbitrary byte lengths. */
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h0 = 0x9E3779B97F4A7C15ull ^ (uint64_t)n;
+    uint64_t h1 = 0xBF58476D1CE4E5B9ull ^ ((uint64_t)n << 7);
+    uint64_t h2 = 0x94D049BB133111EBull ^ ((uint64_t)n << 13);
+    uint64_t h3 = 0xD6E8FEB86659FD93ull ^ ((uint64_t)n << 21);
+    while (n >= 32) {
+        uint64_t v0, v1, v2, v3;
+        memcpy(&v0, b, 8); memcpy(&v1, b + 8, 8); memcpy(&v2, b + 16, 8); memcpy(&v3, b + 24, 8);
+        h0 = (h0 ^ v0) * 0xFF51AFD7ED558CCDull; h0 ^= h0 >> 32;
+        h1 = (h1 ^ v1) * 0xC4CEB9FE1A85EC53ull; h1 ^= h1 >> 31;
+        h2 = (h2 ^ v2) * 0x9E3779B185EBCA87ull; h2 ^= h2 >> 30;
+        h3 = (h3 ^ v3) * 0xC2B2AE3D27D4EB4Full; h3 ^= h3 >> 29;
+        b += 32; n -= 32;
+    }
+    uint64_t h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xBF58476D1CE4E5B9ull) ^ (h3 * 0x94D049BB133111EBull);
     while (n >= 8) { uint64_t v; memcpy(&v, b, 8); h = (h ^ v) * 0xFF51AFD7ED558CCDull; h ^= h >> 32; b += 8; n -= 8; }
     if (n) { uint64_t v = 0; memcpy(&v, b, n); h = (h ^ v) * 0xFF51AFD7ED558CCDull; h ^= h >> 32; }
     h *= 0xC4CEB9FE1A85EC53ull; h ^= h >> 29;

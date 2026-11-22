@@ -1,0 +1,69 @@
+name: translator
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['translator/**', 'build/warnings.txt', 'build/warn_ceiling.sh', '.github/workflows/translator.yml']
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Pick the newest Xcode and check Rust toolchain
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          if command -v rustup >/dev/null 2>&1; then
+            rustup target add x86_64-apple-darwin || true
+          fi
+          rustc --version; cargo --version
+
+      - name: Run translator and wrapper unit tests
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          export MACOSX_DEPLOYMENT_TARGET=15.0
+          cargo test --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
+          cargo test --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
+
+      - name: Build and verify libnvmtl_translate.dylib
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          export MACOSX_DEPLOYMENT_TARGET=15.0
+          CHOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="-C link-arg=-mmacosx-version-min=15.0 --remap-path-prefix=$GITHUB_WORKSPACE/translator=/src --remap-path-prefix=$CHOME=/cargo --remap-path-prefix=$HOME=/build"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          if ! cargo build --release --target x86_64-apple-darwin \
+              --manifest-path translator/wrapper/Cargo.toml \
+              --target-dir "$GITHUB_WORKSPACE/target-xlate" \
+              > "$GITHUB_WORKSPACE/out/cargo.log" 2>&1; then
+            cat "$GITHUB_WORKSPACE/out/cargo.log"
+            exit 4
+          fi
+          bash build/warn_ceiling.sh translator "$(grep -c '^warning' "$GITHUB_WORKSPACE/out/cargo.log" || true)" "$GITHUB_WORKSPACE/out/cargo.log"
+          D="$GITHUB_WORKSPACE/out/libnvmtl_translate.dylib"
+          cp "$GITHUB_WORKSPACE/target-xlate/x86_64-apple-darwin/release/libnvmtl_translate.dylib" "$D"
+          strip -S "$D"
+          install_name_tool -id @rpath/libnvmtl_translate.dylib "$D"
+          codesign -f -s - "$D"
+          left=$(strings -a "$D" | grep -cE '/Users/|/Volumes/' || true)
+          if [ "$left" != 0 ]; then
+            echo "STOP: $left build machine path(s) left in dylib"
+            strings -a "$D" | grep -E '/Users/|/Volumes/' | sort -u | head -10
+            exit 5
+          fi
+          file "$D" | tee "$GITHUB_WORKSPACE/out/file.txt"
+          file "$D" | grep -q "Mach-O 64-bit dynamically linked shared library x86_64"
+          vtool -show-build "$D" | tee "$GITHUB_WORKSPACE/out/vtool.txt"
+          grep -q "minos 15.0" "$GITHUB_WORKSPACE/out/vtool.txt"
+          nm -gU "$D" | awk '{print $3}' | sort > "$GITHUB_WORKSPACE/out/exports.txt"
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/out/rev.txt"
+          ( cd "$GITHUB_WORKSPACE/out" && shasum -a 256 libnvmtl_translate.dylib | tee SHA256 )
+
+      - uses: actions/upload-artifact@v4
+        with: { name: libnvmtl_translate, path: out/ }

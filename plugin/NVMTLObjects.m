@@ -110,6 +110,7 @@ extern uint64_t (*nvmtl_res2_evict_hook)(uint64_t want);
 #include "nvmtl_repeat_bind.h"
 #include "nvmtl_late_frames.h"
 #include <IOKit/IOKitLib.h>
+#include <sys/sysctl.h>
 #include "nvmtl_fps_limit.h"
 #include "nvmtl_shared_wc.h"
 // The keys the user's own block of nvrm610.conf set ("my settings, kept on update"): an application profile never
@@ -219,6 +220,14 @@ static void nvmtl_os_version_override(const char *me, const char *bid)
     nvlog("os version: this process is told %ld.%ld.%ld instead of %ld.%ld.%ld (%s, installed late: reads made before the "
           "plugin loaded saw the real version)", v[0], v[1], v[2], real[0], real[1], real[2], env ? "NVMTL_OS_VERSION" : "application profile");
 }
+static int nvmtl_on_battery(void)
+{
+    int ac = -1; size_t len = sizeof ac;
+    if (sysctlbyname("debug.nvrm_tgp_ac", &ac, &len, NULL, 0) == 0 && (ac == 0 || ac == 1)) return ac == 0;
+    len = sizeof ac;
+    if (sysctlbyname("debug.hwpfix_ac", &ac, &len, NULL, 0) == 0 && (ac == 0 || ac == 1)) return ac == 0;
+    return 0;
+}
 // Settles this process's driver knobs once, before any of them is read: forget what was inherited, read nvrm610.conf,
 // then apply the application profile for this executable, if there is one (nvmtl_app_profile.h has the order of
 // precedence). Every constructor that reads a knob calls this first; the first call does the work.
@@ -236,11 +245,26 @@ static void nvmtl_conf_settle(void)
     const nvmtl_app_profile *p = nvmtl_app_profile_for(me, bid, getenv("NVMTL_APP_PROFILE"));
     nvmtl_profile_ctx ctx = { p, 0 };
     for (unsigned i = 0; p && i < p->nknobs && i < 64; i++) if (getenv(p->knobs[i].key)) ctx.envBits |= 1ull << i;
+    const unsigned nPerf = (unsigned)(sizeof nvmtl_perf_compute_knobs / sizeof nvmtl_perf_compute_knobs[0]);
+    uint64_t perfEnvBits = 0;
+    if (!p) for (unsigned i = 0; i < nPerf && i < 64; i++) if (getenv(nvmtl_perf_compute_knobs[i].key)) perfEnvBits |= 1ull << i;
     nvmtl_conf_read_file(forgot);
     nvmtl_os_version_override(me, bid);
     if (p && !nvmtl_app_profile_for(me, bid, getenv("NVMTL_APP_PROFILE"))) {
         nvlog("profile: %s: off (NVMTL_APP_PROFILE=0)", me);
         p = NULL;
+    }
+    if (!p && nvmtl_perf_app_match(me, bid, getenv("NVMTL_PERF_APPS"), getenv("NVMTL_APP_PROFILE"))) {
+        const int batt = nvmtl_on_battery();
+        const unsigned applyN = batt ? (nPerf - 1u) : nPerf;
+        const nvmtl_app_profile perfProf = { me, bid, nvmtl_perf_compute_knobs, applyN, 0, 0, NULL, 0, NULL, NULL, 0 };
+        nvmtl_profile_ctx pctx = { &perfProf, perfEnvBits };
+        char rec[3072]; const char *had = getenv("NVMTL_CONF_SET");
+        snprintf(rec, sizeof rec, "%s", had ? had : "");
+        unsigned kept = 0, set = nvmtl_app_knobs_apply(nvmtl_perf_compute_knobs, applyN, nvmtl_profile_user_set, &pctx, rec, sizeof rec, &kept);
+        if (rec[0]) setenv("NVMTL_CONF_SET", rec, 1);
+        nvlog("profile (compute/ReBAR%s): %s (%s): %u setting(s) applied, %u kept", batt ? ", battery" : "", me, bid[0] ? bid : "cli", set, kept);
+        return;
     }
     if (!p) return;
     // The profile's values join the conf file's record, so a child process (a crash reporter, a helper) forgets them.
@@ -7602,21 +7626,35 @@ static void nvmtl_late_present(void) {
     if (!drawable || _committed) return;
     nvmtl_late_present();
     {
-        // Frame-rate limiter (NVMTL_FPS_LIMIT in the user's conf block; see nvmtl_fps_limit.h). The wait happens on the
-        // application's own thread, as the Windows driver's maximum frame rate does, so its render loop slows down and
-        // the GPU idles between frames. Resolved once per process: a process with no limit pays one load.
-        static int fps = -1; static nvmtl_fps_pacer pacer; static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
-        if (fps < 0) {
-            fps = nvmtl_fps_limit_for(getenv("NVMTL_FPS_LIMIT"), getprogname());
-            nvmtl_fps_pacer_init(&pacer, fps);
-            if (fps) nvlog("frame-rate limit %d fps for %s", fps, getprogname());
+        // Frame-rate limiter (NVMTL_FPS_LIMIT / NVMTL_FPS_LIMIT_BATT in nvrm610.conf; see nvmtl_fps_limit.h).
+        // When both differ, checks power source at most once every 3s without touching unrelated processes.
+        static int fps_init, fps_ac, fps_batt, active_fps;
+        static uint64_t last_ac_check_ns;
+        static nvmtl_fps_pacer pacer; static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+        uint64_t wait = 0;
+        os_unfair_lock_lock(&pace_lock);
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (!fps_init) {
+            fps_init = 1;
+            const char *me = getprogname();
+            fps_ac = nvmtl_fps_limit_for(getenv("NVMTL_FPS_LIMIT"), me);
+            fps_batt = nvmtl_fps_limit_for(getenv("NVMTL_FPS_LIMIT_BATT"), me);
+            active_fps = (fps_ac != fps_batt && nvmtl_on_battery()) ? fps_batt : fps_ac;
+            last_ac_check_ns = now;
+            nvmtl_fps_pacer_init(&pacer, active_fps);
+            if (active_fps) nvlog("frame-rate limit %d fps for %s", active_fps, me);
+        } else if (fps_ac != fps_batt && now - last_ac_check_ns >= 3000000000ull) {
+            last_ac_check_ns = now;
+            const int want = nvmtl_on_battery() ? fps_batt : fps_ac;
+            if (want != active_fps) {
+                active_fps = want;
+                nvmtl_fps_pacer_init(&pacer, active_fps);
+                nvlog("frame-rate limit switched to %d fps for %s (%s)", active_fps, getprogname(), active_fps == fps_batt ? "battery" : "AC");
+            }
         }
-        if (fps) {
-            os_unfair_lock_lock(&pace_lock);
-            const uint64_t wait = nvmtl_fps_pace(&pacer, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
-            os_unfair_lock_unlock(&pace_lock);
-            if (wait) { struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) }; nanosleep(&ts, NULL); }
-        }
+        if (active_fps) wait = nvmtl_fps_pace(&pacer, now);
+        os_unfair_lock_unlock(&pace_lock);
+        if (wait) { struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) }; nanosleep(&ts, NULL); }
     }
     {
         extern void nvmtl_vk_submit_wait_stats(uint64_t *total_ns, uint64_t *waits);

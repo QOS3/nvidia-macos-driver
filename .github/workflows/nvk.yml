@@ -1,0 +1,101 @@
+name: nvk
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['nvk/**', 'build/build_nvk.sh', '.github/workflows/nvk.yml']
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+
+      - name: Install NVK build tools and synthetic zlib sysroot
+        run: |
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja glslang llvm spirv-llvm-translator cbindgen bindgen pkg-config
+          python3 -m venv "$GITHUB_WORKSPACE/pyvenv"
+          "$GITHUB_WORKSPACE/pyvenv/bin/pip" install --quiet --upgrade pip
+          "$GITHUB_WORKSPACE/pyvenv/bin/pip" install --quiet meson mako pyyaml packaging
+          if command -v rustup >/dev/null 2>&1; then
+            rustup target add x86_64-apple-darwin || true
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/sysroot/lib/pkgconfig"
+          cat > "$GITHUB_WORKSPACE/sysroot/lib/pkgconfig/zlib.pc" <<'EOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+
+          Name: zlib
+          Description: zlib compression library
+          Version: 1.2.12
+          Libs: -lz
+          EOF
+          LLVM_PREFIX=$(brew --prefix llvm)
+          SPIRV_PREFIX=$(brew --prefix spirv-llvm-translator)
+          export PATH="$GITHUB_WORKSPACE/pyvenv/bin:$LLVM_PREFIX/bin:$SPIRV_PREFIX/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          meson --version; ninja --version; glslangValidator --version; llvm-config --version; llvm-spirv --version; rustc --version; cargo --version; cbindgen --version; bindgen --version
+
+      - name: Fetch Mesa base and open-gpu-kernel-modules 610.57.04
+        run: |
+          BASE=$(cat nvk/MESA_BASE)
+          git init "$GITHUB_WORKSPACE/mesa"
+          git -C "$GITHUB_WORKSPACE/mesa" remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
+          git -C "$GITHUB_WORKSPACE/mesa" fetch --depth 1 origin tag mesa-26.3.0-rc3
+          git -C "$GITHUB_WORKSPACE/mesa" cat-file -e "$BASE^{commit}" || \
+            git -C "$GITHUB_WORKSPACE/mesa" fetch --depth 1 origin "$BASE"
+          git -C "$GITHUB_WORKSPACE/mesa" cat-file -e "$BASE^{commit}"
+          mkdir -p "$GITHUB_WORKSPACE/ogkm-610"
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.57.04.tar.gz \
+            | tar --strip-components=1 -xz -C "$GITHUB_WORKSPACE/ogkm-610"
+
+      - name: Build and verify libvulkan_nouveau.dylib
+        run: |
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          LLVM_PREFIX=$(brew --prefix llvm)
+          SPIRV_PREFIX=$(brew --prefix spirv-llvm-translator)
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          export NVK_PATH="$GITHUB_WORKSPACE/pyvenv/bin:$LLVM_PREFIX/bin:$SPIRV_PREFIX/bin:$HOME/.cargo/bin:/usr/local/bin"
+          export PKG_CONFIG_PATH="$SPIRV_PREFIX/lib/pkgconfig:$LLVM_PREFIX/lib/pkgconfig"
+          export LIBCLANG_PATH="$LLVM_PREFIX/lib"
+          export NVK_SYSROOT="$GITHUB_WORKSPACE/sysroot"
+          export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK"
+          export NVK_EXTRA_PATCHES="nvk-loq-ada-perf"
+          export NVK_JOBS=4
+          if ! bash build/build_nvk.sh "$GITHUB_WORKSPACE/mesa" "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/out" 3.0; then
+            for l in clc-native.setup.log clc-native.log setup.log build.log; do
+              if [ -f "$GITHUB_WORKSPACE/out/$l" ]; then
+                echo "=== $l ==="
+                tail -60 "$GITHUB_WORKSPACE/out/$l"
+              fi
+            done
+            exit 1
+          fi
+          D="$GITHUB_WORKSPACE/out/libvulkan_nouveau.dylib"
+          codesign -f -s - "$D"
+          otool -L "$D" | tee "$GITHUB_WORKSPACE/out/otool.txt"
+          if grep -qE '/usr/local/|/opt/homebrew/' "$GITHUB_WORKSPACE/out/otool.txt"; then
+            echo "STOP: unexpected Homebrew dependency in libvulkan_nouveau.dylib"
+            exit 5
+          fi
+          file "$D" | grep -q "Mach-O 64-bit dynamically linked shared library x86_64"
+          vtool -show-build "$D" | tee "$GITHUB_WORKSPACE/out/vtool.txt"
+          grep -q "minos 15.0" "$GITHUB_WORKSPACE/out/vtool.txt"
+          mkdir -p "$GITHUB_WORKSPACE/art"
+          cp "$D" "$GITHUB_WORKSPACE/out/BUILD.txt" "$GITHUB_WORKSPACE/out/exports.txt" \
+             "$GITHUB_WORKSPACE/out/otool.txt" "$GITHUB_WORKSPACE/out/vtool.txt" "$GITHUB_WORKSPACE/art/"
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/art/rev.txt"
+          ( cd "$GITHUB_WORKSPACE/art" && shasum -a 256 libvulkan_nouveau.dylib > SHA256 )
+          cat "$GITHUB_WORKSPACE/art/BUILD.txt" "$GITHUB_WORKSPACE/art/SHA256"
+
+      - uses: actions/upload-artifact@v4
+        with: { name: libvulkan_nouveau, path: art/ }
