@@ -32,7 +32,7 @@ jobs:
           export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
           export PATH="$(brew --prefix spirv-tools)/bin:$PATH"
           export MACOSX_DEPLOYMENT_TARGET=15.0
-          cargo test --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
+          cargo test --lib --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
           cargo test --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
 
       - name: Build and verify libnvmtl_translate.dylib
@@ -40,7 +40,7 @@ jobs:
           export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
           export MACOSX_DEPLOYMENT_TARGET=15.0
           CHOME="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTFLAGS="-C link-arg=-mmacosx-version-min=15.0 --remap-path-prefix=$GITHUB_WORKSPACE/translator=/src --remap-path-prefix=$CHOME=/cargo --remap-path-prefix=$HOME=/build"
+          export RUSTFLAGS="-C link-arg=-mmacosx-version-min=15.0 --remap-path-prefix=$GITHUB_WORKSPACE/translator=/src --remap-path-prefix=$GITHUB_WORKSPACE=/work --remap-path-prefix=$CHOME=/cargo --remap-path-prefix=$HOME=/build"
           mkdir -p "$GITHUB_WORKSPACE/out"
           if ! cargo build --release --target x86_64-apple-darwin \
               --manifest-path translator/wrapper/Cargo.toml \
