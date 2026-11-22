@@ -459,6 +459,7 @@ OpFunctionEnd
             m.types_global_values.iter().filter_map(|i| Some((i.result_id?, i.clone()))).collect();
         m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| b.instructions.iter())
             .filter(|i| i.class.opcode == Op::Load)
+            .filter(|i| i.operands.get(1) == Some(&Operand::MemoryAccess(MemoryAccess::ALIGNED)))
             .filter_map(|i| i.result_type.and_then(|t| types.get(&t)))
             .filter(|t| t.class.opcode == Op::TypeVector)
             .filter_map(|t| match t.operands.get(1) { Some(Operand::LiteralBit32(n)) => Some(*n), _ => None })

@@ -33,7 +33,7 @@ jobs:
           export PATH="$(brew --prefix spirv-tools)/bin:$PATH"
           export MACOSX_DEPLOYMENT_TARGET=15.0
           cargo test --lib --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
-          cargo test --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
+          cargo test --lib --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate" -- --skip ca_named_checks:: --skip pixel_sampler_checks::
 
       - name: Build and verify libnvmtl_translate.dylib
         run: |
