@@ -18,7 +18,10 @@ jobs:
           ls -d /Applications/Xcode*.app
           X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
           sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
-          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install spirv-tools
+          export PATH="$(brew --prefix spirv-tools)/bin:$PATH"
+          spirv-val --version
           if command -v rustup >/dev/null 2>&1; then
             rustup target add x86_64-apple-darwin || true
           fi
@@ -26,7 +29,8 @@ jobs:
 
       - name: Run translator and wrapper unit tests
         run: |
-          export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          export PATH="$(brew --prefix spirv-tools)/bin:$PATH"
           export MACOSX_DEPLOYMENT_TARGET=15.0
           cargo test --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
           cargo test --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
