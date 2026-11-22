@@ -106,3 +106,204 @@
        /* Not supported here: stop asking rather than fail every second. */
        __atomic_store_n(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, __ATOMIC_RELAXED);
        if (nvkmd_nvrm_diag_on())
+diff -ruN a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
+--- a/src/nouveau/compiler/nak/qmd.rs	2026-11-22 16:55:40
++++ b/src/nouveau/compiler/nak/qmd.rs	2026-11-22 16:57:15
+@@ -755,6 +755,23 @@
+             DEPENDENT_QMD0_POINTER
+         );
+         qmd_impl_set_dependent_qmd_schedule_post_v02_04!(clc6c0, QMDV03_00);
++
++        /// Ada/Ampere QMDv3.00 hardware prefetch: first 512 B of shader program at launch
++        /// (256 B units, within NAK's 2 KB shader-heap overalloc) + cbuf0 root descriptor prefetch.
++        fn set_prefetch(&mut self, prog_addr: u64, cbuf0_valid: bool) {
++            if qmd_no_prefetch() {
++                return;
++            }
++            let mut bv = QMDBitView::new(&mut self.qmd);
++            let pf = prog_addr >> 8;
++            set_field!(bv, clc6c0, QMDV03_00, PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED, pf as u32);
++            set_field!(bv, clc6c0, QMDV03_00, PROGRAM_PREFETCH_ADDR_UPPER_SHIFTED, (pf >> 32) as u32);
++            set_field!(bv, clc6c0, QMDV03_00, PROGRAM_PREFETCH_SIZE, 2_u32);
++            set_field!(bv, clc6c0, QMDV03_00, PROGRAM_PREFETCH_TYPE, 0_u32);
++            if cbuf0_valid {
++                set_array!(bv, clc6c0, QMDV03_00, CONSTANT_BUFFER_PREFETCH_POST, 0, true);
++            }
++        }
+     }
+ }
+ use qmd_3_0::Qmd3_0;
+diff -ruN a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h	2026-11-22 16:55:40
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h	2026-11-22 16:57:17
+@@ -262,6 +262,7 @@
+    bool stats;       /* NVMTL_GDQ_STATS=1: barrier/chain counts to stderr at exit */
+    bool res;         /* NVMTL_GDQ_RES=1: k7 resident successors released by DECREMENT_DEPENDENCE */
+    uint32_t rescap;  /* NVMTL_GDQ_RESCAP: residents per chain before it is broken (default 16) */
++   uint32_t action;  /* NVMTL_GDQ_ACTION: 0 = layout default, 1 = QMD_SCHEDULE, 3 = INVALIDATE_COPY_SCHEDULE */
+ };
+ 
+ struct nvk_video_state {
+diff -ruN a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c	2026-11-22 16:55:40
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c	2026-11-22 16:58:01
+@@ -355,6 +355,7 @@
+       c.stats = (s = nvmtl_cfg_getenv("NVMTL_GDQ_STATS")) && atoi(s);
+       c.res = (s = nvmtl_cfg_getenv("NVMTL_GDQ_RES")) && atoi(s);
+       c.rescap = (s = nvmtl_cfg_getenv("NVMTL_GDQ_RESCAP")) && atoi(s) > 0 ? (uint32_t)atoi(s) : 16;
++      c.action = (s = nvmtl_cfg_getenv("NVMTL_GDQ_ACTION")) ? (uint32_t)(strtoul(s, NULL, 0) & 0x7u) : 0;
+       cfg = c;
+       done = true;
+    }
+@@ -415,7 +416,7 @@
+    __atomic_fetch_add(&nvk_gdq_stats[s], 1, __ATOMIC_RELAXED);
+ }
+ 
+-/* NVMTL_GDQ: set bits [lo, hi] of a QMD to v (bit positions from clcdc0qmd.h, QMD v5.00) */
++/* NVMTL_GDQ: set bits [lo, hi] of a QMD to v (bit positions from clc6c0qmd.h QMD v3.00 / clcdc0qmd.h QMD v5.00) */
+ static void
+ nvk_gdq_qmd_set(uint32_t *qmd, unsigned lo, unsigned hi, uint32_t v)
+ {
+@@ -425,6 +426,54 @@
+    }
+ }
+ 
++struct nvk_gdq_layout {
++   uint16_t dep_ptr_lo, dep_ptr_hi;
++   uint16_t dep_cnt_lo, dep_cnt_hi;
++   uint16_t dep_act_lo, dep_act_hi;
++   uint16_t dep_pf;
++   uint16_t dep_en;
++   uint16_t membar_lo, membar_hi;
++   uint16_t inv_base;    /* +0=HDR, +1=SAMP, +2=TEX_DATA, +3=SHADER_DATA, +4=INSTR, +5=CONST */
++   uint16_t dis_auto_inv;
++   uint32_t default_sched_action;
++};
++
++static const struct nvk_gdq_layout nvk_gdq_v3 = {
++   /* clc6c0qmd.h (QMDV03_00: Ampere / Ada) */
++   .dep_ptr_lo = 480, .dep_ptr_hi = 511,
++   .dep_cnt_lo = 142, .dep_cnt_hi = 157,
++   .dep_act_lo = 513, .dep_act_hi = 515,
++   .dep_pf = 516,
++   .dep_en = 512,
++   .membar_lo = 368, .membar_hi = 369,
++   .inv_base = 186,
++   .dis_auto_inv = 383,
++   .default_sched_action = 3, /* QMD_INVALIDATE_COPY_SCHEDULE (matches Mesa qmd.rs for reused QMD VAs) */
++};
++
++static const struct nvk_gdq_layout nvk_gdq_v5 = {
++   /* clcdc0qmd.h (QMDV05_00: Blackwell) */
++   .dep_ptr_lo = 384, .dep_ptr_hi = 415,
++   .dep_cnt_lo = 128, .dep_cnt_hi = 143,
++   .dep_act_lo = 337, .dep_act_hi = 339,
++   .dep_pf = 340,
++   .dep_en = 336,
++   .membar_lo = 624, .membar_hi = 625,
++   .inv_base = 472,
++   .dis_auto_inv = 343,
++   .default_sched_action = 1, /* QMD_SCHEDULE (upstream Blackwell k6) */
++};
++
++static const struct nvk_gdq_layout *
++nvk_gdq_layout_for_cls(uint16_t cls)
++{
++   if (cls >= BLACKWELL_COMPUTE_A)
++      return &nvk_gdq_v5;
++   if (cls >= AMPERE_COMPUTE_A && cls < HOPPER_COMPUTE_A)
++      return &nvk_gdq_v3;
++   return NULL;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+                     uint32_t baseGroupX,
+@@ -467,6 +516,7 @@
+    /* 26.3: CS invocations are counted only while a query wants them (upstream, above); NVMTL_GDQ's deferred sum
+     * and its NVMTL_GDQ_OLDMME arm are retired - with no query nothing is pushed here, which is all a chain needs. */
+    const struct nvk_gdq_cfg *gdq = nvk_gdq_cfg();
++   const struct nvk_gdq_layout *gl = nvk_gdq_layout_for_cls(nvk_cmd_buffer_compute_cls(cmd));
+    struct nvk_compute_state *cs = &cmd->state.cs;
+    uint32_t *qmd_map = cs->gdq_qmd_map;
+    nvk_gdq_stat(NVK_GDQ_STAT_DISPATCH);
+@@ -480,7 +530,7 @@
+       !memcmp(cs->gdq_saved_bar, cs->gdq_push_after_disp, bar_dw * 4);
+    /* k7: a chain holding NVMTL_GDQ_RESCAP residents keeps this barrier; the dispatch heads a new chain */
+    const bool gdq_cap = gdq->res && cs->gdq_res_n >= gdq->rescap;
+-   if (gdq->dq && cs->gdq_prev_qmd != NULL && qmd_map != NULL &&
++   if (gdq->dq && gl != NULL && cs->gdq_prev_qmd != NULL && qmd_map != NULL &&
+        cs->gdq_push_after_bar != NULL && !gdq_cap &&
+        cmd->push.start == cs->gdq_push_start &&
+        cmd->push.end == cs->gdq_push_after_bar &&
+@@ -496,7 +546,7 @@
+       cmd->push.last_hdr_dw = cs->gdq_last_hdr_dw;
+ 
+       uint32_t *prev = cs->gdq_prev_qmd;
+-      nvk_gdq_qmd_set(prev, 384, 415, qmd_addr >> 8);   /* DEPENDENT_QMD0_POINTER */
++      nvk_gdq_qmd_set(prev, gl->dep_ptr_lo, gl->dep_ptr_hi, qmd_addr >> 8);   /* DEPENDENT_QMD0_POINTER */
+       /* k7 NVMTL_GDQ_RES: this QMD waits RESIDENT (DEPENDENCE_COUNTER 1) and prev's completion DECREMENTs it.  Its
+        * INVALIDATE_COPY_SCHEDULE goes where the head's PCAS was and the head's 3 dwords move after it (push memory up
+        * to push_mem_limit; nothing was pushed after the head but the barrier just erased): the push tail stays the head's PCAS, and every resident precedes the head in the push buffer.
+@@ -517,35 +567,36 @@
+             cmd->push.last_hdr = cs->gdq_last_hdr;
+             if (cmd->push.limit < cmd->push.end)
+                cmd->push.limit = cmd->push.end;
+-            nvk_gdq_qmd_set(qmd_map, 128, 143, 1);      /* DEPENDENCE_COUNTER */
++            nvk_gdq_qmd_set(qmd_map, gl->dep_cnt_lo, gl->dep_cnt_hi, 1);      /* DEPENDENCE_COUNTER */
+             cs->gdq_res_n++;
+             gdq_res = true;
+          }
+       }
+       if (gdq->res)
+          nvk_gdq_stat(gdq_res ? NVK_GDQ_STAT_RESIDENT : NVK_GDQ_STAT_RES_MISS);
+-      /* DEPENDENT_QMD0_ACTION = 4 DECREMENT_DEPENDENCE (resident successor) or 1 QMD_SCHEDULE (k6) */
+-      nvk_gdq_qmd_set(prev, 337, 339, gdq_res ? 4 : 1);
+-      nvk_gdq_qmd_set(prev, 340, 340, 1);               /* DEPENDENT_QMD0_PREFETCH */
+-      nvk_gdq_qmd_set(prev, 336, 336, 1);               /* DEPENDENT_QMD0_ENABLE */
++      /* DEPENDENT_QMD0_ACTION = 4 DECREMENT_DEPENDENCE (resident successor) or sched_act */
++      const uint32_t sched_act = gdq->action ? gdq->action : gl->default_sched_action;
++      nvk_gdq_qmd_set(prev, gl->dep_act_lo, gl->dep_act_hi, gdq_res ? 4u : sched_act);
++      nvk_gdq_qmd_set(prev, gl->dep_pf, gl->dep_pf, 1);               /* DEPENDENT_QMD0_PREFETCH */
++      nvk_gdq_qmd_set(prev, gl->dep_en, gl->dep_en, 1);               /* DEPENDENT_QMD0_ENABLE */
+       if (!gdq->noinv && gdq->invfull) {
+          /* k5 control: src side of the barrier: the predecessor's writes leave L1 when it completes */
+-         nvk_gdq_qmd_set(prev, 624, 625, gdq->membar);  /* CWD_MEMBAR_TYPE */
++         nvk_gdq_qmd_set(prev, gl->membar_lo, gl->membar_hi, gdq->membar);  /* CWD_MEMBAR_TYPE */
+          /* dst side: what INVALIDATE_SHADER_CACHES + INVALIDATE_TEXTURE_DATA_CACHE did from the push buffer */
+-         nvk_gdq_qmd_set(qmd_map, 472, 475, 0xf);       /* INVALIDATE_TEXTURE_HEADER/SAMPLER/DATA, SHADER_DATA */
+-         nvk_gdq_qmd_set(qmd_map, 477, 477, 1);         /* INVALIDATE_SHADER_CONSTANT_CACHE */
++         nvk_gdq_qmd_set(qmd_map, gl->inv_base, gl->inv_base + 3, 0xf);     /* INVALIDATE_TEXTURE_HEADER/SAMPLER/DATA, SHADER_DATA */
++         nvk_gdq_qmd_set(qmd_map, gl->inv_base + 5, gl->inv_base + 5, 1);   /* INVALIDATE_SHADER_CONSTANT_CACHE */
+       } else if (!gdq->noinv) {
+          /* k6: the erased barrier's own dst side (nvk_gdq_dep_qmd_inv) - only ever SETS bits, never clears NAK's */
+          const uint32_t inv = cs->gdq_bar_qmd_inv;
+-         nvk_gdq_qmd_set(prev, 624, 625, gdq->membar_env ? gdq->membar : cs->gdq_bar_membar);  /* CWD_MEMBAR_TYPE */
++         nvk_gdq_qmd_set(prev, gl->membar_lo, gl->membar_hi, gdq->membar_env ? gdq->membar : cs->gdq_bar_membar);  /* CWD_MEMBAR_TYPE */
+          if (inv & (1u << 2))
+-            nvk_gdq_qmd_set(qmd_map, 474, 474, 1);      /* INVALIDATE_TEXTURE_DATA_CACHE */
++            nvk_gdq_qmd_set(qmd_map, gl->inv_base + 2, gl->inv_base + 2, 1); /* INVALIDATE_TEXTURE_DATA_CACHE */
+          if (inv & (1u << 3))
+-            nvk_gdq_qmd_set(qmd_map, 475, 475, 1);      /* INVALIDATE_SHADER_DATA_CACHE */
++            nvk_gdq_qmd_set(qmd_map, gl->inv_base + 3, gl->inv_base + 3, 1); /* INVALIDATE_SHADER_DATA_CACHE */
+          if (inv & (1u << 5))
+-            nvk_gdq_qmd_set(qmd_map, 477, 477, 1);      /* INVALIDATE_SHADER_CONSTANT_CACHE */
++            nvk_gdq_qmd_set(qmd_map, gl->inv_base + 5, gl->inv_base + 5, 1); /* INVALIDATE_SHADER_CONSTANT_CACHE */
+       } else if (gdq->noinv >= 2) {
+-         nvk_gdq_qmd_set(qmd_map, 343, 343, 1);         /* DISABLE_AUTO_INVALIDATE (negative arm only) */
++         nvk_gdq_qmd_set(qmd_map, gl->dis_auto_inv, gl->dis_auto_inv, 1);   /* DISABLE_AUTO_INVALIDATE (negative arm only) */
+       }
+ 
+       nvk_gdq_stat(NVK_GDQ_STAT_CHAINED);
+@@ -581,9 +632,8 @@
+       __push_immd(p, SUBC_NVC6C0, NVC6C0_SEND_SIGNALING_PCAS2_B, gdq->pcas);
+    }
+ 
+-   /* NVMTL_GDQ: this dispatch heads a possible chain (QMD v5 layout only) */
+-   cs->gdq_prev_qmd = (gdq->dq &&
+-                       nvk_cmd_buffer_compute_cls(cmd) >= BLACKWELL_COMPUTE_A) ? qmd_map : NULL;
++   /* NVMTL_GDQ: this dispatch heads a possible chain (QMD v3.00 Ampere/Ada or QMD v5.00 Blackwell) */
++   cs->gdq_prev_qmd = (gdq->dq && gl != NULL) ? qmd_map : NULL;
+    cs->gdq_push_start = cmd->push.start;
+    cs->gdq_push_after_disp = cmd->push.end;
+    cs->gdq_last_hdr = cmd->push.last_hdr;
