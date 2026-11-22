@@ -225,9 +225,10 @@ static volatile unsigned long gNvIsrCount = 0, gNvIsrHandled = 0;
 // Read from a shell (also over SSH while the screen is frozen): do GPU interrupts still arrive and get handled?
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_isr_count, CTLFLAG_RD, (int64_t *)&gNvIsrCount, "GPU MSIs taken");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_isr_handled, CTLFLAG_RD, (int64_t *)&gNvIsrHandled, "GPU MSIs RM claimed");
-static volatile SInt64 gNvEvtPosts = 0, gNvEvtMatched = 0, gNvEvtWaits = 0, gNvEvtSlept = 0;
+static volatile SInt64 gNvEvtPosts = 0, gNvEvtMatched = 0, gNvEvtWaits = 0, gNvEvtSlept = 0, gNvEvtWakes = 0;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_evt_posts, CTLFLAG_RD, (int64_t *)&gNvEvtPosts, "RM events posted to user clients");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_evt_waits, CTLFLAG_RD, (int64_t *)&gNvEvtWaits, "user event waits");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_evt_wakes, CTLFLAG_RD, (int64_t *)&gNvEvtWakes, "RM events that actually woke a waiting user client");
 
 // System sleep gate, the nv_system_pm_lock of kernel-open/nvidia/nv.c. Linux freezes user space before suspend and
 // still takes that lock in every ioctl; macOS freezes nothing, so on wake WindowServer and Metal apps called into RM
@@ -440,6 +441,7 @@ private:
     static IOReturn sForgetToken(OSObject *target, void *reference, IOExternalMethodArguments *args);
 public:
     volatile UInt32 fEvtSeq = 0;
+    volatile SInt32 fEvtWaiters = 0;
     UInt32 fEvtMagic = 0x4e564556u;
     static NVRMUserClient *fromNvfp(nv_file_private_t *p);
     int  pid() const { return fPid; }
@@ -741,6 +743,7 @@ bool NVRM::startGPU(IOService *provider)
             sysctlsUp = true;
             sysctl_register_oid(&sysctl__debug_nvrm_isr_count); sysctl_register_oid(&sysctl__debug_nvrm_isr_handled);
             sysctl_register_oid(&sysctl__debug_nvrm_evt_posts); sysctl_register_oid(&sysctl__debug_nvrm_evt_waits);
+            sysctl_register_oid(&sysctl__debug_nvrm_evt_wakes);
             sysctl_register_oid(&sysctl__debug_nvrm_pm_waited);
         }
     }
@@ -2814,14 +2817,22 @@ extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, Nv
 {
     const SInt64 k = OSIncrementAtomic64(&gNvEvtPosts);
     NVRMUserClient *c = event ? NVRMUserClient::fromNvfp(event->nvfp) : NULL;
-    if (c) { OSIncrementAtomic64(&gNvEvtMatched); OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq); thread_wakeup((event_t)&c->fEvtSeq); }
-    if (k == 999 || k == 99999 || k == 999999)
+    if (c) {
+        OSIncrementAtomic64(&gNvEvtMatched);
+        OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq);
+        __sync_synchronize();
+        if (c->fEvtWaiters > 0) {
+            thread_wakeup((event_t)&c->fEvtSeq);
+            OSIncrementAtomic64(&gNvEvtWakes);
+        }
+    }
+    if (nv_xnu_chat() && (k == 999 || k == 99999 || k == 999999))
         OSReportWithBacktrace("NVRM-xnu: post #%lld caller chain (nv_post_event at %p, isr-thread %d)", (long long)k + 1,
                               (void *)&nv_post_event, current_thread() == nv_xnu_isr_thread);
-    if (k < 4 || ((k + 1) & 0x3FFF) == 0)
-        kprintf("NVRM-xnu: nv_post_event #%lld hEvent 0x%x index %u -> %s | matched %lld, waits %lld, slept %lld\n",
+    if (k < 4 || (nv_xnu_chat() && ((k + 1) & 0x3FFF) == 0))
+        kprintf("NVRM-xnu: nv_post_event #%lld hEvent 0x%x index %u -> %s | matched %lld, waits %lld, wakes %lld, slept %lld\n",
                 (long long)k + 1, hEvent, index, c ? "connection woken" : "no connection", (long long)gNvEvtMatched,
-                (long long)gNvEvtWaits, (long long)gNvEvtSlept);
+                (long long)gNvEvtWaits, (long long)gNvEvtWakes, (long long)gNvEvtSlept);
 }
 IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
@@ -2838,10 +2849,15 @@ IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExterna
             // result it could not already have seen.
             OSDecrementAtomic(&gNvEvtSleepers);
         } else {
-            assert_wait_timeout((event_t)&me->fEvtSeq, THREAD_ABORTSAFE, (uint32_t)us, NSEC_PER_USEC);
-            if (me->fEvtSeq != seen) thread_wakeup((event_t)&me->fEvtSeq);
-            OSIncrementAtomic64(&gNvEvtSlept);
-            (void)thread_block(THREAD_CONTINUE_NULL);
+            OSIncrementAtomic(&me->fEvtWaiters);
+            __sync_synchronize();
+            if (me->fEvtSeq == seen) {
+                assert_wait_timeout((event_t)&me->fEvtSeq, THREAD_ABORTSAFE, (uint32_t)us, NSEC_PER_USEC);
+                if (me->fEvtSeq != seen) thread_wakeup((event_t)&me->fEvtSeq);
+                OSIncrementAtomic64(&gNvEvtSlept);
+                (void)thread_block(THREAD_CONTINUE_NULL);
+            }
+            OSDecrementAtomic(&me->fEvtWaiters);
             OSDecrementAtomic(&gNvEvtSleepers);
         }
     }
@@ -2886,10 +2902,12 @@ IOReturn NVRMUserClient::sEsc(OSObject *target, void *reference, IOExternalMetho
     uint32_t cmd = (uint32_t)args->scalarInput[0];
     uint32_t size = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
     if (size == 0 || size > (1u << 20)) return kIOReturnBadArgument;
-    void *buf = kern_os_malloc(size);
+    uint8_t stackBuf[512];
+    void *heapBuf = (size > sizeof(stackBuf)) ? kern_os_malloc(size) : nullptr;
+    void *buf = (size <= sizeof(stackBuf)) ? stackBuf : heapBuf;
     if (!buf) return kIOReturnNoMemory;
     if (args->structureInputDescriptor) {
-        if (args->structureInputDescriptor->prepare() != kIOReturnSuccess) { kern_os_free(buf); return kIOReturnVMError; }
+        if (args->structureInputDescriptor->prepare() != kIOReturnSuccess) { if (heapBuf) kern_os_free(heapBuf); return kIOReturnVMError; }
         args->structureInputDescriptor->readBytes(0, buf, size);
         args->structureInputDescriptor->complete();
     } else nvu_memcpy(buf, args->structureInput, size);
@@ -2903,7 +2921,7 @@ IOReturn NVRMUserClient::sEsc(OSObject *target, void *reference, IOExternalMetho
         nvu_memcpy(args->structureOutput, buf, size);
         args->structureOutputSize = size;
     }
-    kern_os_free(buf);
+    if (heapBuf) kern_os_free(heapBuf);
     return r;
 }
 IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
@@ -2945,8 +2963,17 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
         if (!accel) { OSDictionary *m = IOService::serviceMatching("NVAccel");
                       if (m) { accel = IOService::waitForMatchingService(m, 100ULL * 1000 * 1000); m->release(); } }
         if (!accel) return kIOReturnSuccess;
-        const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVACCEL_SS_FN);
-        if (sym) { accel->callPlatformFunction(sym, false, ss, (void *)current_task(), (void *)(uintptr_t)cmd, NULL); sym->release(); }
+        static const OSSymbol *sSurfSym = nullptr;
+        const OSSymbol *sym = __atomic_load_n(&sSurfSym, __ATOMIC_ACQUIRE);
+        if (!sym) {
+            const OSSymbol *cand = OSSymbol::withCStringNoCopy(NVACCEL_SS_FN);
+            if (cand) {
+                const OSSymbol *expected = nullptr;
+                if (__atomic_compare_exchange_n(&sSurfSym, &expected, cand, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) sym = cand;
+                else { cand->release(); sym = expected; }
+            }
+        }
+        if (sym) accel->callPlatformFunction(sym, false, ss, (void *)current_task(), (void *)(uintptr_t)cmd, NULL);
         return kIOReturnSuccess;
     }
     default: {
