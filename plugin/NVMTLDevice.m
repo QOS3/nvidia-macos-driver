@@ -1484,7 +1484,7 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 }
 typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t pad; } nvmtl_busy_tag;
 #define NVMTL_BUSY_MAGIC 0x4255535au
-#define NVMTL_BUSY_WAIT_NS  (10ull * 1000 * 1000)
+#define NVMTL_BUSY_WAIT_NS  (35ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
 static CFStringRef nvmtl_busy_key(NSUInteger plane) {

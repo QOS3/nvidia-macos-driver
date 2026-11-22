@@ -389,7 +389,7 @@ static int nvmtl_skip_empty_on(void) {
     // NV12 surfaces WindowServer draws captured frames into, so it costs nothing without capture), =2 for every private one,
     // =1 for every surface write, =0 for none.
     static int after = -1;
-    if (after < 0) after = nvmtl_schedule_after_mode(getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"), getprogname());
+    if (after < 0) after = nvmtl_schedule_after_mode_ui(getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"), getprogname());
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) {
         if (s == drawable || !after) continue;

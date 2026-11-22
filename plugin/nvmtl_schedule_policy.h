@@ -19,4 +19,14 @@ static inline int nvmtl_schedule_after_mode(const char *setting, const char *pro
     if (setting && setting[0] >= '0' && setting[0] <= '3' && !setting[1]) return setting[0] - '0';
     return nvmtl_schedule_is_chromium_family(process) ? 1 : 3;
 }
+
+/* Publish every non-drawable cross-process IOSurface write before reporting "scheduled" for all client apps
+   (Electron helpers, WebKit, App Store, Safari, Cocoa scroll views), while keeping WindowServer on mode 3.
+   NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0..3 still overrides in every process. */
+static inline int nvmtl_schedule_after_mode_ui(const char *setting, const char *process)
+{
+    if (setting && setting[0] >= '0' && setting[0] <= '3' && !setting[1]) return setting[0] - '0';
+    if (!process || !*process || !strcmp(process, "WindowServer")) return 3;
+    return 1;
+}
 #endif
