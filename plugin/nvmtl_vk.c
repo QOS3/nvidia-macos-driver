@@ -351,28 +351,28 @@ static void nvmtl_dlss_views_drop(VkImage img);   // DLSS Super Resolution secti
 static uint64_t nvmtl_life_begin(void)
 {
     if (!nvmtl_image_grace_on())
-        return __atomic_add_fetch(&g_cmd_begun, 1, __ATOMIC_RELAXED);
+        return atomic_fetch_add_explicit(&g_cmd_begun, 1, memory_order_relaxed) + 1;
     pthread_mutex_lock(&g_grace_lock);
-    uint64_t id = __atomic_add_fetch(&g_cmd_begun, 1, __ATOMIC_RELAXED);
+    uint64_t id = atomic_fetch_add_explicit(&g_cmd_begun, 1, memory_order_relaxed) + 1;
     pthread_mutex_unlock(&g_grace_lock);
     return id;
 }
 static void nvmtl_life_abandon(void)
 {
     if (!nvmtl_image_grace_on()) {
-        __atomic_add_fetch(&g_cmd_abandoned, 1, __ATOMIC_RELAXED);
+        atomic_fetch_add_explicit(&g_cmd_abandoned, 1, memory_order_relaxed);
         return;
     }
     pthread_mutex_lock(&g_grace_lock);
-    __atomic_add_fetch(&g_cmd_abandoned, 1, __ATOMIC_RELAXED);
+    atomic_fetch_add_explicit(&g_cmd_abandoned, 1, memory_order_relaxed);
     pthread_mutex_unlock(&g_grace_lock);
 }
 static uint64_t nvmtl_life_submit(void)
 {
     if (!nvmtl_image_grace_on())
-        return __atomic_add_fetch(&g_cmd_submitted, 1, __ATOMIC_ACQ_REL);
+        return atomic_fetch_add_explicit(&g_cmd_submitted, 1, memory_order_acq_rel) + 1;
     pthread_mutex_lock(&g_grace_lock);
-    uint64_t id = __atomic_add_fetch(&g_cmd_submitted, 1, __ATOMIC_ACQ_REL);
+    uint64_t id = atomic_fetch_add_explicit(&g_cmd_submitted, 1, memory_order_acq_rel) + 1;
     pthread_mutex_unlock(&g_grace_lock);
     return id;
 }
@@ -381,9 +381,9 @@ static uint64_t nvmtl_life_submit(void)
 // Capping pending prevents an unsubmitted CB from pinning dead images forever.
 static uint64_t nvmtl_grace_seq_locked(void)
 {
-    const uint64_t begun = __atomic_load_n(&g_cmd_begun, __ATOMIC_RELAXED);
-    const uint64_t sub = __atomic_load_n(&g_cmd_submitted, __ATOMIC_RELAXED);
-    const uint64_t abn = __atomic_load_n(&g_cmd_abandoned, __ATOMIC_RELAXED);
+    const uint64_t begun = atomic_load_explicit(&g_cmd_begun, memory_order_relaxed);
+    const uint64_t sub = atomic_load_explicit(&g_cmd_submitted, memory_order_relaxed);
+    const uint64_t abn = atomic_load_explicit(&g_cmd_abandoned, memory_order_relaxed);
     uint64_t pending = begun > sub + abn ? begun - sub - abn : 0;
     if (pending > NVMTL_GRACE_MAX_PENDING) pending = NVMTL_GRACE_MAX_PENDING;
     return sub + pending;
@@ -417,15 +417,15 @@ static int nvmtl_image_grace_enqueue(const nvk_image *img, void *bufview, void *
     e->bufview = bufview; e->alias = alias; e->seq = seq;
     if (g_grace_tail) g_grace_tail->next = e; else g_grace_head = e;
     g_grace_tail = e;
-    __atomic_add_fetch(&g_grace_n, 1, __ATOMIC_RELAXED);
-    const uint64_t sub = __atomic_load_n(&g_cmd_submitted, __ATOMIC_RELAXED);
+    atomic_fetch_add_explicit(&g_grace_n, 1, memory_order_relaxed);
+    const uint64_t sub = atomic_load_explicit(&g_cmd_submitted, memory_order_relaxed);
     const uint64_t horizon = (fin >= sub) ? sub : fin;
     while (g_grace_head && g_grace_head != e &&
-           (g_grace_head->seq <= horizon || __atomic_load_n(&g_grace_n, __ATOMIC_RELAXED) > NVMTL_GRACE_MAX_HELD)) {
+           (g_grace_head->seq <= horizon || atomic_load_explicit(&g_grace_n, memory_order_relaxed) > NVMTL_GRACE_MAX_HELD)) {
         nvmtl_grace_img *old = g_grace_head;
         g_grace_head = old->next; if (!g_grace_head) g_grace_tail = NULL;
         old->next = NULL; *tail = old; tail = &old->next;
-        __atomic_sub_fetch(&g_grace_n, 1, __ATOMIC_RELAXED);
+        atomic_fetch_sub_explicit(&g_grace_n, 1, memory_order_relaxed);
         g_grace_reaped++;
     }
     pthread_mutex_unlock(&g_grace_lock);
@@ -434,21 +434,21 @@ static int nvmtl_image_grace_enqueue(const nvk_image *img, void *bufview, void *
 }
 static void nvmtl_image_grace_reap(void)
 {
-    if (!__atomic_load_n(&g_grace_n, __ATOMIC_ACQUIRE)) return;
+    if (!atomic_load_explicit(&g_grace_n, memory_order_acquire)) return;
     nvmtl_grace_img *due = NULL, **tail = &due; uint64_t n = 0;
     pthread_mutex_lock(&g_grace_lock);
     const uint64_t fin = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
-    const uint64_t sub = __atomic_load_n(&g_cmd_submitted, __ATOMIC_RELAXED);
+    const uint64_t sub = atomic_load_explicit(&g_cmd_submitted, memory_order_relaxed);
     const uint64_t horizon = (fin >= sub) ? sub : fin;
-    while (g_grace_head && (g_grace_head->seq <= horizon || (__atomic_load_n(&g_grace_n, __ATOMIC_RELAXED) > NVMTL_GRACE_MAX_HELD && g_grace_head->seq <= sub))) {
+    while (g_grace_head && (g_grace_head->seq <= horizon || (atomic_load_explicit(&g_grace_n, memory_order_relaxed) > NVMTL_GRACE_MAX_HELD && g_grace_head->seq <= sub))) {
         nvmtl_grace_img *e = g_grace_head; g_grace_head = e->next; if (!g_grace_head) g_grace_tail = NULL;
         e->next = NULL; *tail = e; tail = &e->next;
-        __atomic_sub_fetch(&g_grace_n, 1, __ATOMIC_RELAXED);
+        atomic_fetch_sub_explicit(&g_grace_n, 1, memory_order_relaxed);
         g_grace_reaped++; n++;
     }
     pthread_mutex_unlock(&g_grace_lock);
     nvmtl_grace_destroy_list(due);
-    if (n && (g_grace_reaped & 0xFFF) < n) nvlog("vk: image grace: %llu dead images released so far, %llu still held", (unsigned long long)g_grace_reaped, (unsigned long long)__atomic_load_n(&g_grace_n, __ATOMIC_RELAXED));
+    if (n && (g_grace_reaped & 0xFFF) < n) nvlog("vk: image grace: %llu dead images released so far, %llu still held", (unsigned long long)g_grace_reaped, (unsigned long long)atomic_load_explicit(&g_grace_n, memory_order_relaxed));
 }
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned)
 {
@@ -8665,7 +8665,7 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
     // Every submit up to this one has completed (one in-order queue): dead images whose last possible reader was
     // among them can go now (NVMTL_IMAGE_GRACE).
     if (c->fx_seq) {
-        if (nvmtl_image_grace_on() || __atomic_load_n(&g_grace_n, __ATOMIC_ACQUIRE)) {
+        if (nvmtl_image_grace_on() || atomic_load_explicit(&g_grace_n, memory_order_acquire)) {
             pthread_mutex_lock(&g_grace_lock);
             if (c->fx_seq > g_cmd_finished_seq) __atomic_store_n(&g_cmd_finished_seq, c->fx_seq, __ATOMIC_RELEASE);
             pthread_mutex_unlock(&g_grace_lock);
