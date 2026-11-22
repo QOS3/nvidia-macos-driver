@@ -1,0 +1,76 @@
+name: nvaccel
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['kexts/NVRM/accel/**', 'kexts/NVRM/*.h', '.github/workflows/nvaccel.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: Prepare NVIDIA open-gpu-kernel-modules 620.70.06 headers & compile_cmds
+        run: |
+          mkdir -p ogkm-src work
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm-src
+          T="$GITHUB_WORKSPACE/work/ogkm-620.70.06"
+          cp -R ogkm-src "$T"
+          for f in kexts/NVRM/patches/*.patch; do
+            ok=0
+            for root in "" "src/nvidia-modeset"; do
+              ( cd "$T/$root" && patch -p1 --fuzz=0 --dry-run < "$GITHUB_WORKSPACE/$f" >/dev/null 2>&1 && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$f" >/dev/null ) && { ok=1; break; }
+            done
+            [ "$ok" = 1 ] || { echo "STOP: $(basename "$f") failed on ogkm"; exit 2; }
+            echo "applied $(basename "$f")"
+          done
+          python3 - "$T" <<'PY'
+          import os, sys
+          t = sys.argv[1]
+          def edit(rel, old, new):
+              p = os.path.join(t, rel); s = open(p).read()
+              if new in s: return
+              assert s.count(old) == 1, f"{rel}: anchor found {s.count(old)} times"
+              s = s.replace(old, new); open(p + ".tmp", "w").write(s); os.replace(p + ".tmp", p)
+          edit("src/common/sdk/nvidia/inc/cpuopsys.h", "defined(__INTEGRITY) ) && !defined(nvmacosx)", "defined(__INTEGRITY) || defined(NV_DARWIN) ) && !defined(nvmacosx)")
+          for rel in ("src/common/inc/nvVer.h", "src/common/inc/nvUnixVersion.h"):
+              edit(rel, "defined(NV_QNX) || defined(NV_INTEGRITY) || \\", "defined(NV_QNX) || defined(NV_INTEGRITY) || defined(NV_DARWIN) || \\")
+          edit("src/common/inc/nvBldVer.h", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS)\n", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS) || defined(NV_DARWIN)\n")
+          PY
+          cd "$T/src/nvidia"
+          O=_out/Darwin_x86_64; mkdir -p "$O"
+          make -n TARGET_OS=Darwin TARGET_ARCH=x86_64 NV_VERBOSE=1 2>/dev/null > "$GITHUB_WORKSPACE/work/make-n.txt"
+          grep -E "^echo .*version\.h" "$GITHUB_WORKSPACE/work/make-n.txt" > "$GITHUB_WORKSPACE/work/pre.sh"
+          bash "$GITHUB_WORKSPACE/work/pre.sh"
+          grep " -c " "$GITHUB_WORKSPACE/work/make-n.txt" > "$O/compile_cmds.sh"
+          head -1 "$O/compile_cmds.sh" | cut -c1-200
+      - name: Build base (3.0, main) and loq-perf NVAccel.kext
+        run: |
+          build() {
+            rm -rf "src-$2" "out/$2" && mkdir -p "src-$2" "out/$2"
+            git archive "$1" kexts/NVRM build | tar x -C "src-$2"
+            MACOSX_DEPLOYMENT_TARGET=15.0 OGKM="$GITHUB_WORKSPACE/work/ogkm-620.70.06" \
+              bash "src-$2/build/accel_build.sh" "src-$2/kexts/NVRM" "$GITHUB_WORKSPACE/out/$2" \
+              || { cat "$GITHUB_WORKSPACE/out/$2/accel.err" "$GITHUB_WORKSPACE/out/$2/accelld.err" 2>/dev/null; return 1; }
+            echo "$2: warnings $(grep -c ': warning:' out/$2/accel.err || true)"
+            git rev-parse "$1" > "out/$2/rev.txt"
+            nm -u  "out/$2/NVAccel.kext/Contents/MacOS/NVAccel" | sort -u > "out/$2/undefs.txt"
+            nm -gU "out/$2/NVAccel.kext/Contents/MacOS/NVAccel" | awk '{print $3}' | sort > "out/$2/exports.txt"
+            strings -a "out/$2/NVAccel.kext/Contents/MacOS/NVAccel" | sort -u > "out/$2/strings.txt"
+            vtool -show-build "out/$2/NVAccel.kext/Contents/MacOS/NVAccel" || true
+            shasum -a 256 "out/$2/NVAccel.kext/Contents/MacOS/NVAccel"
+          }
+          build origin/main base
+          build HEAD loq
+          ls -la out/*
+          echo "exports only in base:"; comm -23 out/base/exports.txt out/loq/exports.txt | head
+          echo "exports only in loq:";  comm -13 out/base/exports.txt out/loq/exports.txt | head
+          echo "undefs only in base:";  comm -23 out/base/undefs.txt out/loq/undefs.txt | head -30
+          echo "undefs only in loq:";   comm -13 out/base/undefs.txt out/loq/undefs.txt | head -30
+      - uses: actions/upload-artifact@v4
+        with: { name: NVAccel, path: out/ }
