@@ -1,0 +1,47 @@
+name: nvrm
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['kexts/NVRM/*.cpp', 'kexts/NVRM/*.c', 'kexts/NVRM/*.h', 'kexts/NVRM/*.py', 'kexts/NVRM/Info.plist', 'kexts/NVRM/patches/**', '.github/workflows/nvrm.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: Build NVIDIA open-gpu-kernel-modules RM & NVKMS archives (620.70.06)
+        run: |
+          mkdir -p ogkm-src work
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm-src
+          JOBS=4 bash build/build_rm620.sh work ogkm-src
+          JOBS=4 bash build/build_kms620.sh work
+      - name: Build base (3.0, main) and loq-perf NVRM.kext
+        run: |
+          build() {
+            rm -rf "src-$2" "out/$2" && mkdir -p "src-$2" "out/$2"
+            git archive "$1" kexts/NVRM build | tar x -C "src-$2"
+            bash "src-$2/build/build_nvrm.sh" "src-$2/kexts/NVRM" "$GITHUB_WORKSPACE/work/ogkm-620.70.06" "$GITHUB_WORKSPACE/out/$2" \
+              || { cat "$GITHUB_WORKSPACE/out/$2"/*.err 2>/dev/null; return 1; }
+            git rev-parse "$1" > "out/$2/rev.txt"
+            cp "out/$2/imports.txt" "out/$2/undefs.txt" || nm -u "out/$2/NVRM.kext/Contents/MacOS/NVRM" | sort -u > "out/$2/undefs.txt"
+            nm -u "out/$2/NVRM.kext/Contents/MacOS/NVRM" | sort -u > "out/$2/undefs-sorted.txt"
+            nm -gU "out/$2/NVRM.kext/Contents/MacOS/NVRM" | awk '{print $3}' | sort > "out/$2/exports.txt"
+            strings -a "out/$2/NVRM.kext/Contents/MacOS/NVRM" | sort -u > "out/$2/strings.txt"
+            vtool -show-build "out/$2/NVRM.kext/Contents/MacOS/NVRM" || true
+            shasum -a 256 "out/$2/NVRM.kext/Contents/MacOS/NVRM"
+          }
+          build origin/main base
+          build HEAD loq
+          ls -la out/*
+          echo "exports only in base:"; comm -23 out/base/exports.txt out/loq/exports.txt | head
+          echo "exports only in loq:";  comm -13 out/base/exports.txt out/loq/exports.txt | head
+          echo "undefs only in base:";  comm -23 out/base/undefs-sorted.txt out/loq/undefs-sorted.txt | head -30
+          echo "undefs only in loq:";   comm -13 out/base/undefs-sorted.txt out/loq/undefs-sorted.txt | head -30
+      - uses: actions/upload-artifact@v4
+        with: { name: NVRM, path: out/ }
