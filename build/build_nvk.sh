@@ -138,6 +138,96 @@ cmp -s "$OUT/nvk-rust-crates.txt" "$HERE/licenses/nvk-rust-crates.txt" || { echo
 D=$B/src/nouveau/vulkan/libvulkan_nouveau.dylib
 U=$(nm -m "$D" | grep '(undefined)' | grep -v weak | grep 'dynamically looked up' || true)
 [ -z "$U" ] || { echo "STOP: unresolved strong references (dlopen fails in WindowServer):"; echo "$U"; exit 5; }
+
+# nitro-perf: Mesa's vk_entrypoints_gen.py emits ~2,964 unimplemented weak Vulkan entrypoint references (vk_*, wsi_*,
+# nvk_*). On macOS, b_lundef=false (-undefined dynamic_lookup) forces ld64 to fall back from LC_DYLD_CHAINED_FIXUPS to
+# legacy LC_DYLD_INFO_ONLY with 2,964 FLAT_LOOKUP bindings, making dyld walk every loaded Apple framework's export trie
+# (~1M walks, 220-350 ms!) on every app/Settings launch. Rewrite those undefined weak slots to NULL in the generated
+# *_entrypoints.c tables, recompile just those files, and relink without dynamic_lookup using LC_DYLD_CHAINED_FIXUPS.
+if [ "${NVK_PRUNE_WEAK_FLAT:-1}" = 1 ]; then
+  python3 - "$B" "$D" <<'PYEOF'
+import os, re, subprocess, sys, time
+
+B, D = sys.argv[1], sys.argv[2]
+nm_out = subprocess.check_output(["nm", "-m", D], text=True, errors="replace")
+undef_weak = set()
+other_dyn = []
+for line in nm_out.splitlines():
+    if "(undefined)" not in line or "dynamically looked up" not in line:
+        continue
+    sym = line.strip().split()[-1]
+    if sym.startswith("_"):
+        sym = sym[1:]
+    if "weak" in line and sym.startswith(("nvk_", "vk_", "wsi_")):
+        undef_weak.add(sym)
+    else:
+        other_dyn.append(line.strip())
+
+print(f"nitro-perf: found {len(undef_weak)} undefined weak vk/wsi/nvk flat-lookup symbols (other_dyn={len(other_dyn)})")
+if undef_weak:
+    pat = re.compile(r'(\.[A-Za-z0-9_]+\s*=\s*(?:\([^)]+\)\s*)?)([A-Za-z0-9_]+)(\s*,)')
+    patched_files = 0
+    patched_slots = 0
+    future = time.time() + 2.0
+    for root, _, files in os.walk(os.path.join(B, "src")):
+        for fn in files:
+            if not fn.endswith(("_entrypoints.c", "_entrypoints.cpp")):
+                continue
+            p = os.path.join(root, fn)
+            src = open(p, "r", encoding="utf-8", errors="replace").read()
+            cnt = 0
+            def repl(m):
+                nonlocal cnt
+                if m.group(2) in undef_weak:
+                    cnt += 1
+                    return m.group(1) + "NULL" + m.group(3)
+                return m.group(0)
+            new_src = pat.sub(repl, src)
+            if cnt:
+                open(p, "w", encoding="utf-8").write(new_src)
+                os.utime(p, (future, future))
+                patched_files += 1
+                patched_slots += cnt
+                print(f"  patched {cnt} weak NULL slots in {os.path.relpath(p, B)}")
+    print(f"nitro-perf: rewrote {patched_slots} weak entrypoint slots across {patched_files} file(s)")
+PYEOF
+  ninja -C "$B" -j"$JOBS" src/nouveau/vulkan/libvulkan_nouveau.dylib >> "$OUT/build.log" 2>&1
+  REM=$(nm -m "$D" | grep '(undefined)' | grep 'dynamically looked up' || true)
+  if [ -z "$REM" ]; then
+    python3 - "$B/build.ninja" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+lines = open(p, "r", encoding="utf-8").readlines()
+in_nvk = False
+changed = 0
+for idx, line in enumerate(lines):
+    if line.startswith("build src/nouveau/vulkan/libvulkan_nouveau.dylib:"):
+        in_nvk = True
+    elif in_nvk and line.lstrip().startswith("LINK_ARGS ="):
+        orig = line
+        line = re.sub(r'\s+(?:-Wl,-undefined,dynamic_lookup|-undefined\s+dynamic_lookup)', '', line)
+        if "-fixup_chains" not in line:
+            line = line.rstrip("\n") + " -Wl,-fixup_chains\n"
+        if line != orig:
+            lines[idx] = line
+            changed += 1
+        in_nvk = False
+    elif in_nvk and not line.startswith(" "):
+        in_nvk = False
+assert changed == 1, f"expected to update 1 LINK_ARGS line for libvulkan_nouveau.dylib, got {changed}"
+open(p, "w", encoding="utf-8").writelines(lines)
+print("nitro-perf: stripped dynamic_lookup and enabled -Wl,-fixup_chains for libvulkan_nouveau.dylib")
+PYEOF
+    rm -f "$D"
+    ninja -C "$B" -j"$JOBS" src/nouveau/vulkan/libvulkan_nouveau.dylib >> "$OUT/build.log" 2>&1
+    otool -l "$D" | grep -q LC_DYLD_CHAINED_FIXUPS || { echo "STOP: expected LC_DYLD_CHAINED_FIXUPS after relink"; exit 5; }
+    echo "nitro-perf: verified 0 flat-lookup bindings and LC_DYLD_CHAINED_FIXUPS active"
+  else
+    echo "nitro-perf: note — $(printf '%s\n' "$REM" | wc -l) dynamically-looked-up weak symbols remained (keeping dynamic_lookup):"
+    printf '%s\n' "$REM" | head -20
+  fi
+fi
+
 cp "$D" "$OUT/libvulkan_nouveau.dylib"; strip -S "$OUT/libvulkan_nouveau.dylib"
 nm -gU "$OUT/libvulkan_nouveau.dylib" | awk '{print $3}' | sort > "$OUT/exports.txt"
 UUID=$(otool -l "$OUT/libvulkan_nouveau.dylib" | awk '/uuid/{print $2; exit}')
