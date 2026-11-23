@@ -13,6 +13,10 @@
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -785,14 +789,148 @@ static VkResult nvmtl_opaque_CreateCommandPool(VkDevice dev, const VkCommandPool
     if (result == VK_SUCCESS) *out = handle;
     return result;
 }
+/* nitro-perf: Persistent on-disk VkPipelineCache (compiled Ampere/Ada/Blackwell SASS cache across app launches).
+   Mesa's vk_pipeline_cache validates vendorID, deviceID, and pipelineCacheUUID automatically, so stale caches from
+   other cards or driver builds are safely ignored. NVMTL_NO_VK_PCACHE=1 disables it completely. */
+static PFN_vkCreatePipelineCache pvkCreatePipelineCache;
+static PFN_vkGetPipelineCacheData pvkGetPipelineCacheData;
+static VkPipelineCache g_pcache = VK_NULL_HANDLE;
+static char g_pcache_path[PATH_MAX];
+static size_t g_pcache_cap = 32u << 20;
+static _Atomic uint64_t g_pcache_created, g_pcache_last_saved_cnt, g_pcache_last_save_ns;
+static _Atomic size_t g_pcache_saved_sz;
+static _Atomic int g_pcache_saving;
+
+static uint64_t nvmtl_sys_ram_bytes(void)
+{
+    static uint64_t ram;
+    static int checked;
+    if (!checked) {
+        uint64_t v = 0; size_t l = sizeof v;
+        if (sysctlbyname("hw.memsize", &v, &l, NULL, 0) == 0 && v) ram = v;
+        checked = 1;
+    }
+    return ram;
+}
+
+static void nvmtl_pcache_save_now(void)
+{
+    if (g_state != 1 || g_pcache == VK_NULL_HANDLE || !pvkGetPipelineCacheData || !g_pcache_path[0]) return;
+    if (atomic_exchange(&g_pcache_saving, 1)) return;
+    size_t sz = 0;
+    if (pvkGetPipelineCacheData(g_dev, g_pcache, &sz, NULL) == VK_SUCCESS && sz >= 32 && sz <= g_pcache_cap) {
+        const size_t prev = atomic_load(&g_pcache_saved_sz);
+        if (sz > prev + 64) {
+            void *buf = malloc(sz);
+            if (buf) {
+                size_t got = sz;
+                if (pvkGetPipelineCacheData(g_dev, g_pcache, &got, buf) == VK_SUCCESS && got >= 32 && got <= g_pcache_cap) {
+                    char tmp[PATH_MAX + 32];
+                    snprintf(tmp, sizeof tmp, "%s.tmp.%d", g_pcache_path, (int)getpid());
+                    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+                    if (fd >= 0) {
+                        size_t off = 0; ssize_t w = 0;
+                        while (off < got) {
+                            w = write(fd, (const uint8_t *)buf + off, got - off);
+                            if (w <= 0) break;
+                            off += (size_t)w;
+                        }
+                        close(fd);
+                        if (off == got && rename(tmp, g_pcache_path) == 0) {
+                            atomic_store(&g_pcache_saved_sz, got);
+                            atomic_store(&g_pcache_last_saved_cnt, atomic_load(&g_pcache_created));
+                        } else {
+                            unlink(tmp);
+                        }
+                    }
+                }
+                free(buf);
+            }
+        }
+    }
+    atomic_store(&g_pcache_last_save_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    atomic_store(&g_pcache_saving, 0);
+}
+
+static void nvmtl_pcache_atexit(void)
+{
+    if (atomic_load(&g_pcache_created) > atomic_load(&g_pcache_last_saved_cnt))
+        nvmtl_pcache_save_now();
+}
+
+static void nvmtl_pcache_note_created(void)
+{
+    if (g_pcache == VK_NULL_HANDLE || !g_pcache_path[0]) return;
+    const uint64_t n = atomic_fetch_add(&g_pcache_created, 1) + 1;
+    const uint64_t saved = atomic_load(&g_pcache_last_saved_cnt);
+    if (n - saved < 16) return;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t last = atomic_load(&g_pcache_last_save_ns);
+    if (last && now > last && (now - last) < 5000000000ull) return;
+    if (atomic_load(&g_pcache_saving)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{ nvmtl_pcache_save_now(); });
+}
+
+static void nvmtl_pcache_init(void)
+{
+    const char *off = getenv("NVMTL_NO_VK_PCACHE");
+    if (off && *off && *off != '0') return;
+    pvkCreatePipelineCache = (PFN_vkCreatePipelineCache)pvkGetDeviceProcAddr(g_dev, "vkCreatePipelineCache");
+    pvkGetPipelineCacheData = (PFN_vkGetPipelineCacheData)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineCacheData");
+    if (!pvkCreatePipelineCache || !pvkGetPipelineCacheData) return;
+
+    const uint64_t ram = nvmtl_sys_ram_bytes();
+    g_pcache_cap = (ram && ram <= (9ull << 30)) ? (32u << 20) : (64u << 20);
+
+    extern int nvmtl_spvcache_dir_c(char *out, size_t n);
+    char dir[PATH_MAX];
+    if (nvmtl_spvcache_dir_c(dir, sizeof dir) && dir[0])
+        snprintf(g_pcache_path, sizeof g_pcache_path, "%s/vkpcache.bin", dir);
+
+    void *init_data = NULL; size_t init_sz = 0;
+    const char *try_paths[2] = { g_pcache_path[0] ? g_pcache_path : NULL, NULL };
+    const char *no_sh = getenv("NVMTL_NO_SHARED_CACHE");
+    if (!(no_sh && *no_sh && *no_sh != '0') && access("/Library/GPUBundles/nvmtl/no-shared-cache", F_OK) != 0)
+        try_paths[1] = "/Library/GPUBundles/nvmtl/spvcache/vkpcache.bin";
+
+    for (int i = 0; i < 2 && !init_data; i++) {
+        if (!try_paths[i]) continue;
+        struct stat st;
+        int fd = open(try_paths[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) continue;
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 32 && (size_t)st.st_size <= g_pcache_cap) {
+            void *b = malloc((size_t)st.st_size);
+            if (b) {
+                size_t got = 0; ssize_t r;
+                while (got < (size_t)st.st_size && (r = read(fd, (uint8_t *)b + got, (size_t)st.st_size - got)) > 0) got += (size_t)r;
+                if (got == (size_t)st.st_size) { init_data = b; init_sz = got; }
+                else free(b);
+            }
+        }
+        close(fd);
+    }
+
+    VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, init_sz, init_data };
+    if (pvkCreatePipelineCache(g_dev, &pci, NULL, &g_pcache) != VK_SUCCESS) {
+        g_pcache = VK_NULL_HANDLE;
+    } else {
+        if (init_sz && g_pcache_path[0] && access(g_pcache_path, F_OK) == 0) atomic_store(&g_pcache_saved_sz, init_sz);
+        atexit(nvmtl_pcache_atexit);
+        nvlog("vk: persistent VkPipelineCache ready (%zu KB loaded, cap %zu MiB, path %s)",
+              init_sz >> 10, g_pcache_cap >> 20, g_pcache_path[0] ? g_pcache_path : "memory-only");
+    }
+    free(init_data);
+}
+
 static VkResult nvmtl_opaque_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
+    if (cache == VK_NULL_HANDLE && g_pcache != VK_NULL_HANDLE) cache = g_pcache;
     VkPipeline handle = VK_NULL_HANDLE;
     VkGraphicsPipelineCreateInfo pinfo;
     if (g_pstat) { pinfo = *info; pinfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; info = &pinfo; }
     VkResult result = pvkCreateGraphicsPipelines(dev, cache, count, info, allocator, &handle);
-    if (result == VK_SUCCESS) *out = handle;
+    if (result == VK_SUCCESS) { *out = handle; nvmtl_pcache_note_created(); }
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
 }
@@ -828,9 +966,10 @@ int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n)
 static VkResult nvmtl_opaque_CreateComputePipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkComputePipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
+    if (cache == VK_NULL_HANDLE && g_pcache != VK_NULL_HANDLE) cache = g_pcache;
     VkPipeline handle = VK_NULL_HANDLE;
     VkResult result = nvmtl_create_compute_pipeline(dev, cache, info, allocator, &handle);
-    if (result == VK_SUCCESS) *out = handle;
+    if (result == VK_SUCCESS) { *out = handle; nvmtl_pcache_note_created(); }
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
 }
@@ -1677,6 +1816,7 @@ static int nvmtl_vk_initialize(void)
             g_dsr_depth_modes, g_dsr_stencil_modes, g_dsr_indep, g_dsr_indep_none); }
     nvlog("vk: apps-dyn dynamic vertex strides (vkCmdBindVertexBuffers2): %s", pvkCmdBindVertexBuffers2 ? "yes" : "NO — MTLBufferLayoutStrideDynamic pipelines are refused");
     pvkGetDeviceQueue(g_dev, g_qfam, 0, &g_queue);
+    nvmtl_pcache_init();
 
     atomic_store(&g_up_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
     g_state = 1;
@@ -1799,6 +1939,11 @@ static void image_pool_release(nvk_image *out);
 #define NVMTL_BUFPARK_BYTES (1024ull << 20)
 #define NVMTL_BUFPARK_MAX1  (512ull << 20)
 #define NVMTL_BUFPARK_AGE_NS (5000000000ull)   /* parked memory (system RAM is wired) is let go after 5 s unused */
+/* nitro-perf: on <=8 GB RAM Macs, bound wired buffer parking to 192 MiB / 96 MiB / 2 s (still ~288 144 Hz frames)
+   so Metal apps do not wire gigabytes of RAM and trigger swap storms. */
+static uint64_t bpark_max_bytes(void) { const uint64_t r = nvmtl_sys_ram_bytes(); return (r && r <= (9ull << 30)) ? (192ull << 20) : NVMTL_BUFPARK_BYTES; }
+static uint64_t bpark_max_one(void)   { const uint64_t r = nvmtl_sys_ram_bytes(); return (r && r <= (9ull << 30)) ? (96ull << 20)  : NVMTL_BUFPARK_MAX1; }
+static uint64_t bpark_age_ns(void)    { const uint64_t r = nvmtl_sys_ram_bytes(); return (r && r <= (9ull << 30)) ? 2000000000ull  : NVMTL_BUFPARK_AGE_NS; }
 static pthread_mutex_t g_bpark_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvk_buffer g_bpark[NVMTL_BUFPARK_N];
 static unsigned g_bpark_n;
@@ -8806,15 +8951,16 @@ static void nvmtl_vk_buffer_destroy_body(nvk_buffer *b)
 void nvmtl_vk_buffer_retire(nvk_buffer *b)
 {
     if (g_state != 1 || !b || !b->buf) return;
-    if (!bpark_on() || b->pool || b->placed || b->imported || b->moff || !b->mem || !b->alloc || b->alloc > NVMTL_BUFPARK_MAX1) {
+    if (!bpark_on() || b->pool || b->placed || b->imported || b->moff || !b->mem || !b->alloc || b->alloc > bpark_max_one()) {
         nvmtl_vk_buffer_destroy(b); return; }
     const uint64_t t0 = nvmtl_perf_now();
     const size_t n = b->size;
+    const uint64_t lim_bytes = bpark_max_bytes(), lim_age = bpark_age_ns();
     nvk_buffer ev[NVMTL_BUFPARK_N + 1]; unsigned nev = 0;
     pthread_mutex_lock(&g_bpark_lock);
     const uint64_t pnow = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    while (g_bpark_n && (g_bpark_n >= NVMTL_BUFPARK_N || g_bpark_bytes + b->alloc > NVMTL_BUFPARK_BYTES
-                         || pnow - g_bpark[0].parked_ns > NVMTL_BUFPARK_AGE_NS)) {
+    while (g_bpark_n && (g_bpark_n >= NVMTL_BUFPARK_N || g_bpark_bytes + b->alloc > lim_bytes
+                         || pnow - g_bpark[0].parked_ns > lim_age)) {
         ev[nev++] = g_bpark[0]; g_bpark_bytes -= g_bpark[0].alloc;
         memmove(&g_bpark[0], &g_bpark[1], (g_bpark_n - 1) * sizeof g_bpark[0]); g_bpark_n--; }
     nvmtl_live_relabel(b, NVMTL_LV_PARKED);

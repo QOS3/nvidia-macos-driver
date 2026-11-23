@@ -1521,7 +1521,7 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
     if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
     for (;;) {
         const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        if (now - t0 < 25000ull) {
+        if (now - t0 < 50000ull) {
             for (int spin = 0; spin < 32; spin++) __asm__ __volatile__("pause" ::: "memory");
         } else {
             usleep(NVMTL_BUSY_POLL_US);
@@ -1564,7 +1564,9 @@ static size_t nvmtl_ic_budget_bytes(void)
     static size_t v; static dispatch_once_t o;
     dispatch_once(&o, ^{
         const char *pn = getprogname();
-        const uint64_t def_mb = (pn && strcmp(pn, "WindowServer") == 0) ? 256 : 128;
+        const int is_ws = pn && strcmp(pn, "WindowServer") == 0;
+        const int small_vram = nvmtl_vk_vram_bytes() < (6ull << 30);
+        const uint64_t def_mb = small_vram ? (is_ws ? 160 : 64) : (is_ws ? 256 : 128);
         v = (size_t)(nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_BUDGET_MB", def_mb) << 20);
     });
     return v;

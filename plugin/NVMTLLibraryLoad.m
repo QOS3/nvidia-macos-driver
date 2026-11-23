@@ -526,6 +526,15 @@ static NSString *nvmtl_spvcache_dir(void) {
     });
     return dir;
 }
+/* C bridge for nvmtl_vk.c persistent VkPipelineCache storage in the process's own writable spvcache folder. */
+int nvmtl_spvcache_dir_c(char *out, size_t n) {
+    if (!out || !n) return 0;
+    @autoreleasepool {
+        NSString *d = nvmtl_spvcache_dir();
+        if (!d.length) return 0;
+        return [d getFileSystemRepresentation:out maxLength:(NSUInteger)n] ? 1 : 0;
+    }
+}
 // Shared read-only cache (loq-perf). Each sandboxed process caches in its own container, so every app and every Settings
 // pane translates the same Apple shaders again on first use, and the shared folder stays empty because no process can
 // write it (on one machine: 0 files shared, ~1.2 GB of duplicates in ten folders). A miss in this process's own folder
@@ -948,7 +957,11 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
  * NVMTL_NO_AIRTEXT_MEMO=1 reads the disk cache on every load as before. */
 static NSCache<NSString *, NSString *> *nvmtl_air_text_memo(void) {
     static NSCache *c; static dispatch_once_t once;
-    dispatch_once(&once, ^{ c = [NSCache new]; c.name = @"nvmtl.airtext"; c.totalCostLimit = 64u << 20; });
+    dispatch_once(&once, ^{
+        c = [NSCache new]; c.name = @"nvmtl.airtext";
+        const unsigned long long ram = [NSProcessInfo processInfo].physicalMemory;
+        c.totalCostLimit = (ram && ram <= (9ull << 30)) ? (24u << 20) : (64u << 20);
+    });
     return c;
 }
 static int nvmtl_air_text_memo_on(void) {

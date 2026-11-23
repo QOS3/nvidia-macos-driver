@@ -238,10 +238,18 @@ static void nvmtl_conf_settle(void)
     done = 1;
     unsigned forgot = nvmtl_conf_forget_inherited();
     const char *me = getprogname();
-    // The main bundle's identifier; a process outside any bundle has none and gets no profile.
+    // The main bundle's identifier and game-bundle metadata; a process outside any bundle has none.
     char bid[256] = "";
+    int isGameBundle = 0;
     { CFBundleRef mb = CFBundleGetMainBundle(); CFStringRef s = mb ? CFBundleGetIdentifier(mb) : NULL;
-      if (s && !CFStringGetCString(s, bid, sizeof bid, kCFStringEncodingUTF8)) bid[0] = 0; }
+      if (s && !CFStringGetCString(s, bid, sizeof bid, kCFStringEncodingUTF8)) bid[0] = 0;
+      if (mb) {
+          CFTypeRef cat = CFBundleGetValueForInfoDictionaryKey(mb, CFSTR("LSApplicationCategoryType"));
+          if (cat && CFGetTypeID(cat) == CFStringGetTypeID() &&
+              CFStringCompare((CFStringRef)cat, CFSTR("public.app-category.games"), 0) == kCFCompareEqualTo) isGameBundle = 1;
+          CFTypeRef gm = CFBundleGetValueForInfoDictionaryKey(mb, CFSTR("LSSupportsGameMode"));
+          if (gm && CFGetTypeID(gm) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)gm)) isGameBundle = 1;
+      } }
     const nvmtl_app_profile *p = nvmtl_app_profile_for(me, bid, getenv("NVMTL_APP_PROFILE"));
     nvmtl_profile_ctx ctx = { p, 0 };
     for (unsigned i = 0; p && i < p->nknobs && i < 64; i++) if (getenv(p->knobs[i].key)) ctx.envBits |= 1ull << i;
@@ -254,16 +262,19 @@ static void nvmtl_conf_settle(void)
         nvlog("profile: %s: off (NVMTL_APP_PROFILE=0)", me);
         p = NULL;
     }
-    if (!p && nvmtl_perf_app_match(me, bid, getenv("NVMTL_PERF_APPS"), getenv("NVMTL_APP_PROFILE"))) {
+    const int perfKind = p ? 0 : nvmtl_perf_app_match_kind(me, bid, isGameBundle, getenv("NVMTL_PERF_APPS"), getenv("NVMTL_APP_PROFILE"));
+    if (perfKind) {
         const int batt = nvmtl_on_battery();
+        const nvmtl_app_knob *knobs = (perfKind == 2) ? nvmtl_perf_interactive_knobs : nvmtl_perf_compute_knobs;
         const unsigned applyN = (batt && nPerf >= NVMTL_PERF_COMPUTE_AC_ONLY) ? (nPerf - NVMTL_PERF_COMPUTE_AC_ONLY) : nPerf;
-        const nvmtl_app_profile perfProf = { me, bid, nvmtl_perf_compute_knobs, applyN, 0, 0, NULL, 0, NULL, NULL, 0 };
+        const nvmtl_app_profile perfProf = { me, bid, knobs, applyN, 0, 0, NULL, 0, NULL, NULL, 0 };
         nvmtl_profile_ctx pctx = { &perfProf, perfEnvBits };
         char rec[3072]; const char *had = getenv("NVMTL_CONF_SET");
         snprintf(rec, sizeof rec, "%s", had ? had : "");
-        unsigned kept = 0, set = nvmtl_app_knobs_apply(nvmtl_perf_compute_knobs, applyN, nvmtl_profile_user_set, &pctx, rec, sizeof rec, &kept);
+        unsigned kept = 0, set = nvmtl_app_knobs_apply(knobs, applyN, nvmtl_profile_user_set, &pctx, rec, sizeof rec, &kept);
         if (rec[0]) setenv("NVMTL_CONF_SET", rec, 1);
-        nvlog("profile (compute/ReBAR%s): %s (%s): %u setting(s) applied, %u kept", batt ? ", battery" : "", me, bid[0] ? bid : "cli", set, kept);
+        nvlog("profile (%s/ReBAR%s): %s (%s): %u setting(s) applied, %u kept",
+              perfKind == 2 ? "interactive-144hz" : "compute", batt ? ", battery" : "", me, bid[0] ? bid : "cli", set, kept);
         return;
     }
     if (!p) return;

@@ -114,12 +114,14 @@ static inline const nvmtl_app_profile *nvmtl_app_profile_for(const char *exe, co
     return NULL;
 }
 
-/* Built-in high-throughput ReBAR/VRAM profile for benchmarks, compute, and 3D tools (never applies to WindowServer,
+/* Built-in high-throughput ReBAR/VRAM profile for benchmarks, compute, games, and 3D tools (never applies to WindowServer,
    system daemons, or Electron UI helpers). The last NVMTL_PERF_COMPUTE_AC_ONLY entries apply on AC power only so
    Battery mode keeps event-wait ON, lets NVK's battery policy drop PERF_BOOST, and leaves default TSG timeslice.
    NVMTL_SHARED_VRAM=1 is excluded (readback+hash regressed Metal -10.8k and OpenCL -6.9k). NVMTL_NO_ORDER_BARRIER=1
-   removes the Cyberpunk render-pass ordering barrier so Ada QMDv3 Dependent-QMD chaining (NVMTL_GDQ) links ~93% of
-   compute barriers in hardware. NVMTL_NO_RES2=1 avoids sparse VM binds on >=1 MiB Private buffers. */
+   removes the Cyberpunk render-pass ordering barrier so Ampere/Ada QMDv3 Dependent-QMD chaining (NVMTL_GDQ) links ~93% of
+   compute barriers in hardware. NVMTL_NO_RES2=1 avoids sparse VM binds on >=1 MiB Private buffers.
+   Interactive 3D/game workloads use a 4 ms AC TSG timeslice (inside a 6.94 ms 144 Hz frame) so WindowServer never starves,
+   while headless CLI benchmarks keep 8 ms for maximum throughput. */
 static const nvmtl_app_knob nvmtl_perf_compute_knobs[] = {
     { "NVK_LOCAL_MAP_SYSMEM", "0" },
     { "NVMTL_PRIVATE_POOL", "1" },
@@ -131,6 +133,18 @@ static const nvmtl_app_knob nvmtl_perf_compute_knobs[] = {
     { "NVRM_610_BOOST", "hold" },
     { "NVRM_TSG_TIMESLICE_US", "8000" },
 };
+static const nvmtl_app_knob nvmtl_perf_interactive_knobs[] = {
+    { "NVK_LOCAL_MAP_SYSMEM", "0" },
+    { "NVMTL_PRIVATE_POOL", "1" },
+    { "NVMTL_IMAGE_POOL", "1" },
+    { "NVMTL_PRETRANSLATE", "1" },
+    { "NVMTL_NO_ORDER_BARRIER", "1" },
+    { "NVMTL_NO_RES2", "1" },
+    { "NVRM_EVENT_WAIT", "0" },
+    { "NVRM_610_BOOST", "hold" },
+    { "NVRM_TSG_TIMESLICE_US", "4000" },
+};
+_Static_assert(sizeof nvmtl_perf_compute_knobs == sizeof nvmtl_perf_interactive_knobs, "perf knob tables must match");
 #define NVMTL_PERF_COMPUTE_AC_ONLY 3u
 
 static inline int nvmtl_perf_system_process(const char *exe)
@@ -146,16 +160,23 @@ static inline int nvmtl_perf_system_process(const char *exe)
     return 0;
 }
 
-static inline int nvmtl_perf_app_match(const char *exe, const char *bundle_id, const char *user_list, const char *profile_off)
+/* Returns 0 = no match, 1 = headless/benchmark compute (8 ms AC timeslice), 2 = interactive 3D/game (4 ms 144 Hz-safe AC timeslice). */
+static inline int nvmtl_perf_app_match_kind(const char *exe, const char *bundle_id, int is_game_bundle,
+                                            const char *user_list, const char *profile_off)
 {
     if ((profile_off && !strcmp(profile_off, "0")) || nvmtl_perf_system_process(exe)) return 0;
     static const char *const cli_exes[] = { "geekbench_avx2", "geekbench7", "geekbench_x86_64", "geekbench6", 0 };
     for (int i = 0; cli_exes[i]; i++) if (!strcmp(exe, cli_exes[i])) return 1;
     if (bundle_id && *bundle_id) {
         if ((!strcmp(exe, "Geekbench 7") || !strcmp(exe, "Geekbench 6")) && !strncmp(bundle_id, "com.primatelabs.", 16)) return 1;
-        if (!strcmp(exe, "Blender") && !strncmp(bundle_id, "org.blenderfoundation.", 22)) return 1;
-        if (!strcmp(exe, "Resolve") && !strncmp(bundle_id, "com.blackmagic-design.", 22)) return 1;
+        if (!strcmp(exe, "Blender") && !strncmp(bundle_id, "org.blenderfoundation.", 22)) return 2;
+        if (!strcmp(exe, "Resolve") && !strncmp(bundle_id, "com.blackmagic-design.", 22)) return 2;
     }
+    if (is_game_bundle) return 2;
+    static const char *const game_exes[] = {
+        "RobloxPlayer", "wine64-preloader", "wine-preloader", "CrossOver", "UnrealEditor", "Unity", 0
+    };
+    for (int i = 0; game_exes[i]; i++) if (!strcmp(exe, game_exes[i])) return 2;
     if (user_list && *user_list) {
         const size_t elen = strlen(exe);
         const char *p = user_list;
@@ -164,12 +185,17 @@ static inline int nvmtl_perf_app_match(const char *exe, const char *bundle_id, c
             const char *e = comma ? comma : p + strlen(p);
             while (p < e && (*p == ' ' || *p == '\t')) p++;
             while (e > p && (e[-1] == ' ' || e[-1] == '\t')) e--;
-            if ((size_t)(e - p) == elen && !memcmp(p, exe, elen)) return 1;
+            if ((size_t)(e - p) == elen && !memcmp(p, exe, elen)) return 2;
             if (!comma) break;
             p = comma + 1;
         }
     }
     return 0;
+}
+
+static inline int nvmtl_perf_app_match(const char *exe, const char *bundle_id, const char *user_list, const char *profile_off)
+{
+    return nvmtl_perf_app_match_kind(exe, bundle_id, 0, user_list, profile_off) != 0;
 }
 
 /* "major[.minor[.patch]]" into v; 1 when the major is a plausible macOS version (14..99). */
