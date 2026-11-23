@@ -58,6 +58,16 @@ install -m 755 -o root -g wheel "$HERE/userland/libvulkan_nouveau.dylib" "$GB/nv
 mkdir -p "$ST/bin" /usr/local/bin
 install -m 755 -o root -g wheel "$HERE/bin/nvmtl-smi" "$ST/bin/nvmtl-smi"
 ln -sf "$ST/bin/nvmtl-smi" /usr/local/bin/nvmtl-smi
+if [ -f "$HERE/nitro-perf-ctl.sh" ]; then
+  install -m 755 -o root -g wheel "$HERE/nitro-perf-ctl.sh" "$ST/nitro-perf-ctl.sh"
+  ln -sf "$ST/nitro-perf-ctl.sh" /usr/local/bin/nitro-perf-ctl
+fi
+if [ -f "$HERE/merge-shared-cache.sh" ]; then
+  install -m 755 -o root -g wheel "$HERE/merge-shared-cache.sh" "$ST/merge-shared-cache.sh"
+fi
+if [ -f "$HERE/rollback-nitro-perf.sh" ]; then
+  install -m 755 -o root -g wheel "$HERE/rollback-nitro-perf.sh" "$ST/rollback-nitro-perf.sh"
+fi
 
 codesign --force --sign - "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib"
 codesign --force --sign - "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib"

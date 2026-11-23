@@ -392,10 +392,10 @@ jobs:
           ditto incoming/nitro-nvrm bundle/kexts/NVRM.kext
           ditto incoming/nitro-nvaccel bundle/kexts/NVAccel.kext
           ditto incoming/nitro-nvrmfb bundle/kexts/NVRMFB.kext
-          cp package/install-nitro-perf.sh package/rollback-nitro-perf.sh package/merge-shared-cache.sh bundle/
+          cp package/install-nitro-perf.sh package/rollback-nitro-perf.sh package/merge-shared-cache.sh package/nitro-perf-ctl.sh bundle/
           chmod 755 bundle/kexts/*.kext/Contents/MacOS/* bundle/userland/* bundle/bin/nvmtl-smi bundle/*.sh
           git rev-parse HEAD > bundle/COMMIT
-          ( cd bundle && find kexts userland bin install-nitro-perf.sh rollback-nitro-perf.sh merge-shared-cache.sh COMMIT -type f | sort | xargs shasum -a 256 > SHA256SUMS )
+          ( cd bundle && find kexts userland bin install-nitro-perf.sh rollback-nitro-perf.sh merge-shared-cache.sh nitro-perf-ctl.sh COMMIT -type f | sort | xargs shasum -a 256 > SHA256SUMS )
           cat bundle/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with: { name: nitro-perf-bundle, path: bundle/ }
