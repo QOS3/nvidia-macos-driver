@@ -2196,13 +2196,20 @@ static IOLock *sFlipWaitLock;
 static volatile SInt32 sFlipWakeEv[8];
 void NVRMNVDAFramebuffer::flipWake(unsigned head)
 {
-    if (head < 8 && sFlipWaitLock) IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
+    if (head >= 8 || !sFlipWaitLock) return;
+    IOLockLock(sFlipWaitLock);
+    OSIncrementAtomic(&sFlipWakeEv[head]);
+    IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
+    IOLockUnlock(sFlipWaitLock);
 }
 bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
 {
     if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
     uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
+    const unsigned h = fHead < 8 ? fHead : 0;
     for (;;) {
+        const SInt32 seq0 = sFlipWakeEv[h];
+        __sync_synchronize();
         NvBool pending = NV_TRUE;
         if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
         if (!pending) return true;
@@ -2212,7 +2219,8 @@ bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
         if (next > end) next = end;
         if (!sFlipWaitLock) { IOSleep(1); continue; }
         IOLockLock(sFlipWaitLock);
-        IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[fHead < 8 ? fHead : 0], next, THREAD_UNINT);
+        if (sFlipWakeEv[h] == seq0)
+            IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[h], next, THREAD_UNINT);
         IOLockUnlock(sFlipWaitLock);
     }
 }
@@ -4667,9 +4675,10 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LO
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 
 #define NVRM_VRAM_POOL_MAX_SLOTS 64
+#define NVRM_VRAM_POOL_MAX_BYTES_4G (96ull * 1024ull * 1024ull)
 #define NVRM_VRAM_POOL_MAX_BYTES (128ull * 1024ull * 1024ull)
 #define NVRM_VRAM_POOL_MAX_ENTRY (16ull * 1024ull * 1024ull)
-#define NVRM_VRAM_POOL_COOLDOWN_NS (20ull * 1000ull * 1000ull)
+#define NVRM_VRAM_POOL_COOLDOWN_NS (14ull * 1000ull * 1000ull)
 struct NVRMVramPoolEntry {
     struct NvKmsKapiDevice *dev;
     struct NvKmsKapiMemory *mem;
@@ -4739,7 +4748,7 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vramtest_mode, CTLFLAG_RW | CTLFLAG_LOCKED, 
 static int gFlipInterval = 1;
 // gFlipLatch and the counters are defined above submitConfig, where the completion wait drives them.
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatch, 0, "1 = a committed flip waits for its completion before a surface retires (0 = debug bypass, 2 = deferred: the next submit verifies it)");
-SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_auto, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatchAuto, 0, "1 = at 357 Hz and above latch mode 1 runs as 2 (deferred); 0 = always wait");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_auto, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatchAuto, 0, "1 = at 120 Hz and above latch mode 1 runs as 2 (deferred); 0 = always wait");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_deferred, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchDeferred, 0, "flips verified by the next submit instead of waited for");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchWaits, 0, "flips that waited for completion");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_guard_cleared, CTLFLAG_RD | CTLFLAG_LOCKED, &gGuardCleared, 0, "1 once the boot guard was cleared this boot");
@@ -5056,12 +5065,13 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
         const bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + r->actualSize) > fPhys;
         const bool onConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + r->actualSize) > fConsPhys;
         if (p && !onScanout && !onConsole) {
+            const NvU64 poolMaxBytes = fBarLen <= (4ull << 30) ? NVRM_VRAM_POOL_MAX_BYTES_4G : NVRM_VRAM_POOL_MAX_BYTES;
             while (gVramPoolN >= NVRM_VRAM_POOL_MAX_SLOTS ||
-                   (gVramPoolN > 0 && OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)r->actualSize > (SInt64)NVRM_VRAM_POOL_MAX_BYTES)) {
+                   (gVramPoolN > 0 && OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)r->actualSize > (SInt64)poolMaxBytes)) {
                 vramPoolEvictAt(fKms, 0);
             }
             if (gVramPoolN < NVRM_VRAM_POOL_MAX_SLOTS &&
-                OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)r->actualSize <= (SInt64)NVRM_VRAM_POOL_MAX_BYTES) {
+                OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)r->actualSize <= (SInt64)poolMaxBytes) {
                 gVramPool[gVramPoolN++] = { fDev, mem, r->kva, p, (NvU64)r->actualSize, mach_absolute_time() };
                 OSAddAtomic64((SInt64)r->actualSize, &gVramPoolBytes);
                 OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)r->actualSize, &gCntReleaseBytes);

@@ -165,8 +165,8 @@ int main() {
     { Kms k; k.mode=COMPLETE; FB f; f.fKms=&k; f.mode(148500000, 2200, 1125); reset(); gFlipLatch = 2;
       assert(f.waitComplete(false, true) == NV_TRUE);
       assert(gFlipLatchDeferred == 1 && gFlipLatchWaits == 0 && gSleeps == 0 && "deferred mode must not wait for the flip"); }
-    // From 357 Hz a latch setting of 1 runs as 2 (the wait would cost a third of the frame); below it, and with the automatic
-    // switch off, the synchronous wait stays.
+    // From 120 Hz a latch setting of 1 runs as 2 (nitro-perf: eliminates ~3.8-7.3 ms synchronous stall on 144 Hz); below it,
+    // and with the automatic switch off, the synchronous wait stays.
     { Kms k; k.mode=COMPLETE; FB f; f.fKms=&k; f.mode(1199880000, 2000, 1111); reset();
       assert(f.waitComplete(false, true) == NV_TRUE);
       assert(gFlipLatchDeferred == 1 && gFlipLatchWaits == 0 && "540 Hz: the flip is verified by the next submit, not waited for"); }
@@ -175,7 +175,10 @@ int main() {
       assert(gFlipLatchWaits == 1 && gFlipLatchDeferred == 0 && "540 Hz with the automatic switch off keeps the synchronous wait"); }
     { Kms k; k.mode=COMPLETE; FB f; f.fKms=&k; f.mode(405000000, 2200, 1115); reset();
       assert(f.waitComplete(false, true) == NV_TRUE);
-      assert(gFlipLatchWaits == 1 && gFlipLatchDeferred == 0 && "165 Hz still waits for every flip"); }
+      assert(gFlipLatchDeferred == 1 && gFlipLatchWaits == 0 && "165 Hz uses deferred flip latching when autoDefer is on"); }
+    { Kms k; k.mode=COMPLETE; FB f; f.fKms=&k; f.mode(405000000, 2200, 1115); reset(); gFlipLatchAuto = 0;
+      assert(f.waitComplete(false, true) == NV_TRUE);
+      assert(gFlipLatchWaits == 1 && gFlipLatchDeferred == 0 && "165 Hz with autoDefer off keeps synchronous wait"); }
     // A completed flip: one wait recorded, no timeout, a duration captured.
     { Kms k; k.mode=COMPLETE; FB f; f.fKms=&k; f.mode(148500000, 2200, 1125); reset();
       assert(f.waitComplete(false, true) == NV_TRUE);

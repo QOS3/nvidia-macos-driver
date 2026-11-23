@@ -21,15 +21,19 @@ int main() {
     assert(kNvrmMaxPixelClockMHz >= 2100 && 1370 < kNvrmMaxPixelClockMHz);   // 2560x1600@300 (1.37 GHz) and 4K@240 DSC (2.1 GHz) fit
     assert(nvrmFlipLatchMode(1, 1, ns(540)) == 2);   // 540 Hz: deferred
     assert(nvrmFlipLatchMode(1, 1, ns(360)) == 2);
-    assert(nvrmFlipLatchMode(1, 1, ns(240)) == 1);   // 240 Hz and below: unchanged synchronous wait
+    assert(nvrmFlipLatchMode(1, 1, ns(240)) == 2);   // 240 Hz: deferred
+    assert(nvrmFlipLatchMode(1, 1, ns(144)) == 2);   // 144 Hz: deferred (nitro-perf)
+    assert(nvrmFlipLatchMode(1, 1, ns(120)) == 2);   // 120 Hz: deferred (nitro-perf)
+    assert(nvrmFlipLatchMode(1, 1, ns(90)) == 1);    // below 120 Hz: unchanged synchronous wait
     assert(nvrmFlipLatchMode(1, 1, ns(60)) == 1);
+    assert(nvrmFlipLatchMode(1, 0, ns(144)) == 1);   // auto switched off
     assert(nvrmFlipLatchMode(1, 0, ns(540)) == 1);   // auto switched off
     assert(nvrmFlipLatchMode(0, 1, ns(540)) == 0);   // explicit bypass untouched
     assert(nvrmFlipLatchMode(2, 1, ns(60)) == 2);    // explicit deferred untouched
     assert(nvrmFlipLatchMode(1, 1, 0) == 1);         // unknown period: wait
     // OLD RULE (control): 500 Hz cap excludes 540, latch mode never changes with rate
     assert(540 > 500);
-    puts("PASS: range reaches 540 Hz, latch deferred from 357 Hz up, slower panels and explicit settings unchanged");
+    puts("PASS: range reaches 540 Hz, latch deferred from 120 Hz up, slower panels and explicit settings unchanged");
 }
 '''
 with tempfile.TemporaryDirectory() as d:
