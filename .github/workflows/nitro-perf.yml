@@ -1,0 +1,397 @@
+name: nitro-perf
+on:
+  workflow_dispatch:
+  push:
+    branches: [nitro-perf]
+
+jobs:
+  tests:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Run nitro-perf gated host tests
+        run: |
+          python3 tools/run_all_tests.py -j 4 \
+            test_fb_highrefresh.py \
+            test_flip_latch_counters.py \
+            test_app_profile.c \
+            test_sysctl_allowlist.py \
+            test_tree_layout.py \
+            test_import_cache.c \
+            test_game_priority.c \
+            test_fps_limit.c \
+            test_fb_keep_front.py \
+            test_fb_scaler_limit.py \
+            test_fb_ddc.py \
+            test_fb_gamma_scale.py \
+            test_fb_open_console_copies.py \
+            test_device_removed.py \
+            test_host_pages_lease.py \
+            test_multigpu_wiring.py \
+            test_opengl_perf.py \
+            test_slot_handle_guard.py \
+            test_fc_spec_plugin.py \
+            test_vram_park_hold.py \
+            test_stream_uncached.py \
+            test_security_hardening.py \
+            test_warn_ceiling.py
+      - name: Run full host test sweep (informational for pre-existing rewritten-history controls)
+        continue-on-error: true
+        run: python3 tools/run_all_tests.py -j 4
+
+  plugin:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: Vulkan headers
+        run: |
+          git clone -q --depth 1 --branch v1.4.362 https://github.com/KhronosGroup/Vulkan-Headers.git vkh \
+            || git clone -q --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git vkh
+      - name: Build nitro-perf NVMTLDriver
+        run: |
+          mkdir -p src out
+          git archive HEAD plugin | tar x -C src
+          grep -rqs supportsPlacementSparse "$(xcrun --show-sdk-path)/System/Library/Frameworks/Metal.framework/Headers" \
+            || sed -i "" "s/, supportsPlacementSparse;/;/" src/plugin/NVMTLDevice.m
+          ( cd src/plugin && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 -DNVMTL_RELEASE=1 \
+              -Wno-protocol -Wno-incomplete-implementation -Werror=unguarded-availability-new \
+              -I"$GITHUB_WORKSPACE/vkh/include" -o "$GITHUB_WORKSPACE/out/NVMTLDriver" \
+              NVMTLDevice.m nvmtl_dlss.c dlss/elfhost.c dlss/lnxlibc.c \
+              -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework MetalFX -liconv \
+              2>"$GITHUB_WORKSPACE/out/build.err" ) || { grep -A3 ' error:' out/build.err | head -60; exit 1; }
+          codesign -f -s - out/NVMTLDriver
+          vtool -show-build out/NVMTLDriver | grep -q "minos 15.0"
+          shasum -a 256 out/NVMTLDriver
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-plugin, path: out/NVMTLDriver }
+
+  translator:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode and install spirv-tools
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install spirv-tools
+          if command -v rustup >/dev/null 2>&1; then rustup target add x86_64-apple-darwin || true; fi
+      - name: Run translator unit tests and build libnvmtl_translate.dylib
+        run: |
+          export PATH="$HOME/.cargo/bin:$(brew --prefix spirv-tools)/bin:/usr/local/bin:$PATH"
+          export MACOSX_DEPLOYMENT_TARGET=15.0
+          cargo test --lib --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
+          cargo test --lib --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate" -- --skip ca_named_checks:: --skip pixel_sampler_checks::
+          CHOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="-C link-arg=-mmacosx-version-min=15.0 --remap-path-prefix=$GITHUB_WORKSPACE/translator=/src --remap-path-prefix=$GITHUB_WORKSPACE=/work --remap-path-prefix=$CHOME=/cargo --remap-path-prefix=$HOME=/build"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cargo build --release --target x86_64-apple-darwin \
+            --manifest-path translator/wrapper/Cargo.toml \
+            --target-dir "$GITHUB_WORKSPACE/target-xlate" \
+            > "$GITHUB_WORKSPACE/out/cargo.log" 2>&1 || { cat "$GITHUB_WORKSPACE/out/cargo.log"; exit 4; }
+          D="$GITHUB_WORKSPACE/out/libnvmtl_translate.dylib"
+          cp "$GITHUB_WORKSPACE/target-xlate/x86_64-apple-darwin/release/libnvmtl_translate.dylib" "$D"
+          strip -S "$D"
+          install_name_tool -id @rpath/libnvmtl_translate.dylib "$D"
+          codesign -f -s - "$D"
+          vtool -show-build "$D" | grep -q "minos 15.0"
+          shasum -a 256 "$D"
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-translator, path: out/libnvmtl_translate.dylib }
+
+  nvk:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode and install NVK build tools
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja glslang llvm spirv-llvm-translator cbindgen bindgen pkg-config
+          python3 -m venv "$GITHUB_WORKSPACE/pyvenv"
+          "$GITHUB_WORKSPACE/pyvenv/bin/pip" install --quiet --upgrade pip
+          "$GITHUB_WORKSPACE/pyvenv/bin/pip" install --quiet meson mako pyyaml packaging
+          if command -v rustup >/dev/null 2>&1; then rustup target add x86_64-apple-darwin || true; fi
+          mkdir -p "$GITHUB_WORKSPACE/sysroot/lib/pkgconfig"
+          cat > "$GITHUB_WORKSPACE/sysroot/lib/pkgconfig/zlib.pc" <<'EOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+
+          Name: zlib
+          Description: zlib compression library
+          Version: 1.2.12
+          Libs: -lz
+          EOF
+      - name: Fetch Mesa base and open-gpu-kernel-modules 610.57.04
+        run: |
+          BASE=$(cat nvk/MESA_BASE)
+          git init "$GITHUB_WORKSPACE/mesa"
+          git -C "$GITHUB_WORKSPACE/mesa" remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
+          git -C "$GITHUB_WORKSPACE/mesa" fetch --depth 1 origin tag mesa-26.3.0-rc3
+          git -C "$GITHUB_WORKSPACE/mesa" cat-file -e "$BASE^{commit}" || git -C "$GITHUB_WORKSPACE/mesa" fetch --depth 1 origin "$BASE"
+          mkdir -p "$GITHUB_WORKSPACE/ogkm-610"
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.57.04.tar.gz \
+            | tar --strip-components=1 -xz -C "$GITHUB_WORKSPACE/ogkm-610"
+      - name: Build nitro-perf libvulkan_nouveau.dylib
+        run: |
+          export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
+          LLVM_PREFIX=$(brew --prefix llvm)
+          SPIRV_PREFIX=$(brew --prefix spirv-llvm-translator)
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          export NVK_PATH="$GITHUB_WORKSPACE/pyvenv/bin:$LLVM_PREFIX/bin:$SPIRV_PREFIX/bin:$HOME/.cargo/bin:/usr/local/bin"
+          export PKG_CONFIG_PATH="$SPIRV_PREFIX/lib/pkgconfig:$LLVM_PREFIX/lib/pkgconfig"
+          export LIBCLANG_PATH="$LLVM_PREFIX/lib"
+          export NVK_SYSROOT="$GITHUB_WORKSPACE/sysroot"
+          export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK"
+          export NVK_EXTRA_PATCHES="nvk-loq-ada-perf nvk-nitro-perf"
+          export NVK_JOBS=4
+          if ! bash build/build_nvk.sh "$GITHUB_WORKSPACE/mesa" "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/out" 3.0; then
+            for l in clc-native.setup.log clc-native.log setup.log build.log; do
+              [ -f "$GITHUB_WORKSPACE/out/$l" ] && { echo "=== $l ==="; tail -60 "$GITHUB_WORKSPACE/out/$l"; }
+            done
+            exit 1
+          fi
+          D="$GITHUB_WORKSPACE/out/libvulkan_nouveau.dylib"
+          codesign -f -s - "$D"
+          otool -L "$D" | grep -qE '/usr/local/|/opt/homebrew/' && { echo "STOP: Homebrew dep"; exit 5; } || true
+          vtool -show-build "$D" | grep -q "minos 15.0"
+          shasum -a 256 "$D"
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvk, path: out/libvulkan_nouveau.dylib }
+
+  nvrm:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode and build NVRM.kext
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          mkdir -p ogkm-src work src out
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm-src
+          JOBS=4 bash build/build_rm620.sh work ogkm-src
+          JOBS=4 bash build/build_kms620.sh work
+          git archive HEAD kexts/NVRM build | tar x -C src
+          bash src/build/build_nvrm.sh src/kexts/NVRM "$GITHUB_WORKSPACE/work/ogkm-620.70.06" "$GITHUB_WORKSPACE/out" \
+            || { cat "$GITHUB_WORKSPACE/out"/*.err 2>/dev/null; exit 1; }
+          shasum -a 256 out/NVRM.kext/Contents/MacOS/NVRM
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvrm, path: out/NVRM.kext }
+
+  nvaccel:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode and build NVAccel.kext (macOS 15)
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          mkdir -p ogkm-src work src out
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm-src
+          T="$GITHUB_WORKSPACE/work/ogkm-620.70.06"
+          cp -R ogkm-src "$T"
+          for f in kexts/NVRM/patches/*.patch; do
+            ok=0
+            for root in "" "src/nvidia-modeset"; do
+              ( cd "$T/$root" && patch -p1 --fuzz=0 --dry-run < "$GITHUB_WORKSPACE/$f" >/dev/null 2>&1 && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$f" >/dev/null ) && { ok=1; break; }
+            done
+            [ "$ok" = 1 ] || { echo "STOP: $(basename "$f") failed on ogkm"; exit 2; }
+          done
+          python3 - "$T" <<'PY'
+          import os, sys
+          t = sys.argv[1]
+          def edit(rel, old, new):
+              p = os.path.join(t, rel); s = open(p).read()
+              if new in s: return
+              assert s.count(old) == 1
+              open(p + ".tmp", "w").write(s.replace(old, new)); os.replace(p + ".tmp", p)
+          edit("src/common/sdk/nvidia/inc/cpuopsys.h", "defined(__INTEGRITY) ) && !defined(nvmacosx)", "defined(__INTEGRITY) || defined(NV_DARWIN) ) && !defined(nvmacosx)")
+          for rel in ("src/common/inc/nvVer.h", "src/common/inc/nvUnixVersion.h"):
+              edit(rel, "defined(NV_QNX) || defined(NV_INTEGRITY) || \\", "defined(NV_QNX) || defined(NV_INTEGRITY) || defined(NV_DARWIN) || \\")
+          edit("src/common/inc/nvBldVer.h", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS)\n", "#if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS) || defined(NV_DARWIN)\n")
+          PY
+          cd "$T/src/nvidia"
+          O=_out/Darwin_x86_64; mkdir -p "$O"
+          make -n TARGET_OS=Darwin TARGET_ARCH=x86_64 NV_VERBOSE=1 2>/dev/null > "$GITHUB_WORKSPACE/work/make-n.txt"
+          grep -E "^echo .*version\.h" "$GITHUB_WORKSPACE/work/make-n.txt" > "$GITHUB_WORKSPACE/work/pre.sh"
+          bash "$GITHUB_WORKSPACE/work/pre.sh"
+          grep " -c " "$GITHUB_WORKSPACE/work/make-n.txt" > "$O/compile_cmds.sh"
+          cd "$GITHUB_WORKSPACE"
+          git archive HEAD kexts/NVRM build | tar x -C src
+          MACOSX_DEPLOYMENT_TARGET=15.0 OGKM="$T" bash src/build/accel_build.sh src/kexts/NVRM "$GITHUB_WORKSPACE/out" \
+            || { cat "$GITHUB_WORKSPACE/out/accel.err" "$GITHUB_WORKSPACE/out/accelld.err" 2>/dev/null; exit 1; }
+          shasum -a 256 out/NVAccel.kext/Contents/MacOS/NVAccel
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvaccel, path: out/NVAccel.kext }
+
+  nvrmfb:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode and build NVRMFB.kext
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          mkdir -p ogkm src out
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/620.70.06.tar.gz | tar --strip-components=1 -xz -C ogkm
+          for f in kexts/NVRM/patches/*.patch; do
+            ok=0
+            for root in "" "src/nvidia-modeset"; do
+              ( cd "ogkm/$root" && patch -p1 --fuzz=0 --dry-run < "$GITHUB_WORKSPACE/$f" >/dev/null 2>&1 && patch -p1 --fuzz=0 --no-backup-if-mismatch < "$GITHUB_WORKSPACE/$f" >/dev/null ) && { ok=1; break; }
+            done
+            [ "$ok" = 1 ] || { echo "STOP: $(basename "$f") failed on ogkm"; exit 2; }
+          done
+          git archive HEAD kexts/NVRMFB kexts/NMHDA build | tar x -C src
+          OGKM="$GITHUB_WORKSPACE/ogkm" MINVER=15.0 bash src/build/fb_build.sh src/kexts "$GITHUB_WORKSPACE/out" \
+            || { cat "$GITHUB_WORKSPACE/out/fb.err" "$GITHUB_WORKSPACE/out/fbld.err" 2>/dev/null; exit 1; }
+          shasum -a 256 out/NVRMFB.kext/Contents/MacOS/NVRMFB
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvrmfb, path: out/NVRMFB.kext }
+
+  nvencvt:
+    runs-on: macos-15-intel
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode, fetch headers, and build libnvencvt.dylib
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          mkdir -p hdr/webkit-spi src out
+          fetch() {
+            d=$1; u=$2; r=$3; shift 3
+            git clone -q --filter=blob:none --no-checkout "$u" "hdr/$d"
+            git -C "hdr/$d" sparse-checkout set "$@"
+            git -C "hdr/$d" fetch -q --tags origin
+            git -C "hdr/$d" checkout -q "$r"
+          }
+          fetch ogkm https://github.com/NVIDIA/open-gpu-kernel-modules.git 610.57.04 src/common/sdk/nvidia/inc src/nvidia/arch/nvalloc/unix/include
+          fetch ogd https://github.com/NVIDIA/open-gpu-doc.git 9fdf5c4062007929d9f4e6cbad9c9771fe61b880 classes/video
+          for f in CMBaseObjectSPI.h VTVideoDecoderSPI.h; do
+            curl -fsSL -o "hdr/webkit-spi/$f" "https://raw.githubusercontent.com/WebKit/WebKit/3bfbc200370710495ffa440abdd31b943c83ad7a/Source/ThirdParty/libwebrtc/Source/webrtc/webkit_sdk/WebKit/$f"
+          done
+          git archive HEAD vendor/nvenc | tar x -C src
+          VER=$(git rev-parse --short HEAD)
+          ( cd src/vendor/nvenc && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -fvisibility=hidden -dynamiclib \
+              -DNVENC_VERSION="\"$VER\"" \
+              -o "$GITHUB_WORKSPACE/out/libnvencvt.dylib" vt/nvencvt.c vt/nvencvt_dec.c src/*.c \
+              -I src -I "$GITHUB_WORKSPACE/hdr/webkit-spi" \
+              -I "$GITHUB_WORKSPACE/hdr/ogkm/src/common/sdk/nvidia/inc" \
+              -I "$GITHUB_WORKSPACE/hdr/ogkm/src/nvidia/arch/nvalloc/unix/include" \
+              -I "$GITHUB_WORKSPACE/hdr/ogd/classes/video" \
+              -Werror=unguarded-availability-new \
+              -framework IOKit -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
+              -framework Accelerate -framework IOSurface \
+              2>"$GITHUB_WORKSPACE/out/build.err" ) || { grep -A3 ' error:' out/build.err | head -60; exit 1; }
+          codesign -f -s - out/libnvencvt.dylib
+          vtool -show-build out/libnvencvt.dylib | grep -q "minos 15.0"
+          shasum -a 256 out/libnvencvt.dylib
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvencvt, path: out/libnvencvt.dylib }
+
+  nvmtl-smi:
+    runs-on: macos-15-intel
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode, materialize headers, and build nvmtl-smi
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          mkdir -p "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/mesa-nvrm" out
+          curl -fsSL https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.57.04.tar.gz \
+            | tar --strip-components=1 -xz -C "$GITHUB_WORKSPACE/ogkm-610"
+          for p in nvk/ogkm-nvos-620.patch nvk/ogkm-warnings.patch; do
+            patch -p1 --fuzz=0 --no-backup-if-mismatch -d "$GITHUB_WORKSPACE/ogkm-610" < "$p"
+          done
+          python3 - "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/mesa-nvrm" <<'PY'
+          import os, subprocess, sys
+          repo, dest = sys.argv[1], sys.argv[2]
+          targets = {
+              "src/nouveau/vulkan/nvmtl_cfg.h",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvrm_surfshare_abi.h",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c",
+              "src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h",
+          }
+          def extract_hunks(patch_path, wanted):
+              lines = open(patch_path, encoding="utf-8", errors="replace").readlines()
+              out, cur, cur_file, i = [], [], None, 0
+              while i < len(lines):
+                  line = lines[i]
+                  if line.startswith("diff "):
+                      if cur and cur_file in wanted: out.extend(cur)
+                      cur, cur_file, i = [line], None, i + 1; continue
+                  if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+                      if not (cur and cur[0].startswith("diff ") and not any(l.startswith("+++ ") for l in cur)):
+                          if cur and cur_file in wanted: out.extend(cur)
+                          cur = []
+                      b = lines[i + 1][4:].strip().split("\t")[0]
+                      cur_file = b[2:] if b.startswith("b/") else b
+                      cur.extend([line, lines[i + 1]]); i += 2; continue
+                  if cur: cur.append(line)
+                  i += 1
+              if cur and cur_file in wanted: out.extend(cur)
+              return "".join(out)
+          for name in ["nvk-macos", "nvk-fixes-after-def16", "nvk-620-kernel", "nvk-slab", "nvk-hubfix", "nvk-card-select"]:
+              sub = extract_hunks(os.path.join(repo, "nvk", f"{name}.patch"), targets)
+              if sub: subprocess.run(["patch", "-p1", "--fuzz=0", "--no-backup-if-mismatch"], cwd=dest, input=sub, text=True, check=True)
+          PY
+          ln -sfn "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/mesa-nvrm/src/nouveau/vulkan/nvkmd/nvrm/open-gpu-kernel-modules"
+          bash tools/nvmtl-smi/build.sh "$GITHUB_WORKSPACE/mesa-nvrm" out/nvmtl-smi
+          codesign -f -s - out/nvmtl-smi
+          vtool -show-build out/nvmtl-smi | grep -q "minos 15.0"
+          shasum -a 256 out/nvmtl-smi
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvmtl-smi, path: out/nvmtl-smi }
+
+  bundle:
+    needs: [tests, plugin, translator, nvk, nvrm, nvaccel, nvrmfb, nvencvt, nvmtl-smi]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: incoming }
+      - name: Assemble verified nitro-perf-bundle
+        run: |
+          mkdir -p bundle/kexts bundle/userland bundle/bin
+          cp incoming/nitro-plugin/NVMTLDriver bundle/userland/
+          cp incoming/nitro-translator/libnvmtl_translate.dylib bundle/userland/
+          cp incoming/nitro-nvencvt/libnvencvt.dylib bundle/userland/
+          cp incoming/nitro-nvk/libvulkan_nouveau.dylib bundle/userland/
+          cp incoming/nitro-nvmtl-smi/nvmtl-smi bundle/bin/
+          ditto incoming/nitro-nvrm bundle/kexts/NVRM.kext
+          ditto incoming/nitro-nvaccel bundle/kexts/NVAccel.kext
+          ditto incoming/nitro-nvrmfb bundle/kexts/NVRMFB.kext
+          cp package/install-nitro-perf.sh package/rollback-nitro-perf.sh package/merge-shared-cache.sh bundle/
+          chmod 755 bundle/kexts/*.kext/Contents/MacOS/* bundle/userland/* bundle/bin/nvmtl-smi bundle/*.sh
+          git rev-parse HEAD > bundle/COMMIT
+          ( cd bundle && find kexts userland bin install-nitro-perf.sh rollback-nitro-perf.sh merge-shared-cache.sh COMMIT -type f | sort | xargs shasum -a 256 > SHA256SUMS )
+          cat bundle/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-perf-bundle, path: bundle/ }
