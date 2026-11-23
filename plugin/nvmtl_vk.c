@@ -1933,17 +1933,41 @@ static int  vpool_on(void);
 static void pool_buffer_release(nvk_buffer *b);
 static int  private_pool_on(void);
 static int  private_pool_buffer_create(size_t size, nvk_buffer *out);
+static int  bar1_upload_buffer_create(size_t size, nvk_buffer *out);
+static void pool_trim_idle_now(void);
 static int  image_pool_bind(nvk_image *out);
 static void image_pool_release(nvk_image *out);
 #define NVMTL_BUFPARK_N     32
 #define NVMTL_BUFPARK_BYTES (1024ull << 20)
 #define NVMTL_BUFPARK_MAX1  (512ull << 20)
 #define NVMTL_BUFPARK_AGE_NS (5000000000ull)   /* parked memory (system RAM is wired) is let go after 5 s unused */
-/* nitro-perf: on <=8 GB RAM Macs, bound wired buffer parking to 192 MiB / 96 MiB / 2 s (still ~288 144 Hz frames)
-   so Metal apps do not wire gigabytes of RAM and trigger swap storms. */
-static uint64_t bpark_max_bytes(void) { const uint64_t r = nvmtl_sys_ram_bytes(); return (r && r <= (9ull << 30)) ? (192ull << 20) : NVMTL_BUFPARK_BYTES; }
-static uint64_t bpark_max_one(void)   { const uint64_t r = nvmtl_sys_ram_bytes(); return (r && r <= (9ull << 30)) ? (96ull << 20)  : NVMTL_BUFPARK_MAX1; }
-static uint64_t bpark_age_ns(void)    { const uint64_t r = nvmtl_sys_ram_bytes(); return (r && r <= (9ull << 30)) ? 2000000000ull  : NVMTL_BUFPARK_AGE_NS; }
+/* nitro-perf v2: adaptive memory-pressure-aware buffer parking. Under NORMAL pressure on <=8 GB RAM Macs we allow
+   384 MiB / 128 MiB / 4 s for high reuse hit rates; DISPATCH_MEMORYPRESSURE_WARN tightens to 64 MiB and drains excess,
+   and CRITICAL drains 100% immediately so macOS stays out of swap. */
+static _Atomic int g_mem_pressure;
+static uint64_t bpark_max_bytes(void)
+{
+    const int p = atomic_load(&g_mem_pressure);
+    if (p >= 2) return 0;
+    if (p == 1) return 64ull << 20;
+    const uint64_t r = nvmtl_sys_ram_bytes();
+    return (r && r <= (9ull << 30)) ? (384ull << 20) : NVMTL_BUFPARK_BYTES;
+}
+static uint64_t bpark_max_one(void)
+{
+    const int p = atomic_load(&g_mem_pressure);
+    if (p >= 2) return 0;
+    if (p == 1) return 32ull << 20;
+    const uint64_t r = nvmtl_sys_ram_bytes();
+    return (r && r <= (9ull << 30)) ? (128ull << 20) : NVMTL_BUFPARK_MAX1;
+}
+static uint64_t bpark_age_ns(void)
+{
+    const int p = atomic_load(&g_mem_pressure);
+    if (p >= 1) return 1000000000ull;
+    const uint64_t r = nvmtl_sys_ram_bytes();
+    return (r && r <= (9ull << 30)) ? 4000000000ull : NVMTL_BUFPARK_AGE_NS;
+}
 static pthread_mutex_t g_bpark_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvk_buffer g_bpark[NVMTL_BUFPARK_N];
 static unsigned g_bpark_n;
@@ -2012,6 +2036,24 @@ static void bpark_drain_private(void)
     for (unsigned k = 0; k < nout; k++) bpark_free(&out[k]);
     if (nout) { atomic_fetch_add(&g_bpark_drained, nout);
         nvlog("buffer park: VRAM wall refused - drained %u parked Private buffers", nout); }
+}
+void nvmtl_vk_memory_pressure(int level)
+{
+    atomic_store(&g_mem_pressure, level);
+    if (g_state != 1 || level <= 0) return;
+    const uint64_t cap = level >= 2 ? 0 : (64ull << 20);
+    nvk_buffer out[NVMTL_BUFPARK_N]; unsigned nout = 0;
+    pthread_mutex_lock(&g_bpark_lock);
+    while (g_bpark_n && (level >= 2 || g_bpark_bytes > cap)) {
+        out[nout++] = g_bpark[0]; g_bpark_bytes -= g_bpark[0].alloc;
+        memmove(&g_bpark[0], &g_bpark[1], (g_bpark_n - 1) * sizeof g_bpark[0]); g_bpark_n--;
+    }
+    pthread_mutex_unlock(&g_bpark_lock);
+    for (unsigned k = 0; k < nout; k++) bpark_free(&out[k]);
+    if (nout) atomic_fetch_add(&g_bpark_drained, nout);
+    if (level >= 2) pool_trim_idle_now();
+    if (nout || level >= 2)
+        nvlog("memory pressure (%s): drained %u parked buffer(s)", level >= 2 ? "CRITICAL" : "WARN", nout);
 }
 static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer *out);
 static pthread_mutex_t nvmtl_submit_mutex;
@@ -2322,6 +2364,22 @@ static int nvmtl_vk_stage(nvk_queue *q, size_t size, nvk_buffer *out)
     if (nvmtl_vk_buffer_create(size, 1, s)) { memset(s, 0, sizeof *s); return -1; }
     *out = *s;
     return 0;
+}
+/* nitro-perf v2: dedicated per-thread write-only staging buffer backed by BAR1 ReBAR VRAM for <=4 MiB texture
+   uploads (CPU writes directly over WC BAR1, GPU copies VRAM->VRAM). Keeps nvmtl_vk_stage on cached sysmem for readbacks. */
+static pthread_key_t g_wstage_key; static pthread_once_t g_wstage_once = PTHREAD_ONCE_INIT;
+static void nvmtl_wstage_key_make(void) { if (pthread_key_create(&g_wstage_key, nvmtl_stage_free)) nvlog("wstage: pthread_key_create FAILED"); }
+static int nvmtl_vk_stage_write(nvk_queue *q, size_t size, nvk_buffer *out)
+{
+    if (size > NVMTL_POOL_MAX) return nvmtl_vk_stage(q, size, out);
+    pthread_once(&g_wstage_once, nvmtl_wstage_key_make);
+    nvk_buffer *s = pthread_getspecific(g_wstage_key);
+    if (!s) { s = calloc(1, sizeof *s); if (!s) return nvmtl_vk_stage(q, size, out);
+        if (pthread_setspecific(g_wstage_key, s)) { free(s); return nvmtl_vk_stage(q, size, out); } }
+    if (s->buf && s->size >= size) { *out = *s; return 0; }
+    nvmtl_vk_buffer_destroy(s); memset(s, 0, sizeof *s);
+    if (bar1_upload_buffer_create(size, s) == 0) { *out = *s; return 0; }
+    return nvmtl_vk_stage(q, size, out);
 }
 
 int nvmtl_vk_format_is_storage(uint32_t vkfmt)
@@ -9748,11 +9806,11 @@ int nvmtl_vk_image_write_region_level_layer(nvk_queue *q, nvk_image *img, const 
         // a prior async upload to THIS image must land before we overwrite the texture or its staging
         if (finish_first) nvmtl_asyncup_finish(nvmtl_asyncup_take(img));
         au = (nvmtl_asyncup *)calloc(1, sizeof *au);
-        if (!au || nvmtl_vk_buffer_create(bytes, 1, &au->stage)) { free(au); au = NULL; }   // fall back to sync
+        if (!au || (bar1_upload_buffer_create(bytes, &au->stage) && nvmtl_vk_buffer_create(bytes, 1, &au->stage))) { free(au); au = NULL; }   // fall back to sync
     }
     if (au) { stageb = &au->stage; c = &au->cb; }
     else {
-        if (nvmtl_vk_stage(q, bytes, &stage_sync)) return -1;
+        if (nvmtl_vk_stage_write(q, bytes, &stage_sync)) return -1;
         stageb = &stage_sync; c = &local_cb;
     }
     uint8_t *dst = (uint8_t *)stageb->map;
@@ -11399,8 +11457,12 @@ static pool_block *g_pool;
 static pool_block *g_vpool;
 static pool_block *g_private_pool;   /* NVMTL_PRIVATE_POOL: small private buffers */
 static pool_block *g_image_pool;     /* NVMTL_IMAGE_POOL: small optimal images */
+static pool_block *g_bar1_up_pool;   /* nitro-perf v2: persistent BAR1 ReBAR write-only upload ring/pool */
 static pool_block **pool_head(int vram);
 static uint64_t g_vpool_blocks;
+static uint64_t g_bar1_up_blocks;
+static size_t g_bar1_up_bytes;
+static int g_bar1_up_off;
 static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_pool_align;
 
@@ -11528,11 +11590,111 @@ static void pool_buffer_release(nvk_buffer *b)
             pool_block **pp = head; while (*pp && *pp != blk) pp = &(*pp)->next;
             if (*pp) { *pp = blk->next; const size_t hs = blk->heap.size; const int v = blk->vram;
                 nvmtl_vk_heap_destroy(&blk->heap); free(blk->fr); free(blk); g_pool_blocks--;
-                if (v == 1) { g_vpool_blocks--; g_bar1_bytes -= hs; } }
+                if (v == 1) { g_vpool_blocks--; g_bar1_bytes -= hs; }
+                else if (v == 4) { g_bar1_up_blocks--; g_bar1_up_bytes -= hs; } }
         }
     }
     pthread_mutex_unlock(&g_pool_lock);
     b->pool = NULL;
+}
+
+/* nitro-perf v2: trim all empty idle pool blocks on CRITICAL memory pressure. */
+static void pool_trim_idle_now(void)
+{
+    pthread_mutex_lock(&g_pool_lock);
+    const int kinds[2] = { 0, 4 };
+    for (int ki = 0; ki < 2; ki++) {
+        pool_block **pp = pool_head(kinds[ki]);
+        while (*pp) {
+            pool_block *blk = *pp;
+            if (!blk->nlive) {
+                *pp = blk->next;
+                const size_t hs = blk->heap.size; const int v = blk->vram;
+                nvmtl_vk_heap_destroy(&blk->heap); free(blk->fr); free(blk); g_pool_blocks--;
+                if (v == 4) { g_bar1_up_blocks--; g_bar1_up_bytes -= hs; }
+            } else {
+                pp = &blk->next;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_pool_lock);
+}
+
+/* nitro-perf v2: Persistent BAR1 ReBAR write-only upload pool (16 MiB blocks, max 2 on <=6 GB VRAM / 4 on >6 GB).
+   Activates automatically ONLY on true full-ReBAR cards (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT heap >= 2 GiB),
+   eliminating staging vkAllocateMemory and PCIe DMA reads for write-only texture uploads <= 4 MiB.
+   NVMTL_NO_BAR1_RING=1 disables it. */
+#define NVMTL_BAR1_UP_BLOCK (16u << 20)
+static int bar1_upload_memtype(uint32_t bits)
+{
+    if (g_bar1_up_off) return -1;
+    static int env = -1;
+    if (env < 0) { const char *e = getenv("NVMTL_NO_BAR1_RING"); env = !(e && *e && *e != '0'); }
+    if (!env) { g_bar1_up_off = 1; return -1; }
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++) {
+        if (!(bits & (1u << i)) || (g_memp.memoryTypes[i].propertyFlags & want) != want) continue;
+        const VkDeviceSize heap = g_memp.memoryHeaps[g_memp.memoryTypes[i].heapIndex].size;
+        if (heap >= (2ull << 30)) return (int)i;
+    }
+    g_bar1_up_off = 1;
+    return -1;
+}
+static int bar1_upload_heap_create(size_t size, nvk_heap *out)
+{
+    static uint32_t bits;
+    memset(out, 0, sizeof *out);
+    const uint64_t max_blocks = nvmtl_vk_vram_bytes() <= (6ull << 30) ? 2u : 4u;
+    if (g_bar1_up_blocks >= max_blocks) return -1;
+    if (!bits) {
+        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 4096, NVMTL_BUFFER_USAGE, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+        VkBuffer pb = VK_NULL_HANDLE;
+        if (pvkCreateBuffer(g_dev, &bci, NULL, &pb) != VK_SUCCESS) return -1;
+        VkMemoryRequirements mr; pvkGetBufferMemoryRequirements(g_dev, pb, &mr); pvkDestroyBuffer(g_dev, pb, NULL);
+        bits = mr.memoryTypeBits; if (!bits) return -1;
+    }
+    const int bt = bar1_upload_memtype(bits); if (bt < 0) return -1;
+    VkMemoryAllocateFlagsInfo bf = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0 };
+    VkMemoryAllocateInfo bi = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &bf, size + nvmtl_buf_guard(), (uint32_t)bt };
+    VkDeviceMemory bm = VK_NULL_HANDLE; void *bp = NULL;
+    VkResult r1 = pvkAllocateMemory(g_dev, &bi, NULL, &bm);
+    VkResult r2 = r1 == VK_SUCCESS ? pvkMapMemory(g_dev, bm, 0, VK_WHOLE_SIZE, 0, &bp) : r1;
+    if (r2 != VK_SUCCESS || !bp) {
+        if (r1 == VK_SUCCESS && r2 == VK_SUCCESS) pvkUnmapMemory(g_dev, bm);
+        if (bm) pvkFreeMemory(g_dev, bm, NULL);
+        g_bar1_up_off = 1;
+        nvlog("bar1 upload ring: disabled (alloc %d, map %d at %zu B)", r1, r2, g_bar1_up_bytes);
+        return -1;
+    }
+    out->mem = bm; out->map = bp; out->size = size; out->memtype = (uint32_t)bt; out->host_visible = 1;
+    g_alloc_bytes += size; g_bar1_up_bytes += size;
+    return 0;
+}
+static int bar1_upload_buffer_create(size_t size, nvk_buffer *out)
+{
+    if (g_state != 1 || g_bar1_up_off || !size || size > NVMTL_POOL_MAX || atomic_load(&g_mem_pressure) >= 2) return -1;
+    size_t al = pool_align(), len = (size + al - 1) / al * al; if (!len) len = al;
+    pthread_mutex_lock(&g_pool_lock);
+    pool_block *blk = g_bar1_up_pool; size_t off = 0; int got = 0;
+    for (; blk; blk = blk->next) if (pool_block_take(blk, len, &off)) { got = 1; break; }
+    if (!got) {
+        pool_block *nb = calloc(1, sizeof *nb);
+        if (!nb || bar1_upload_heap_create(NVMTL_BAR1_UP_BLOCK, &nb->heap)) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
+        nb->vram = 4; nb->next = g_bar1_up_pool; g_bar1_up_pool = nb; g_pool_blocks++; g_bar1_up_blocks++;
+        nvmtl_vk_heap_zero(&nb->heap, "BAR1 ReBAR upload ring");
+        nvlog("bar1 upload ring: mapped block #%llu (%zu MiB, type %u)", (unsigned long long)g_bar1_up_blocks, nb->heap.size >> 20, nb->heap.memtype);
+        blk = nb; if (!pool_block_take(blk, len, &off)) { pthread_mutex_unlock(&g_pool_lock); return -1; }
+    }
+    blk->nlive++; g_pool_live++; g_pool_bytes += len;
+    pthread_mutex_unlock(&g_pool_lock);
+    nvk_buffer pb; memset(&pb, 0, sizeof pb);
+    if (nvmtl_vk_buffer_create_placed(size, &blk->heap, off, &pb)) {
+        pthread_mutex_lock(&g_pool_lock); blk->nlive--; g_pool_live--; g_pool_bytes -= len; pool_block_give(blk, off, len); pthread_mutex_unlock(&g_pool_lock);
+        return -1;
+    }
+    *out = pb; out->pool = blk; out->poff = off; out->alloc = len; out->size = size;
+    if (!out->map && blk->heap.map) out->map = (uint8_t *)blk->heap.map + off;
+    return 0;
 }
 
 /* NVMTL_PRIVATE_POOL=1: private buffers of up to NVMTL_POOL_MAX bytes share VRAM blocks of NVMTL_POOL_BLOCK instead of
@@ -11547,10 +11709,10 @@ static int private_pool_on(void)
         if (on) nvlog("vk: private buffers of up to %u KB share %u MiB VRAM blocks (NVMTL_PRIVATE_POOL=1)", NVMTL_POOL_MAX >> 10, NVMTL_POOL_BLOCK >> 20); }
     return on;
 }
-/* the block list for a pool kind: 0 system pool, 1 shared-in-VRAM pool, 2 private buffers, 3 optimal images */
+/* the block list for a pool kind: 0 system pool, 1 shared-in-VRAM pool, 2 private buffers, 3 optimal images, 4 BAR1 upload ring */
 static pool_block **pool_head(int vram)
 {
-    return vram == 3 ? &g_image_pool : vram == 2 ? &g_private_pool : vram ? &g_vpool : &g_pool;
+    return vram == 4 ? &g_bar1_up_pool : vram == 3 ? &g_image_pool : vram == 2 ? &g_private_pool : vram ? &g_vpool : &g_pool;
 }
 /* Takes `reserved` bytes from a block of kind `vram` whose memory type is in `bits`, making a VRAM block when none fits.
    On success the block has one more live range and the lock is released; the caller binds at an aligned offset. */

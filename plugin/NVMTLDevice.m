@@ -87,6 +87,7 @@ uint16_t nvmtl_vk_vendor(void);
 const char *nvmtl_vk_device_name(void);
 void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, size_t *bytes);
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned);
+static void nvmtl_ic_flush_pressure(int critical);
 
 static int nvmtl_sample_payload_abi(id value) {
     if (![value isKindOfClass:[NSDictionary class]]) return 0;
@@ -341,6 +342,30 @@ static bool nvmtl_decode_is_delegated(const char *me)
     CFStringRef ident = main ? CFBundleGetIdentifier(main) : NULL;
     return ident && CFStringHasPrefix(ident, CFSTR("com.apple."));
 }
+// nitro-perf: Apple System Settings extensions and non-media system UI utilities never encode/decode video via
+// VideoToolbox (which rejects registration inside them with -12908), yet synchronously dlopen'ing 5 codec dylibs +
+// opening an RM handle on the main UI thread adds ~150-200 ms to every Settings pane launch.
+// NVMTL_FORCE_CODECS=1 restores registration in those processes; media apps & VT XPC services are untouched.
+static bool nvmtl_skip_codec_in_ui(const char *me)
+{
+    if (getenv("NVMTL_FORCE_CODECS")) return false;
+    if (nvmtl_is_decode_service(me)) return false;
+    if (me && strncmp(me, "VTEncoderXPCService", 19) == 0) return false;
+    CFBundleRef main = CFBundleGetMainBundle();
+    CFStringRef ident = main ? CFBundleGetIdentifier(main) : NULL;
+    char bid[256] = "";
+    if (ident && CFStringGetCString(ident, bid, sizeof bid, kCFStringEncodingUTF8) && !strncmp(bid, "com.apple.", 10)) {
+        const char *tail = bid + 10;
+        if (strstr(tail, "Settings") || strstr(tail, "Preference") || !strcmp(tail, "systempreferences")) return true;
+        static const char *const ui_ids[] = {
+            "dock", "dock.extra", "Spotlight", "Terminal", "ActivityMonitor", "finder",
+            "controlcenter", "notificationcenterui", "loginwindow", "CursorUIViewService",
+            "SecurityPrivacyExtension", "PowerPreferences", NULL
+        };
+        for (int i = 0; ui_ids[i]; i++) if (!strcmp(tail, ui_ids[i])) return true;
+    }
+    return false;
+}
 static void nvmtl_nvdec_register(void)
 {
     static dispatch_once_t once;
@@ -348,6 +373,7 @@ static void nvmtl_nvdec_register(void)
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVDEC")) { nvlog("nvdec: NVMTL_NO_NVDEC set - not registering in %s", me); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_skip_codec_in_ui(me)) return;
         if (nvmtl_decode_is_delegated(me)) {
             nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process H.264 decoder (delegates to VTDecoderXPCService)", me);
             return;
@@ -392,6 +418,7 @@ static void nvmtl_nvenc_register(void)
         const char *lib = nvmtl_nvenc_library_for_this_gpu();
         if (!lib) { nvlog("nvenc: no encoder library for %s - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_skip_codec_in_ui(me)) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
         if (!reg) { nvlog("nvenc: VideoToolbox is not loaded in %s - not registering", me); return; }
@@ -486,6 +513,7 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         bool haveGen = nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen);
         if (!nvmtl_nvencvt_selected(getenv("NVMTL_NVENCVT"), me, haveGen ? gen : NULL)) return;
         if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
+        if (nvmtl_skip_codec_in_ui(me)) return;
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
@@ -516,6 +544,7 @@ static void nvmtl_nvdec_hevc_register(void)
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVDEC_HEVC")) { nvlog("nvdec: NVMTL_NO_NVDEC_HEVC set - not registering HEVC in %s", me); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_skip_codec_in_ui(me)) return;
         if (nvmtl_decode_is_delegated(me)) {
             nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process HEVC decoder (delegates to VTDecoderXPCService)", me);
             return;
@@ -597,6 +626,7 @@ static void nvmtl_nvenc_hevc_register(void)
         const char *lib = nvmtl_nvenc_hevc_library_for_this_gpu();
         if (!lib) { nvlog("nvenc: no HEVC encoder library for %s - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_skip_codec_in_ui(me)) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
         if (!reg) { nvlog("nvenc: VideoToolbox is not loaded in %s - not registering HEVC", me); return; }
@@ -986,6 +1016,31 @@ static id nvmtl_refuse_before_init(id obj)
         return nil;
     }
     nvmtl_gl_caps_enable();
+    { static dispatch_source_t g_mp_src; static dispatch_once_t g_mp_once;
+      dispatch_once(&g_mp_once, ^{
+          g_mp_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+              DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+              dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+          if (g_mp_src) {
+              dispatch_source_set_event_handler(g_mp_src, ^{
+                  extern void nvmtl_vk_memory_pressure(int level);
+                  extern void nvmtl_air_text_memo_flush(void);
+                  const unsigned long f = dispatch_source_get_data(g_mp_src);
+                  if (f & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+                      nvmtl_vk_memory_pressure(2);
+                      nvmtl_air_text_memo_flush();
+                      nvmtl_ic_flush_pressure(1);
+                  } else if (f & DISPATCH_MEMORYPRESSURE_WARN) {
+                      nvmtl_vk_memory_pressure(1);
+                      nvmtl_air_text_memo_flush();
+                      nvmtl_ic_flush_pressure(0);
+                  } else if (f & DISPATCH_MEMORYPRESSURE_NORMAL) {
+                      nvmtl_vk_memory_pressure(0);
+                  }
+              });
+              dispatch_resume(g_mp_src);
+          }
+      }); }
     if (nvmtl_vk_vendor() == 0x1002 || nvmtl_vk_vendor() == 0x8086) nvmtl_nmxvt_register();
     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
         nvmtl_nvdec_register();
@@ -1595,6 +1650,15 @@ static void nvmtl_ic_expire_now(void)
     unsigned char gone[NVMTL_IC_SLOTS][NVMTL_IC_PAYLOAD];
     os_unfair_lock_lock(&g_ic_lock);
     const int n = nvmtl_ic_expire(&g_ic, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), nvmtl_ic_idle_ns(), 0, gone, NVMTL_IC_SLOTS);
+    os_unfair_lock_unlock(&g_ic_lock);
+    nvmtl_ic_destroy_all(gone, n);
+}
+static void nvmtl_ic_flush_pressure(int critical)
+{
+    if (!nvmtl_ic_on()) return;
+    unsigned char gone[NVMTL_IC_SLOTS][NVMTL_IC_PAYLOAD];
+    os_unfair_lock_lock(&g_ic_lock);
+    const int n = nvmtl_ic_expire(&g_ic, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), critical ? 0 : (nvmtl_ic_idle_ns() / 2), critical, gone, NVMTL_IC_SLOTS);
     os_unfair_lock_unlock(&g_ic_lock);
     nvmtl_ic_destroy_all(gone, n);
 }

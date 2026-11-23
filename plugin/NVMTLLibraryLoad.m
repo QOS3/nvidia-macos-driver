@@ -960,9 +960,12 @@ static NSCache<NSString *, NSString *> *nvmtl_air_text_memo(void) {
     dispatch_once(&once, ^{
         c = [NSCache new]; c.name = @"nvmtl.airtext";
         const unsigned long long ram = [NSProcessInfo processInfo].physicalMemory;
-        c.totalCostLimit = (ram && ram <= (9ull << 30)) ? (24u << 20) : (64u << 20);
+        c.totalCostLimit = (ram && ram <= (9ull << 30)) ? (48u << 20) : (64u << 20);
     });
     return c;
+}
+void nvmtl_air_text_memo_flush(void) {
+    [nvmtl_air_text_memo() removeAllObjects];
 }
 static int nvmtl_air_text_memo_on(void) {
     static int on = -1;
@@ -1356,8 +1359,17 @@ static _Atomic unsigned long gPreQueued, gPreDone, gPreTranslated, gPreCached, g
 static nvmtl_pool *nvmtl_pre_pool(void) {
     static nvmtl_pool pool; static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *t = getenv("NVMTL_PRETRANSLATE_THREADS"); int n = t ? atoi(t) : 2;
-        nvmtl_pool_init(&pool, n < 1 ? 1 : n > 4 ? 4 : n, 1);
+        const char *t = getenv("NVMTL_PRETRANSLATE_THREADS");
+        int n;
+        if (t && *t) {
+            n = atoi(t);
+        } else {
+            int ncpu = (int)[NSProcessInfo processInfo].activeProcessorCount;
+            n = ncpu / 2;
+            if (n < 2) n = 2;
+            if (n > 6) n = 6;
+        }
+        nvmtl_pool_init(&pool, n < 1 ? 1 : n > 8 ? 8 : n, 1);
     });
     return &pool;
 }
@@ -1371,7 +1383,9 @@ static void nvmtl_pre_run(void *ctx) {
             || (nvmtl_air_text_flags(ll) & (NVMTL_AIRF_DYLD_TABLE | NVMTL_AIRF_ISECT_TABLE))) atomic_fetch_add(&gPreSkipped, 1);
         else {
             NSString *file = getenv("NVMTL_SPVCACHE_OFF") ? nil : nvmtl_spvcache_path(air, stage);
-            if (file && access(file.fileSystemRepresentation, F_OK) == 0) atomic_fetch_add(&gPreCached, 1);
+            NSString *shared = file ? nvmtl_shared_twin(file) : nil;
+            if ((file && access(file.fileSystemRepresentation, F_OK) == 0) ||
+                (shared && access(shared.fileSystemRepresentation, F_OK) == 0)) atomic_fetch_add(&gPreCached, 1);
             else {
                 NSString *why = nil;
                 if (nvmtl_compile_library_entry(air, ll, stage, name, &why)) atomic_fetch_add(&gPreTranslated, 1);
