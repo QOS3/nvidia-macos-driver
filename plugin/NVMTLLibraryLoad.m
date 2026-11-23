@@ -73,6 +73,34 @@ static char gXlateTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
 // The translator build alone, without the mode suffixes (-u2, -p5, ...) gXlateTag adds: the stale-entry sweep keys on it.
 static char gXlateBuildTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
+    struct stat st;
+    if (path && stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+        // Fast path (nitro-perf v4): root-owned <path>.sha256 sidecar matched against (size, mtime_sec, mtime_nsec)
+        // avoids synchronously reading & SHA-256 hashing 15.3 MB of libnvmtl_translate.dylib on every app/Settings launch.
+        char spath[PATH_MAX];
+        if (snprintf(spath, sizeof spath, "%s.sha256", path) < (int)sizeof spath) {
+            struct stat sst;
+            int sfd = open(spath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (sfd >= 0) {
+                if (fstat(sfd, &sst) == 0 && S_ISREG(sst.st_mode) && sst.st_uid == 0 && !(sst.st_mode & S_IWOTH) &&
+                    sst.st_size > 64 && sst.st_size < 256) {
+                    char sb[256]; ssize_t rn = read(sfd, sb, sizeof sb - 1);
+                    if (rn > 64) {
+                        sb[rn] = 0;
+                        long long sz = -1, mt_s = -1, mt_ns = -1; char hx[80] = {0};
+                        if (sscanf(sb, "%lld %lld %lld %64[0-9a-f]", &sz, &mt_s, &mt_ns, hx) == 4 &&
+                            strlen(hx) == 64 && sz == (long long)st.st_size &&
+                            mt_s == (long long)st.st_mtimespec.tv_sec && mt_ns == (long long)st.st_mtimespec.tv_nsec) {
+                            close(sfd);
+                            snprintf(tag, capacity, "sha256-%s", hx);
+                            return;
+                        }
+                    }
+                }
+                close(sfd);
+            }
+        }
+    }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     CC_SHA256_CTX context; CC_SHA256_Init(&context);
     BOOL complete = fd >= 0; uint8_t buffer[65536];
@@ -131,21 +159,24 @@ static nvmtl_promote_uniform_fn xlate_promote_uniform;
 typedef int (*nvmtl_tile_rewrite_fn)(const char *, uint32_t, uint32_t, uint32_t, uint8_t **, size_t *, char *, size_t);
 static nvmtl_tile_rewrite_fn xlate_tile_rewrite;
 
-static int nvmtl_xlate_ready(void) {
+static char gXlatePath[PATH_MAX];
+static int nvmtl_xlate_tag_ready(void) {
     static dispatch_once_t once;
+    static int ok;
     dispatch_once(&once, ^{
         Dl_info info; NSString *bundled = nil;
-        if (dladdr((const void *)&nvmtl_xlate_ready, &info) && info.dli_fname)
+        if (dladdr((const void *)&nvmtl_xlate_tag_ready, &info) && info.dli_fname)
             bundled = [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"libnvmtl_translate.dylib"];
-        const char *xpath = bundled && access(bundled.fileSystemRepresentation,R_OK)==0 ? bundled.fileSystemRepresentation : NVMTL_XLATE_LIB;
-        void *h = dlopen(xpath, RTLD_NOW | RTLD_LOCAL);
-        if (h) nvmtl_translator_cache_tag(xpath, gXlateTag, sizeof gXlateTag);
+        const char *xpath = bundled && access(bundled.fileSystemRepresentation, R_OK) == 0 ? bundled.fileSystemRepresentation : NVMTL_XLATE_LIB;
+        if (!xpath || access(xpath, R_OK) != 0) return;
+        strlcpy(gXlatePath, xpath, sizeof gXlatePath);
+        nvmtl_translator_cache_tag(gXlatePath, gXlateTag, sizeof gXlateTag);
         strlcpy(gXlateBuildTag, gXlateTag, sizeof gXlateBuildTag);
         // Each mode below changes the SPIR-V a module translates to, so a cache entry written in one mode must never be
         // served in another: unrolled AIR, canonical pointers, argument-buffer samplers, and the two translator switches
         // an application profile sets.
         { const char *as = getenv("NVMTL_ARGBUF_SAMPLERS");
-          if (h && !nvmtl_spvcache_mode_tag(gXlateTag, sizeof gXlateTag, gXlateBuildTag, !getenv("NVMTL_NO_AIR_UNROLL"),
+          if (!nvmtl_spvcache_mode_tag(gXlateTag, sizeof gXlateTag, gXlateBuildTag, !getenv("NVMTL_NO_AIR_UNROLL"),
                                        getenv("NVMTL_CANONICAL_POINTERS") != NULL, as && !strcmp(as, "1"),
                                        getenv("NVMTL_NO_PTR_PHI_LOAD") != NULL, getenv("NVMTL_NO_PIXEL_HW_FILTER") != NULL)) {
               // A tag that cannot name every mode cannot keep the modes apart: no cache entry is read or written.
@@ -155,8 +186,18 @@ static int nvmtl_xlate_ready(void) {
         // Typed dummy slots change every module that indexes the heap (a null resource id is redirected), so their
         // SPIR-V never shares a cache entry with the other mode.
         { extern int nvmtl_typed_dummies_wanted(void);
-          if (h && strcmp(gXlateTag, "untagged") && nvmtl_typed_dummies_wanted()) strlcat(gXlateTag, "-td1", sizeof gXlateTag); }
-        if (!h) { nvlog("translate: dlopen(%s): %s", NVMTL_XLATE_LIB, dlerror()); return; }
+          if (strcmp(gXlateTag, "untagged") && nvmtl_typed_dummies_wanted()) strlcat(gXlateTag, "-td1", sizeof gXlateTag); }
+        ok = 1;
+    });
+    return ok;
+}
+
+static int nvmtl_xlate_ready(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!nvmtl_xlate_tag_ready() || !gXlatePath[0]) { nvlog("translate: %s not readable", NVMTL_XLATE_LIB); return; }
+        void *h = dlopen(gXlatePath, RTLD_NOW | RTLD_LOCAL);
+        if (!h) { nvlog("translate: dlopen(%s): %s", gXlatePath, dlerror()); return; }
         xlate = (nvmtl_translate_fn)dlsym(h, "nvmtl_translate");
         { char tid[1200];
           nvlog("translate: opened %s (cache tag %s)%s", nvmtl_image_ident((const void *)xlate, tid, sizeof tid), gXlateTag,
@@ -1263,7 +1304,7 @@ static void nvmtl_translate_failure_note(NSString *key, NSString *why) {
 }
 
 NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, NSString *name, NSString **error) {
-    if (!air || !ll || !stage || !nvmtl_xlate_ready()) { if(error)*error=@"missing entry or translator"; return nil; }
+    if (!air || !ll || !stage || !nvmtl_xlate_tag_ready()) { if(error)*error=@"missing entry or translator"; return nil; }
     if (air.length >= 20 && *(const uint32_t *)air.bytes == 0x07230203u) return air;
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
         NSString *spvp = nvmtl_spvcache_path(air, stage);
@@ -1303,6 +1344,10 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
                 return nil;
             }
             gSpvMiss++;
+            if (!nvmtl_xlate_ready()) {
+                nvmtl_sf_publish(sf, sfKey.UTF8String, NULL); nvmtl_sf_retire(sf, sfKey.UTF8String);
+                if (error) *error = @"missing translator"; return nil;
+            }
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
                 nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err);
                 nvmtl_translate_failure_note(sfKey, @(err));
@@ -1471,7 +1516,7 @@ NSDictionary<NSString *, NSData *> *nvmtl_index_metallib_uncached(NSData *lib, N
 // modes (canonical pointers inline helpers). It is named by the library AND the full cache tag, so a record written in
 // one mode is never read in another; without a tag there is no record.
 static NSString *nvmtl_idx_path(NSData *key) {
-    (void)nvmtl_xlate_ready();   // the tag is made there
+    (void)nvmtl_xlate_tag_ready();   // the tag is made there without dlopen'ing libnvmtl_translate.dylib
     if (!strcmp(gXlateTag, "untagged")) return nil;
     NSMutableString *h = [NSMutableString stringWithString:@"idx2-"]; const uint8_t *d = key.bytes;
     for (NSUInteger i = 0; i < key.length; i++) [h appendFormat:@"%02x", d[i]];
@@ -2009,7 +2054,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
                                        const uint32_t *idx, const uint32_t *sizes,
                                        const uint8_t *const *payloads, size_t n, NSString **err)
 {
-    if (!ll || !constants.count || !nvmtl_xlate_ready())
+    if (!ll || !constants.count || !nvmtl_xlate_tag_ready())
         return nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
     NSDictionary *config = @{ @"stage": stage ?: @"", @"entry": name ?: @"", @"constants": constants };
     NSData *json = [NSJSONSerialization dataWithJSONObject:config options:NSJSONWritingSortedKeys error:NULL];
@@ -2096,7 +2141,8 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
 {
     NVMTLAirDigest *airDigest = nvmtl_air_state(ll);
     NSDictionary *fc = (function && [function->_fc isKindOfClass:[NSDictionary class]]) ? function->_fc : @{};
-    NSDictionary *config = @{ @"stage": stage ?: @"", @"fc": fc, @"fcx": @(xlate_refl_fc != NULL) };
+    // Before libnvmtl_translate.dylib is dlopen'ed, assume modern translator exports nvmtl_reflect_fc so warm refl1 cache hits avoid dlopen.
+    NSDictionary *config = @{ @"stage": stage ?: @"", @"fc": fc, @"fcx": @(xlate ? (xlate_refl_fc != NULL) : YES) };
     NSData *json = [NSJSONSerialization isValidJSONObject:config]
                  ? [NSJSONSerialization dataWithJSONObject:config options:NSJSONWritingSortedKeys error:NULL] : nil;
     NSString *path = (airDigest && json) ? nvmtl_spvcache_path_air(airDigest, json, @"refl1") : nil;
@@ -2115,6 +2161,10 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
                                         (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, hn, (unsigned long)gRfMiss, (unsigned long)gRfStored);
             return hit;
         }
+    }
+    if (!nvmtl_xlate_ready() || !xlate_refl) {
+        if (e && elen) snprintf(e, elen, "translator not ready");
+        return nil;
     }
     unsigned long mn = ++gRfMiss;
     uint8_t *j = NULL; size_t jn = 0;
@@ -2139,7 +2189,7 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     NSData *air = [ll dataUsingEncoding:NSUTF8StringEncoding];
     NSData *st = [(stage ?: @"") dataUsingEncoding:NSUTF8StringEncoding];
     size_t *ord = calloc(n ? n : 1, sizeof *ord);
-    if (!air || !st || !ord || !nvmtl_xlate_ready()) { free(ord); return nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err); }
+    if (!air || !st || !ord || !nvmtl_xlate_tag_ready()) { free(ord); return nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err); }
     for (size_t k = 0; k < n; k++) ord[k] = k;
     for (size_t a = 1; a < n; a++) for (size_t b = a; b > 0 && idx[ord[b - 1]] > idx[ord[b]]; b--) { size_t x = ord[b]; ord[b] = ord[b - 1]; ord[b - 1] = x; }
     NSMutableData *key = [NSMutableData data]; uint64_t size = air.length, sl = st.length, nn = n;
@@ -2179,7 +2229,7 @@ NSDictionary *nvmtl_function_reflection(NVMTLFunction *function)
     @synchronized (function) {
         if (function->_refl) return function->_refl.count ? function->_refl : nil;
         function->_refl = @{};
-        if (!nvmtl_xlate_ready() || !xlate_refl) { nvlog("reflection: translator not ready — %s cannot be reflected", function->_fname.UTF8String ?: "?"); return nil; }
+        if (!nvmtl_xlate_tag_ready()) { nvlog("reflection: translator not ready — %s cannot be reflected", function->_fname.UTF8String ?: "?"); return nil; }
         NSString *ll = function->_air, *stage = function->_stage, *name = function->_fname;
         if (!ll || !stage.length) { nvlog("reflection: %s has no AIR — cannot be reflected", name.UTF8String ?: "?"); return nil; }
         char e[512] = { 0 };

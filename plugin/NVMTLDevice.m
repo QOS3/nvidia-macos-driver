@@ -358,8 +358,13 @@ static bool nvmtl_skip_codec_in_ui(const char *me)
         const char *tail = bid + 10;
         if (strstr(tail, "Settings") || strstr(tail, "Preference") || !strcmp(tail, "systempreferences")) return true;
         static const char *const ui_ids[] = {
-            "dock", "dock.extra", "Spotlight", "Terminal", "ActivityMonitor", "finder",
-            "controlcenter", "notificationcenterui", "loginwindow", "CursorUIViewService",
+            "dock", "dock.extra", "dock.helper", "Spotlight", "SpotlightNetHelper",
+            "Terminal", "ActivityMonitor", "finder", "WindowManager", "WallpaperAgent",
+            "controlcenter", "notificationcenterui", "UserNotificationCenter",
+            "loginwindow", "CursorUIViewService", "CoreServicesUIAgent",
+            "ViewBridgeAuxiliary", "systemuiserver", "TextInputMenuAgent",
+            "AccessibilityVisualsAgent", "UniversalAccessAuthWarn", "screencaptureui",
+            "appkit.xpc.openAndSavePanelService",
             "SecurityPrivacyExtension", "PowerPreferences", NULL
         };
         for (int i = 0; ui_ids[i]; i++) if (!strcmp(tail, ui_ids[i])) return true;

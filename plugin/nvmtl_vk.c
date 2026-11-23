@@ -794,7 +794,11 @@ static VkResult nvmtl_opaque_CreateCommandPool(VkDevice dev, const VkCommandPool
    other cards or driver builds are safely ignored. NVMTL_NO_VK_PCACHE=1 disables it completely. */
 static PFN_vkCreatePipelineCache pvkCreatePipelineCache;
 static PFN_vkGetPipelineCacheData pvkGetPipelineCacheData;
+static PFN_vkMergePipelineCaches pvkMergePipelineCaches;
+static PFN_vkDestroyPipelineCache pvkDestroyPipelineCache;
 static VkPipelineCache g_pcache = VK_NULL_HANDLE;
+static uint8_t g_pcache_uuid[16];
+static uint32_t g_pcache_vid, g_pcache_did;
 static char g_pcache_path[PATH_MAX];
 static size_t g_pcache_cap = 32u << 20;
 static _Atomic uint64_t g_pcache_created, g_pcache_last_saved_cnt, g_pcache_last_save_ns;
@@ -871,12 +875,46 @@ static void nvmtl_pcache_note_created(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{ nvmtl_pcache_save_now(); });
 }
 
+static int nvmtl_pcache_header_valid(const void *buf, size_t sz)
+{
+    if (!buf || sz < 32) return 0;
+    uint32_t hdr[4];
+    memcpy(hdr, buf, sizeof hdr);
+    if (hdr[0] < 32 || hdr[1] != 1) return 0;
+    if (g_pcache_vid && hdr[2] != g_pcache_vid) return 0;
+    if (g_pcache_did && hdr[3] != g_pcache_did) return 0;
+    return memcmp((const uint8_t *)buf + 16, g_pcache_uuid, 16) == 0;
+}
+
+static void *nvmtl_pcache_read_valid(const char *path, size_t *out_sz)
+{
+    *out_sz = 0;
+    if (!path || !*path) return NULL;
+    struct stat st;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    void *res = NULL;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 32 && (size_t)st.st_size <= g_pcache_cap) {
+        void *b = malloc((size_t)st.st_size);
+        if (b) {
+            size_t got = 0; ssize_t r;
+            while (got < (size_t)st.st_size && (r = read(fd, (uint8_t *)b + got, (size_t)st.st_size - got)) > 0) got += (size_t)r;
+            if (got == (size_t)st.st_size && nvmtl_pcache_header_valid(b, got)) { res = b; *out_sz = got; }
+            else free(b);
+        }
+    }
+    close(fd);
+    return res;
+}
+
 static void nvmtl_pcache_init(void)
 {
     const char *off = getenv("NVMTL_NO_VK_PCACHE");
     if (off && *off && *off != '0') return;
     pvkCreatePipelineCache = (PFN_vkCreatePipelineCache)pvkGetDeviceProcAddr(g_dev, "vkCreatePipelineCache");
     pvkGetPipelineCacheData = (PFN_vkGetPipelineCacheData)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineCacheData");
+    pvkMergePipelineCaches = (PFN_vkMergePipelineCaches)pvkGetDeviceProcAddr(g_dev, "vkMergePipelineCaches");
+    pvkDestroyPipelineCache = (PFN_vkDestroyPipelineCache)pvkGetDeviceProcAddr(g_dev, "vkDestroyPipelineCache");
     if (!pvkCreatePipelineCache || !pvkGetPipelineCacheData) return;
 
     const uint64_t ram = nvmtl_sys_ram_bytes();
@@ -887,39 +925,46 @@ static void nvmtl_pcache_init(void)
     if (nvmtl_spvcache_dir_c(dir, sizeof dir) && dir[0])
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/vkpcache.bin", dir);
 
-    void *init_data = NULL; size_t init_sz = 0;
-    const char *try_paths[2] = { g_pcache_path[0] ? g_pcache_path : NULL, NULL };
+    const char *shared_path = NULL;
     const char *no_sh = getenv("NVMTL_NO_SHARED_CACHE");
     if (!(no_sh && *no_sh && *no_sh != '0') && access("/Library/GPUBundles/nvmtl/no-shared-cache", F_OK) != 0)
-        try_paths[1] = "/Library/GPUBundles/nvmtl/spvcache/vkpcache.bin";
+        shared_path = "/Library/GPUBundles/nvmtl/spvcache/vkpcache.bin";
 
-    for (int i = 0; i < 2 && !init_data; i++) {
-        if (!try_paths[i]) continue;
-        struct stat st;
-        int fd = open(try_paths[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-        if (fd < 0) continue;
-        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 32 && (size_t)st.st_size <= g_pcache_cap) {
-            void *b = malloc((size_t)st.st_size);
-            if (b) {
-                size_t got = 0; ssize_t r;
-                while (got < (size_t)st.st_size && (r = read(fd, (uint8_t *)b + got, (size_t)st.st_size - got)) > 0) got += (size_t)r;
-                if (got == (size_t)st.st_size) { init_data = b; init_sz = got; }
-                else free(b);
-            }
-        }
-        close(fd);
+    size_t local_sz = 0, shared_sz = 0;
+    void *local_data = g_pcache_path[0] ? nvmtl_pcache_read_valid(g_pcache_path, &local_sz) : NULL;
+    void *shared_data = (shared_path && (!g_pcache_path[0] || strcmp(g_pcache_path, shared_path) != 0))
+                      ? nvmtl_pcache_read_valid(shared_path, &shared_sz) : NULL;
+
+    // Prefer the larger valid cache as primary; if both local and shared are valid, merge the secondary into primary
+    // so new processes never lose shared UI shaders to a tiny local cache, and never load a stale-UUID local cache.
+    void *pri = local_data, *sec = shared_data;
+    size_t pri_sz = local_sz, sec_sz = shared_sz;
+    int pri_is_local = (local_data != NULL);
+    if (shared_data && shared_sz > local_sz) {
+        pri = shared_data; pri_sz = shared_sz;
+        sec = local_data; sec_sz = local_sz;
+        pri_is_local = 0;
     }
 
-    VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, init_sz, init_data };
+    VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, pri_sz, pri };
     if (pvkCreatePipelineCache(g_dev, &pci, NULL, &g_pcache) != VK_SUCCESS) {
         g_pcache = VK_NULL_HANDLE;
     } else {
-        if (init_sz && g_pcache_path[0] && access(g_pcache_path, F_OK) == 0) atomic_store(&g_pcache_saved_sz, init_sz);
+        if (sec && sec_sz >= 32 && pvkMergePipelineCaches && pvkDestroyPipelineCache) {
+            VkPipelineCache tmp_c = VK_NULL_HANDLE;
+            VkPipelineCacheCreateInfo sci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, sec_sz, sec };
+            if (pvkCreatePipelineCache(g_dev, &sci, NULL, &tmp_c) == VK_SUCCESS) {
+                (void)pvkMergePipelineCaches(g_dev, g_pcache, 1, &tmp_c);
+                pvkDestroyPipelineCache(g_dev, tmp_c, NULL);
+            }
+        }
+        if (pri_is_local && pri_sz) atomic_store(&g_pcache_saved_sz, pri_sz);
         atexit(nvmtl_pcache_atexit);
-        nvlog("vk: persistent VkPipelineCache ready (%zu KB loaded, cap %zu MiB, path %s)",
-              init_sz >> 10, g_pcache_cap >> 20, g_pcache_path[0] ? g_pcache_path : "memory-only");
+        nvlog("vk: persistent VkPipelineCache ready (%zu KB primary + %zu KB merged, cap %zu MiB, path %s)",
+              pri_sz >> 10, sec_sz >> 10, g_pcache_cap >> 20, g_pcache_path[0] ? g_pcache_path : "memory-only");
     }
-    free(init_data);
+    free(local_data);
+    free(shared_data);
 }
 
 static VkResult nvmtl_opaque_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
@@ -1371,6 +1416,8 @@ static int nvmtl_vk_initialize(void)
     nvlog("vk: pdev %u physical device(s) through this ICD (VkResult %d)", n, (int)er);
     VkPhysicalDevice pds[8]; if (n > 8) n = 8; pvkEnumeratePhysicalDevices(g_inst, &n, pds); g_pdev = pds[0];
     VkPhysicalDeviceProperties pp; pvkGetPhysicalDeviceProperties(g_pdev, &pp);
+    g_pcache_vid = pp.vendorID; g_pcache_did = pp.deviceID;
+    memcpy(g_pcache_uuid, pp.pipelineCacheUUID, sizeof g_pcache_uuid);
     if (pp.vendorID == 0x10de) {
         g_cbuf_limit = pp.limits.maxUniformBufferRange < 65536u ? pp.limits.maxUniformBufferRange : 65536u;
         g_cbuf_alignment = pp.limits.minUniformBufferOffsetAlignment;
@@ -5449,6 +5496,27 @@ static int nvmtl_spirv_ssbo_table(const void *spv, size_t n)
     return 0;
 }
 static _Atomic unsigned long long g_g1_refused;
+static _Atomic unsigned long gAddrDiskHit, gAddrDiskMiss;
+static NSString *nvmtl_addr_cache_path(const void *data, size_t len, uint32_t flags) {
+    if (getenv("NVMTL_SPVCACHE_OFF") || !nvmtl_xlate_tag_ready() || !strcmp(gXlateBuildTag, "untagged")) return nil;
+    NSString *d = nvmtl_spvcache_dir();
+    if (!d) return nil;
+    const uint32_t mode = (flags & 0xFFFFu) | (nvmtl_table_ubo() ? (1u << 16) : 0u) | (nvmtl_align_guard_on() ? (1u << 17) : 0u);
+    CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
+    CC_SHA256_Update(&ctx, &mode, sizeof mode);
+    const uint64_t l64 = (uint64_t)len;
+    CC_SHA256_Update(&ctx, &l64, sizeof l64);
+    for (size_t off = 0; off < len; ) {
+        CC_LONG chunk = (CC_LONG)((len - off) > (1u << 30) ? (1u << 30) : (len - off));
+        CC_SHA256_Update(&ctx, (const uint8_t *)data + off, chunk);
+        off += chunk;
+    }
+    unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(h, &ctx);
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+    return [d stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.addr1.%s.c3.spv", hex, gXlateBuildTag]];
+}
+
 static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t flags, uint32_t *info) {
@@ -5463,7 +5531,33 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
         return hit[0] == (id)[NSNull null] ? nil : hit[0];
     }
     uint32_t got[4] = {0};
-    NSData *d = nvmtl_address_shader_g_uncached(data, len, flags, got);
+    NSData *d = nil;
+    NSString *diskPath = nvmtl_addr_cache_path(data, len, flags);
+    if (diskPath) {
+        NSData *disk = nvmtl_cache_read(diskPath);
+        if (disk.length >= 40 && ((disk.length - 20) % 4) == 0) {
+            uint32_t hdr[6];
+            memcpy(hdr, disk.bytes, sizeof hdr);
+            if (hdr[0] == 0x4441564Eu && hdr[5] == 0x07230203u) {
+                memcpy(got, &hdr[1], sizeof got);
+                d = [NSData dataWithBytes:(const uint8_t *)disk.bytes + 20 length:disk.length - 20];
+                atomic_fetch_add(&gAddrDiskHit, 1);
+                nvmtl_cache_touch(diskPath);
+            }
+        }
+    }
+    if (!d) {
+        d = nvmtl_address_shader_g_uncached(data, len, flags, got);
+        if (diskPath && d.length >= 20 && (d.length % 4) == 0 && *(const uint32_t *)d.bytes == 0x07230203u) {
+            atomic_fetch_add(&gAddrDiskMiss, 1);
+            uint32_t hdr[5] = { 0x4441564Eu, got[0], got[1], got[2], got[3] };
+            NSMutableData *blob = [NSMutableData dataWithCapacity:20 + d.length];
+            [blob appendBytes:hdr length:sizeof hdr];
+            [blob appendData:d];
+            NSData *stored = [blob copy]; NSString *file = [diskPath copy];
+            nvmtl_cache_io(^{ (void)nvmtl_cache_write(file, stored); });
+        }
+    }
     if (info) memcpy(info, got, sizeof got);
     pthread_mutex_lock(&lk);
     if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];
