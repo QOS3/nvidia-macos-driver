@@ -148,75 +148,105 @@ if [ "${NVK_PRUNE_WEAK_FLAT:-1}" = 1 ]; then
   python3 - "$B" "$D" <<'PYEOF'
 import os, re, subprocess, sys, time
 
-B, D = sys.argv[1], sys.argv[2]
-nm_out = subprocess.check_output(["nm", "-m", D], text=True, errors="replace")
-undef_weak = set()
-other_dyn = []
-for line in nm_out.splitlines():
-    if "(undefined)" not in line or "dynamically looked up" not in line:
-        continue
-    sym = line.strip().split()[-1]
-    if sym.startswith("_"):
-        sym = sym[1:]
-    if "weak" in line and sym.startswith(("nvk_", "vk_", "wsi_")):
-        undef_weak.add(sym)
-    else:
-        other_dyn.append(line.strip())
+def main():
+    B, D = sys.argv[1], sys.argv[2]
+    nm_out = subprocess.check_output(["nm", "-m", D], text=True, errors="replace")
+    undef_weak = set()
+    other_dyn = []
+    sample_dyn = []
+    for line in nm_out.splitlines():
+        if "(undefined)" not in line or "dynamically looked up" not in line:
+            continue
+        if len(sample_dyn) < 5:
+            sample_dyn.append(line.strip())
+        # Apple nm -m format:
+        #   (undefined) weak external _vk_common_Foo (dynamically looked up)
+        #   (undefined) weak external _vk_common_Foo [referenced dynamically] (dynamically looked up)
+        before = line.split("(dynamically looked up)", 1)[0].strip()
+        before = re.sub(r"\[[^\]]*\]", "", before).strip()
+        toks = before.split()
+        if not toks:
+            other_dyn.append(line.strip())
+            continue
+        sym = toks[-1]
+        if sym.startswith("_"):
+            sym = sym[1:]
+        if "weak" in before and sym.startswith(("nvk_", "vk_", "wsi_")):
+            undef_weak.add(sym)
+        else:
+            other_dyn.append(line.strip())
 
-print(f"nitro-perf: found {len(undef_weak)} undefined weak vk/wsi/nvk flat-lookup symbols (other_dyn={len(other_dyn)})")
-if undef_weak:
-    pat = re.compile(r'(\.[A-Za-z0-9_]+\s*=\s*(?:\([^)]+\)\s*)?)([A-Za-z0-9_]+)(\s*,)')
-    patched_files = 0
-    patched_slots = 0
-    future = time.time() + 2.0
-    for root, _, files in os.walk(os.path.join(B, "src")):
-        for fn in files:
-            if not fn.endswith(("_entrypoints.c", "_entrypoints.cpp")):
-                continue
-            p = os.path.join(root, fn)
-            src = open(p, "r", encoding="utf-8", errors="replace").read()
-            cnt = 0
-            def repl(m):
-                nonlocal cnt
-                if m.group(2) in undef_weak:
-                    cnt += 1
-                    return m.group(1) + "NULL" + m.group(3)
-                return m.group(0)
-            new_src = pat.sub(repl, src)
-            if cnt:
-                open(p, "w", encoding="utf-8").write(new_src)
-                os.utime(p, (future, future))
-                patched_files += 1
-                patched_slots += cnt
-                print(f"  patched {cnt} weak NULL slots in {os.path.relpath(p, B)}")
-    print(f"nitro-perf: rewrote {patched_slots} weak entrypoint slots across {patched_files} file(s)")
+    print(f"nitro-perf: found {len(undef_weak)} undefined weak vk/wsi/nvk flat-lookup symbols (other_dyn={len(other_dyn)})")
+    if sample_dyn and not undef_weak:
+        print("nitro-perf: sample dynamically-looked-up lines:")
+        for s in sample_dyn:
+            print(" ", s)
+    if undef_weak:
+        pat = re.compile(r"(\.[A-Za-z0-9_]+\s*=\s*(?:\([^)]+\)\s*)?)([A-Za-z0-9_]+)(\s*,)")
+        patched_files = 0
+        patched_slots = 0
+        future = time.time() + 5.0
+        for root, _, files in os.walk(os.path.join(B, "src")):
+            for fn in sorted(files):
+                if not fn.endswith(("_entrypoints.c", "_entrypoints.cpp")):
+                    continue
+                p = os.path.join(root, fn)
+                src = open(p, "r", encoding="utf-8", errors="replace").read()
+                cnt = [0]
+                def repl(m, _cnt=cnt):
+                    if m.group(2) in undef_weak:
+                        _cnt[0] += 1
+                        return m.group(1) + "0" + m.group(3)
+                    return m.group(0)
+                new_src = pat.sub(repl, src)
+                if cnt[0]:
+                    open(p, "w", encoding="utf-8").write(new_src)
+                    os.utime(p, (future, future))
+                    patched_files += 1
+                    patched_slots += cnt[0]
+                    print(f"  patched {cnt[0]} weak NULL slots in {os.path.relpath(p, B)}")
+        print(f"nitro-perf: rewrote {patched_slots} weak entrypoint slots across {patched_files} file(s)")
+
+main()
 PYEOF
   ninja -C "$B" -j"$JOBS" src/nouveau/vulkan/libvulkan_nouveau.dylib >> "$OUT/build.log" 2>&1
   REM=$(nm -m "$D" | grep '(undefined)' | grep 'dynamically looked up' || true)
   if [ -z "$REM" ]; then
     python3 - "$B/build.ninja" <<'PYEOF'
 import re, sys
-p = sys.argv[1]
-lines = open(p, "r", encoding="utf-8").readlines()
-in_nvk = False
-changed = 0
-for idx, line in enumerate(lines):
-    if line.startswith("build src/nouveau/vulkan/libvulkan_nouveau.dylib:"):
-        in_nvk = True
-    elif in_nvk and line.lstrip().startswith("LINK_ARGS ="):
-        orig = line
-        line = re.sub(r'\s+(?:-Wl,-undefined,dynamic_lookup|-undefined\s+dynamic_lookup)', '', line)
-        if "-fixup_chains" not in line:
-            line = line.rstrip("\n") + " -Wl,-fixup_chains\n"
-        if line != orig:
-            lines[idx] = line
-            changed += 1
-        in_nvk = False
-    elif in_nvk and not line.startswith(" "):
-        in_nvk = False
-assert changed == 1, f"expected to update 1 LINK_ARGS line for libvulkan_nouveau.dylib, got {changed}"
-open(p, "w", encoding="utf-8").writelines(lines)
-print("nitro-perf: stripped dynamic_lookup and enabled -Wl,-fixup_chains for libvulkan_nouveau.dylib")
+
+def main():
+    p = sys.argv[1]
+    lines = open(p, "r", encoding="utf-8").readlines()
+    in_nvk = False
+    changed = 0
+    seen_link = []
+    dyn_pat = re.compile(
+        r"\s+(?:'?-Wl,-undefined,dynamic_lookup'?|'?-Wl,-undefined'?\s+'?-Wl,dynamic_lookup'?|'?-undefined'?\s+'?dynamic_lookup'?)"
+    )
+    for idx, line in enumerate(lines):
+        if line.startswith("build ") and ":" in line:
+            outs = line.split(":", 1)[0].split()
+            in_nvk = "src/nouveau/vulkan/libvulkan_nouveau.dylib" in outs
+        elif in_nvk and line.lstrip().startswith("LINK_ARGS ="):
+            seen_link.append(line.strip())
+            orig = line
+            line = dyn_pat.sub("", line)
+            if "-fixup_chains" not in line:
+                line = line.rstrip("\n") + " -Wl,-fixup_chains\n"
+            if line != orig:
+                lines[idx] = line
+                changed += 1
+            in_nvk = False
+        elif in_nvk and not line.startswith(" "):
+            in_nvk = False
+    if changed != 1:
+        print("nitro-perf: LINK_ARGS seen for libvulkan_nouveau.dylib:", seen_link, file=sys.stderr)
+        sys.exit(f"expected to update 1 LINK_ARGS line for libvulkan_nouveau.dylib, got {changed}")
+    open(p, "w", encoding="utf-8").writelines(lines)
+    print("nitro-perf: stripped dynamic_lookup and enabled -Wl,-fixup_chains for libvulkan_nouveau.dylib")
+
+main()
 PYEOF
     rm -f "$D"
     ninja -C "$B" -j"$JOBS" src/nouveau/vulkan/libvulkan_nouveau.dylib >> "$OUT/build.log" 2>&1
