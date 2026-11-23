@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 #include <pthread.h>
+#include <os/lock.h>
 #include <stdatomic.h>
 #include <time.h>
 #include "nvmtl_avail.h"
@@ -103,22 +104,35 @@ static int nvmtl_sample_payload_abi(id value) {
     return 1;
 }
 
-#define NVLOG_SITES    256
+#define NVLOG_SITES    512
 #define NVLOG_VERBATIM 8
 #define NVLOG_EVERY    4096
-static struct { const char *fmt; uint64_t n; } g_nvlog_sites[NVLOG_SITES];
-static pthread_mutex_t g_nvlog_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { const char *fmt; uint64_t n; int8_t rel_skip; } g_nvlog_sites[NVLOG_SITES];
+static os_unfair_lock g_nvlog_lock = OS_UNFAIR_LOCK_INIT;
 static int nvlog_dropped(const char *fmt, uint64_t *rep) {
     *rep = 0;
-    pthread_mutex_lock(&g_nvlog_lock);
-    int i = 0;
-    for (; i < NVLOG_SITES; i++) {
-        if (g_nvlog_sites[i].fmt == fmt) break;
-        if (!g_nvlog_sites[i].fmt) { g_nvlog_sites[i].fmt = fmt; break; }
+#if NVMTL_RELEASE
+    const int rel_quiet = !nvmtl_process_env_on();
+#else
+    const int rel_quiet = 0;
+#endif
+    uint32_t h = (uint32_t)(((uintptr_t)fmt >> 4) * 2654435761u) & (NVLOG_SITES - 1u);
+    os_unfair_lock_lock(&g_nvlog_lock);
+    int idx = -1;
+    for (uint32_t probe = 0; probe < NVLOG_SITES; probe++) {
+        uint32_t s = (h + probe) & (NVLOG_SITES - 1u);
+        if (g_nvlog_sites[s].fmt == fmt) { idx = (int)s; break; }
+        if (!g_nvlog_sites[s].fmt) {
+            g_nvlog_sites[s].fmt = fmt;
+            g_nvlog_sites[s].rel_skip = (int8_t)((!strstr(fmt, "%s") && !strstr(fmt, "-> %") && !nvmtl_log_failure(fmt)) ? 1 : 0);
+            idx = (int)s;
+            break;
+        }
     }
-    if (i == NVLOG_SITES) { pthread_mutex_unlock(&g_nvlog_lock); return 0; }
-    uint64_t n = ++g_nvlog_sites[i].n;
-    pthread_mutex_unlock(&g_nvlog_lock);
+    if (idx < 0) { os_unfair_lock_unlock(&g_nvlog_lock); return 0; }
+    if (rel_quiet && g_nvlog_sites[idx].rel_skip) { os_unfair_lock_unlock(&g_nvlog_lock); return 1; }
+    uint64_t n = ++g_nvlog_sites[idx].n;
+    os_unfair_lock_unlock(&g_nvlog_lock);
     if (n <= NVLOG_VERBATIM) return 0;
     if (n % NVLOG_EVERY == 0) { *rep = n; return 0; }
     return 1;
@@ -356,7 +370,9 @@ static bool nvmtl_skip_codec_in_ui(const char *me)
     char bid[256] = "";
     if (ident && CFStringGetCString(ident, bid, sizeof bid, kCFStringEncodingUTF8) && !strncmp(bid, "com.apple.", 10)) {
         const char *tail = bid + 10;
-        if (strstr(tail, "Settings") || strstr(tail, "Preference") || !strcmp(tail, "systempreferences")) return true;
+        if (strstr(tail, "Settings") || strstr(tail, "Preference") || !strcmp(tail, "systempreferences") ||
+            strstr(tail, "Widget") || strstr(tail, "IntentsExtension") || strstr(tail, "ThumbnailExtension") ||
+            strstr(tail, "iconservices") || strstr(tail, "QuickLook")) return true;
         static const char *const ui_ids[] = {
             "dock", "dock.extra", "dock.helper", "Spotlight", "SpotlightNetHelper",
             "Terminal", "ActivityMonitor", "finder", "WindowManager", "WallpaperAgent",
@@ -364,7 +380,8 @@ static bool nvmtl_skip_codec_in_ui(const char *me)
             "loginwindow", "CursorUIViewService", "CoreServicesUIAgent",
             "ViewBridgeAuxiliary", "systemuiserver", "TextInputMenuAgent",
             "AccessibilityVisualsAgent", "UniversalAccessAuthWarn", "screencaptureui",
-            "appkit.xpc.openAndSavePanelService",
+            "appkit.xpc.openAndSavePanelService", "OSDUIHelper", "talagent",
+            "universalaccessd", "UserEventAgent", "sharingd", "studentd",
             "SecurityPrivacyExtension", "PowerPreferences", NULL
         };
         for (int i = 0; ui_ids[i]; i++) if (!strcmp(tail, ui_ids[i])) return true;
@@ -1660,9 +1677,90 @@ static dispatch_queue_t nvmtl_ic_reap_queue(void)
     });
     return q;
 }
+// nitro-perf v5: Shared-VRAM surface alias VkImage/VkImageView park.
+// WindowServer wraps the same shared-VRAM IOSurfaces every 144 Hz frame. Parking the linear alias
+// VkImage/VkImageView on dealloc (exclusive ownership, keyed by vb.buf + vb.mem + geometry/format)
+// eliminates steady-state per-frame vkCreateImage/vkBindImageMemory/vkCreateImageView/vkDestroyImage churn.
+// Every parked alias is purged BEFORE its backing nvk_buffer is destroyed (nvmtl_ic_destroy_*).
+#define NVMTL_IC_IMG_PARK_SLOTS 128
+typedef struct {
+    void *vbuf, *vmem;
+    uint32_t key[7];   /* w, h, vkf, bpp, a8, wantStex, row */
+    nvk_image img;
+} nvmtl_ic_img_entry;
+static nvmtl_ic_img_entry g_ic_img_park[NVMTL_IC_IMG_PARK_SLOTS];
+static uint32_t g_ic_img_park_n;
+static os_unfair_lock g_ic_img_lock = OS_UNFAIR_LOCK_INIT;
+static int nvmtl_ic_img_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_NO_SURF_IMG_CACHE"); on = !(e && *e && *e != '0'); }
+    return on;
+}
+static int nvmtl_ic_img_take(void *vbuf, void *vmem, const uint32_t key[7], nvk_image *out)
+{
+    if (!nvmtl_ic_img_on() || !vbuf || !vmem) return -1;
+    int got = -1;
+    os_unfair_lock_lock(&g_ic_img_lock);
+    for (uint32_t i = g_ic_img_park_n; i-- > 0; ) {
+        nvmtl_ic_img_entry *p = &g_ic_img_park[i];
+        if (p->vbuf != vbuf || p->vmem != vmem || memcmp(p->key, key, sizeof p->key) != 0) continue;
+        *out = p->img;
+        out->hz_ut = 0;
+        if (i + 1 < g_ic_img_park_n) memmove(p, p + 1, (size_t)(g_ic_img_park_n - i - 1) * sizeof *p);
+        g_ic_img_park_n--;
+        got = 0;
+        break;
+    }
+    os_unfair_lock_unlock(&g_ic_img_lock);
+    if (got == 0) nvmtl_vk_image_recycled(out);
+    return got;
+}
+static void nvmtl_ic_img_purge(void *vbuf)
+{
+    nvk_image gone[NVMTL_IC_IMG_PARK_SLOTS];
+    uint32_t ng = 0;
+    os_unfair_lock_lock(&g_ic_img_lock);
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < g_ic_img_park_n; i++) {
+        if (!vbuf || g_ic_img_park[i].vbuf == vbuf) gone[ng++] = g_ic_img_park[i].img;
+        else g_ic_img_park[w++] = g_ic_img_park[i];
+    }
+    g_ic_img_park_n = w;
+    os_unfair_lock_unlock(&g_ic_img_lock);
+    for (uint32_t i = 0; i < ng; i++) nvmtl_vk_image_destroy(&gone[i]);
+}
+static void nvmtl_ic_img_try_park(const nvk_buffer *vb, nvk_image *img, const uint32_t key[7])
+{
+    if (!nvmtl_ic_img_on() || !vb || !vb->buf || !vb->mem || !img || !img->img) return;
+    // Only park if g_ic actively owns vb->buf (refs >= 1, not stale) so nvmtl_ic_destroy_* is guaranteed to purge it.
+    int owned = 0;
+    os_unfair_lock_lock(&g_ic_lock);
+    for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+        if (g_ic.s[i].id == (uintptr_t)vb->buf) { owned = !g_ic.s[i].stale && g_ic.s[i].refs > 0; break; }
+    }
+    os_unfair_lock_unlock(&g_ic_lock);
+    if (!owned) return;
+
+    nvmtl_vk_image_parked(img);
+    nvk_image ev; int evict = 0;
+    os_unfair_lock_lock(&g_ic_img_lock);
+    if (g_ic_img_park_n >= NVMTL_IC_IMG_PARK_SLOTS) {
+        ev = g_ic_img_park[0].img; evict = 1;
+        memmove(&g_ic_img_park[0], &g_ic_img_park[1], (NVMTL_IC_IMG_PARK_SLOTS - 1) * sizeof g_ic_img_park[0]);
+        g_ic_img_park_n--;
+    }
+    nvmtl_ic_img_entry *p = &g_ic_img_park[g_ic_img_park_n++];
+    p->vbuf = vb->buf; p->vmem = vb->mem;
+    memcpy(p->key, key, sizeof p->key);
+    p->img = *img;
+    os_unfair_lock_unlock(&g_ic_img_lock);
+    memset(img, 0, sizeof *img);
+    if (evict) nvmtl_vk_image_destroy(&ev);
+}
 static void nvmtl_ic_destroy_all(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
 {
-    for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_vk_buffer_destroy(&b); }
+    for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_ic_img_purge(b.buf); nvmtl_vk_buffer_destroy(&b); }
 }
 // Offload RM free ioctls for expired/evicted surface imports off WindowServer's compositor thread.
 static void nvmtl_ic_destroy_async(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
@@ -1672,7 +1770,7 @@ static void nvmtl_ic_destroy_async(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int 
     if (!bufs) { nvmtl_ic_destroy_all(gone, n); return; }
     for (int i = 0; i < n; i++) memcpy(&bufs[i], gone[i], sizeof bufs[i]);
     dispatch_async(nvmtl_ic_reap_queue(), ^{
-        for (int i = 0; i < n; i++) nvmtl_vk_buffer_destroy(&bufs[i]);
+        for (int i = 0; i < n; i++) { nvmtl_ic_img_purge(bufs[i].buf); nvmtl_vk_buffer_destroy(&bufs[i]); }
         free(bufs);
     });
 }
@@ -1693,6 +1791,7 @@ static void nvmtl_ic_expire_now(void)
 static void nvmtl_ic_flush_pressure(int critical)
 {
     if (!nvmtl_ic_on()) return;
+    nvmtl_ic_img_purge(NULL);
     unsigned char gone[32][NVMTL_IC_PAYLOAD];
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     const uint64_t idle = critical ? 0 : (nvmtl_ic_idle_ns() / 2);
@@ -1766,7 +1865,10 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
             if (!nvmtl_ic_get(surf, row * h, &vb)) {
-                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+                const uint32_t ikey[7] = { w, h, vkf, bpp, (uint32_t)(a8 != 0), (uint32_t)(stex != 0), (uint32_t)row };
+                if (!nvmtl_ic_img_take(vb.buf, vb.mem, ikey, &t->_i) ||
+                    !nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+                    memcpy(t->_pkey, ikey, sizeof ikey);
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
@@ -1815,13 +1917,17 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
 }
 
 static char nvmtl_surface_cache_key;
+static os_unfair_lock g_surf_priv_lock = OS_UNFAIR_LOCK_INIT;
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
-    @synchronized(self) {
-        NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
-        if (!cache) { cache = [NSMapTable strongToWeakObjectsMapTable];
-            objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-        return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
+    NSMapTable *cache = nil;
+    os_unfair_lock_lock(&g_surf_priv_lock);
+    cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+    if (!cache) {
+        cache = [NSMapTable strongToWeakObjectsMapTable];
+        objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    os_unfair_lock_unlock(&g_surf_priv_lock);
+    return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
 }
 - (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
     if (nvmtl_vk_init()) return nil;
@@ -1842,8 +1948,16 @@ static char nvmtl_surface_cache_key;
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = (surf && cache.count > 0) ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
-    NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+    NSArray *key = nil;
+    NVMTLTexture *backing = nil;
+    if (surf) {
+        os_unfair_lock_lock(&g_surf_priv_lock);
+        if (cache.count > 0) {
+            key = @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
+            backing = [cache objectForKey:key];
+        }
+        os_unfair_lock_unlock(&g_surf_priv_lock);
+    }
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
     // whether a wrapper reads it or writes it (the image is made writable).
@@ -1867,7 +1981,9 @@ static char nvmtl_surface_cache_key;
     nvmtl_texture_desc_swizzle(t, d);
     if (surf && !t->_vramOn) {
         if (!key) key = @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
+        os_unfair_lock_lock(&g_surf_priv_lock);
         [cache setObject:t forKey:key];
+        os_unfair_lock_unlock(&g_surf_priv_lock);
     }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
