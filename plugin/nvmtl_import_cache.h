@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define NVMTL_IC_SLOTS 128
+#define NVMTL_IC_SLOTS 256
 #define NVMTL_IC_PAYLOAD 160
 typedef struct {
     uint32_t sid; size_t need; uint64_t cookie;
@@ -21,6 +21,16 @@ typedef struct {
     int refs, stale; uint64_t idle_since;
 } nvmtl_ic_slot;
 typedef struct { nvmtl_ic_slot s[NVMTL_IC_SLOTS]; size_t total_bytes; } nvmtl_ic;
+
+/* Fast in-memory presence check so cache misses skip the IOSurfaceCopyValue IOKit trap completely. */
+static inline int nvmtl_ic_has_sid(const nvmtl_ic *c, uint32_t sid, size_t need)
+{
+    for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+        const nvmtl_ic_slot *e = &c->s[i];
+        if (e->id && e->sid == sid && e->need == need && !e->stale) return 1;
+    }
+    return 0;
+}
 
 /* A live, unexpired entry for this surface and size whose cookie matches: its refcount goes up and its payload is copied
    out (1). An entry whose cookie no longer matches belongs to a reused surface id: it is marked stale, so it is never

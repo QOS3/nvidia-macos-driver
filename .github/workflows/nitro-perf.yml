@@ -67,7 +67,7 @@ jobs:
           git archive HEAD plugin | tar x -C src
           grep -rqs supportsPlacementSparse "$(xcrun --show-sdk-path)/System/Library/Frameworks/Metal.framework/Headers" \
             || sed -i "" "s/, supportsPlacementSparse;/;/" src/plugin/NVMTLDevice.m
-          ( cd src/plugin && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 -DNVMTL_RELEASE=1 \
+          ( cd src/plugin && xcrun clang -arch x86_64 -march=x86-64-v3 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O2 -DNVMTL_RELEASE=1 \
               -Wno-protocol -Wno-incomplete-implementation -Werror=unguarded-availability-new \
               -I"$GITHUB_WORKSPACE/vkh/include" -o "$GITHUB_WORKSPACE/out/NVMTLDriver" \
               NVMTLDevice.m nvmtl_dlss.c dlss/elfhost.c dlss/lnxlibc.c \
@@ -99,7 +99,9 @@ jobs:
           cargo test --lib --manifest-path translator/translator/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate"
           cargo test --lib --manifest-path translator/wrapper/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target-xlate" -- --skip ca_named_checks:: --skip pixel_sampler_checks::
           CHOME="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTFLAGS="-C link-arg=-mmacosx-version-min=15.0 --remap-path-prefix=$GITHUB_WORKSPACE/translator=/src --remap-path-prefix=$GITHUB_WORKSPACE=/work --remap-path-prefix=$CHOME=/cargo --remap-path-prefix=$HOME=/build"
+          export CARGO_INCREMENTAL=0
+          export CARGO_PROFILE_RELEASE_LTO=thin
+          export RUSTFLAGS="-C target-cpu=x86-64-v3 -C link-arg=-mmacosx-version-min=15.0 --remap-path-prefix=$GITHUB_WORKSPACE/translator=/src --remap-path-prefix=$GITHUB_WORKSPACE=/work --remap-path-prefix=$CHOME=/cargo --remap-path-prefix=$HOME=/build"
           mkdir -p "$GITHUB_WORKSPACE/out"
           cargo build --release --target x86_64-apple-darwin \
             --manifest-path translator/wrapper/Cargo.toml \
@@ -164,6 +166,7 @@ jobs:
           export NVK_SYSROOT="$GITHUB_WORKSPACE/sysroot"
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK"
           export NVK_EXTRA_PATCHES="nvk-loq-ada-perf nvk-nitro-perf"
+          export NVK_CPU_ARCH="x86-64-v3"
           export NVK_JOBS=4
           if ! bash build/build_nvk.sh "$GITHUB_WORKSPACE/mesa" "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/out" 3.0; then
             for l in clc-native.setup.log clc-native.log setup.log build.log; do
@@ -299,7 +302,7 @@ jobs:
           done
           git archive HEAD vendor/nvenc | tar x -C src
           VER=$(git rev-parse --short HEAD)
-          ( cd src/vendor/nvenc && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -fvisibility=hidden -dynamiclib \
+          ( cd src/vendor/nvenc && xcrun clang -arch x86_64 -march=x86-64-v3 -mmacosx-version-min=15.0 -O2 -Wall -fvisibility=hidden -dynamiclib \
               -DNVENC_VERSION="\"$VER\"" \
               -o "$GITHUB_WORKSPACE/out/libnvencvt.dylib" vt/nvencvt.c vt/nvencvt_dec.c src/*.c \
               -I src -I "$GITHUB_WORKSPACE/hdr/webkit-spi" \

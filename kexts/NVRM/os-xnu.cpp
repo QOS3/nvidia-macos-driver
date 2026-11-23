@@ -358,7 +358,12 @@ static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOM
 void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 {
     IOOptionBits cache = (mode == NV_MEMORY_CACHED) ? kIOMapDefaultCache : (mode == NV_MEMORY_WRITECOMBINED ? kIOMapWriteCombineCache : kIOMapInhibitCache);
-    kprintf("NVRM-xnu: >os_map_kernel_space start=0x%llx size=0x%llx mode=%u\n", start, size, mode);
+    // nitro-perf: throttle success-path map traces after early bringup so hot BAR1 maps do not contend on kprintf locks.
+    static unsigned int mapLogN = 0;
+    const unsigned int mapSeq = __atomic_add_fetch(&mapLogN, 1u, __ATOMIC_RELAXED);
+    const bool logMap = (mapSeq <= 32u) || ((mapSeq & 511u) == 0u);
+    if (logMap)
+        kprintf("NVRM-xnu: >os_map_kernel_space #%u start=0x%llx size=0x%llx mode=%u\n", mapSeq, start, size, mode);
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
         if (ava) {
@@ -385,8 +390,9 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
         if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
         const unsigned high = nv_xnu_maps_high;
         IOLockUnlock(nv_xnu_maps_lock);
-        kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
-                (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
+        if (logMap)
+            kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
+                    (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
         return va;
     }
     IOLockUnlock(nv_xnu_maps_lock);

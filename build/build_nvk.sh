@@ -117,12 +117,18 @@ EOT
 # The build directory sits inside the source tree: Rust and some C debug paths are recorded relative to it
 # ("../src/..."), so a build directory elsewhere gives a different binary (and LC_UUID).
 B=$S/build
+C_ARCH_ARG=""
+RUST_ARCH_ARG=""
+if [ -n "${NVK_CPU_ARCH:-}" ]; then
+  C_ARCH_ARG=" -march=$NVK_CPU_ARCH"
+  RUST_ARCH_ARG=" -Ctarget-cpu=$NVK_CPU_ARCH"
+fi
 meson setup "$B" "$S" --cross-file="$X" -Dbuildtype=release -Db_ndebug=true -Dvulkan-drivers=nouveau -Dgallium-drivers= -Dplatforms=macos \
   -Degl=disabled -Dglx=disabled -Dglvnd=disabled -Dllvm=disabled -Dmesa-clc=system -Dshared-glapi=disabled \
   -Dvulkan-layers= -Dtools= -Dbuild-tests=false -Dexpat=disabled -Dzstd=disabled -Dlibunwind=disabled \
   -Dlmsensors=disabled -Dvalgrind=disabled -Dxlib-lease=disabled -Dgallium-rusticl=false -Dspirv-tools=disabled \
-  "-Dc_args=-ffile-prefix-map=$S=/src -ffile-prefix-map=$HOME=/build" "-Dcpp_args=-ffile-prefix-map=$S=/src -ffile-prefix-map=$HOME=/build" \
-  "-Drust_args=--remap-path-prefix=$S=/src --remap-path-prefix=$HOME=/build" \
+  "-Dc_args=-ffile-prefix-map=$S=/src -ffile-prefix-map=$HOME=/build$C_ARCH_ARG" "-Dcpp_args=-ffile-prefix-map=$S=/src -ffile-prefix-map=$HOME=/build$C_ARCH_ARG" \
+  "-Drust_args=--remap-path-prefix=$S=/src --remap-path-prefix=$HOME=/build$RUST_ARCH_ARG" \
   "-Dc_link_args=-Wl,-oso_prefix,$B -Wl,-no_warn_duplicate_libraries" "-Dcpp_link_args=-Wl,-oso_prefix,$B -Wl,-no_warn_duplicate_libraries" > "$OUT/setup.log" 2>&1
 ninja -C "$B" -j"$JOBS" src/nouveau/vulkan/libvulkan_nouveau.dylib > "$OUT/build.log" 2>&1
 # Warnings may only go down: the committed count in nvk/WARNINGS is the ceiling (2.9 brought it to 0).

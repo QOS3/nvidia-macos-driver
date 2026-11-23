@@ -12,7 +12,9 @@ int main(void)
 {
     nvmtl_ic *c = calloc(1, sizeof *c); H h = { (void *)0x1000, 7 }, out; unsigned char gone[NVMTL_IC_PAYLOAD], ev[NVMTL_IC_PAYLOAD]; uintptr_t evid;
     ARM("a second wrapper of the same surface reuses the import instead of making one",
+        nvmtl_ic_has_sid(c, 42, 4096) == 0 &&
         nvmtl_ic_insert(c, 42, 4096, 111, (uintptr_t)h.buf, &h, sizeof h, ev, &evid) == 1 &&
+        nvmtl_ic_has_sid(c, 42, 4096) == 1 &&
         nvmtl_ic_acquire(c, 42, 4096, 111, &out, sizeof out) == 1 && out.buf == h.buf && out.tag == 7);
     ARM("the import stays after the last wrapper goes, so the next frame's wrapper finds it",
         nvmtl_ic_release(c, (uintptr_t)h.buf, 1000, gone) == 1 && nvmtl_ic_release(c, (uintptr_t)h.buf, 2000, gone) == 1 &&
