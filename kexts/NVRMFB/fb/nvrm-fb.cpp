@@ -4771,6 +4771,77 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_interval, CTLFLAG_RW | CTLFLAG_LOCKED, 
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipUsSum, "microseconds spent in pure-flip applyModeSetConfig");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_n, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipN, "pure flips timed");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_max, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipUsMax, "the slowest pure flip, us");
+// nitro-perf v2: lock-free 256-frame micro-stutter profiler (zero sort/alloc on the flip hot path; p50/p95/p99/max
+// computed on demand when debug.nvrmfb_frame_stats is read). Active inter-frame gaps >100 ms are treated as desktop idle.
+enum { kFrameRingN = 256 };
+static volatile uint32_t gFrameDtRing[kFrameRingN];
+static volatile uint32_t gFlipUsRing[kFrameRingN];
+static volatile SInt32 gFrameRingIdx = 0;
+static volatile uint64_t gFrameLastAbs = 0;
+static SInt64 gFrameJank8ms = 0, gFrameJank14ms = 0;
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_jank_8ms, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFrameJank8ms, "active frames with >8.5 ms inter-flip interval (144 Hz drop)");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_jank_14ms, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFrameJank14ms, "active frames with >14 ms inter-flip interval (>2x 144 Hz)");
+static inline void nvrmfbRecordFrameSample(uint64_t nowAbs, uint32_t flipUs)
+{
+    const uint64_t prev = gFrameLastAbs;
+    gFrameLastAbs = nowAbs;
+    uint32_t dtUs = 0;
+    if (prev && nowAbs > prev) {
+        uint64_t ns = 0; absolutetime_to_nanoseconds(nowAbs - prev, &ns);
+        const uint64_t us = ns / 1000ull;
+        if (us >= 500ull && us <= 100000ull) {
+            dtUs = (uint32_t)us;
+            if (dtUs > 8500u) OSAddAtomic64(1, &gFrameJank8ms);
+            if (dtUs > 14000u) OSAddAtomic64(1, &gFrameJank14ms);
+        }
+    }
+    const uint32_t slot = ((uint32_t)OSIncrementAtomic(&gFrameRingIdx)) & (kFrameRingN - 1u);
+    gFrameDtRing[slot] = dtUs;
+    gFlipUsRing[slot] = flipUs;
+}
+static void nvrmfbSortU32(uint32_t *a, uint32_t n)
+{
+    for (uint32_t i = 1; i < n; i++) {
+        const uint32_t v = a[i];
+        uint32_t j = i;
+        while (j > 0 && a[j - 1] > v) { a[j] = a[j - 1]; j--; }
+        a[j] = v;
+    }
+}
+static int nvrmfbFrameStatsSysctl SYSCTL_HANDLER_ARGS
+{
+    (void)oidp; (void)arg1; (void)arg2;
+    uint32_t *tmp = (uint32_t *)IOMalloc(kFrameRingN * 2 * sizeof(uint32_t));
+    if (!tmp) return ENOMEM;
+    uint32_t *dt = tmp, *fl = tmp + kFrameRingN;
+    uint32_t ndt = 0, nfl = 0;
+    const uint32_t seen = (uint32_t)gFrameRingIdx;
+    const uint32_t lim = seen < kFrameRingN ? seen : kFrameRingN;
+    for (uint32_t i = 0; i < lim; i++) {
+        const uint32_t d = gFrameDtRing[i];
+        if (d) dt[ndt++] = d;
+        const uint32_t f = gFlipUsRing[i];
+        if (f) fl[nfl++] = f;
+    }
+    nvrmfbSortU32(dt, ndt);
+    nvrmfbSortU32(fl, nfl);
+    auto pct = [](const uint32_t *a, uint32_t n, uint32_t p) -> uint32_t {
+        if (!n) return 0;
+        uint32_t idx = (uint32_t)(((uint64_t)(n - 1) * p) / 100ull);
+        return a[idx < n ? idx : n - 1];
+    };
+    char buf[224];
+    int len = snprintf(buf, sizeof buf,
+                       "dt_us p50=%u p95=%u p99=%u max=%u | flip_us p50=%u p95=%u p99=%u max=%u | jank8=%lld jank14=%lld n=%u",
+                       pct(dt, ndt, 50), pct(dt, ndt, 95), pct(dt, ndt, 99), ndt ? dt[ndt - 1] : 0u,
+                       pct(fl, nfl, 50), pct(fl, nfl, 95), pct(fl, nfl, 99), nfl ? fl[nfl - 1] : 0u,
+                       (long long)gFrameJank8ms, (long long)gFrameJank14ms, ndt);
+    IOFree(tmp, kFrameRingN * 2 * sizeof(uint32_t));
+    if (len < 0) len = 0;
+    if ((size_t)len >= sizeof buf) len = (int)sizeof buf - 1;
+    return SYSCTL_OUT(req, buf, (size_t)len + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_frame_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nvrmfbFrameStatsSysctl, "A", "144 Hz frame pacing p50/p95/p99/max and jank counts");
 static bool gFbSysctl = false;
 void nvrmfbColorChanged(bool needsModeset);
 static int nvrmfbColorSysctl SYSCTL_HANDLER_ARGS
@@ -4804,6 +4875,8 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_jank_8ms); sysctl_register_oid(&sysctl__debug_nvrmfb_jank_14ms);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_frame_stats);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_lean);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
@@ -5284,8 +5357,9 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     const uint64_t ft0 = mach_absolute_time();
     NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, true);
-    if (pure) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
-        OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us; }
+    if (pure) { const uint64_t ft1 = mach_absolute_time(); const SInt64 us = (SInt64)((ft1 - ft0) / 1000);
+        OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us;
+        nvrmfbRecordFrameSample(ft1, us > 0 ? (uint32_t)us : 1u); }
     // IN_PROGRESS on a refusal is the previous flip still on its way (submitConfig's late path, or NVKMS's own answer
     // to a flip over an outstanding one): the caller keeps its frame and presents the next.
     int rc = ok ? (int)rep->flipResult : rep->flipResult == NV_KMS_FLIP_RESULT_IN_PROGRESS ? (int)NV_KMS_FLIP_RESULT_IN_PROGRESS : -1;
