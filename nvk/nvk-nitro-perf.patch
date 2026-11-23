@@ -1,0 +1,30 @@
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	2026-11-23 04:20:19
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	2026-11-23 04:20:19
+@@ -223,15 +223,24 @@
+ nvkmd_nvrm_wait_block(int64_t waited_ns, unsigned n, const uint32_t *slot, const uint32_t *gen, const uint64_t *want)
+ {
+    static int on = -1;
++   static int64_t spin_ns = 20000;
+    /*: the event sleep is WindowServer's (b73: polling was 35% of its active CPU). An app waiting on its own work
+     * polls: GB7 with NVRM_EVENT_WAIT=0 = 92,487 vs 90,840 sleeping (Video +4%, Photo +3.7%, Horizon +2.5%) - a wake that
+-    * arrives late, or a 2 ms timeout, is GPU idle time the app pays. NVRM_EVENT_WAIT=0/1 still forces either. */
++    * arrives late, or a 2 ms timeout, is GPU idle time the app pays. NVRM_EVENT_WAIT=0/1 still forces either.
++    * nitro-perf: adaptive spin-before-sleep (NVRM_EVENT_WAIT_SPIN_US, default 20 us WindowServer / 80 us apps) lets
++    * short GPU bursts complete with zero wakeup latency while longer waits sleep on the RM event at ~0% CPU. */
+    if (on < 0) {
+       const char *e = nvmtl_cfg_getenv("NVRM_EVENT_WAIT");
++      const char *pn = getprogname();
++      const bool is_ws = pn && !strcmp(pn, "WindowServer");
+       if (e && e[0]) on = e[0] != '0';
+-      else { const char *pn = getprogname(); on = pn && !strcmp(pn, "WindowServer"); }
++      else on = is_ws;
++      const char *sp = nvmtl_cfg_getenv("NVRM_EVENT_WAIT_SPIN_US");
++      int64_t us = is_ws ? 20 : 80;
++      if (sp && sp[0]) { long v = strtol(sp, NULL, 10); if (v >= 0 && v <= 500) us = (int64_t)v; }
++      spin_ns = us * 1000;
+    }
+-   if (on == 0 || waited_ns < 20000 || n == 0) {
++   if (on == 0 || waited_ns < spin_ns || n == 0) {
+       nvkmd_nvrm_wait_backoff(waited_ns);
+       return;
+    }
