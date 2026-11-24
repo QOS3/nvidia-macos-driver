@@ -2667,7 +2667,7 @@ static IOBufferMemoryDescriptor *nvrmSurfMetaDescriptor(void)
     if (cand->prepare() != kIOReturnSuccess) { cand->release(); return nullptr; }
     nvrm_surf_meta_page *pg = (nvrm_surf_meta_page *)cand->getBytesNoCopy();
     if (!pg) { cand->complete(); cand->release(); return nullptr; }
-    nvu_zero(pg, NVRM_SURF_META_BYTES);
+    nvu_memset(pg, 0, NVRM_SURF_META_BYTES);
     pg->hdr.magic = NVRM_SURF_META_MAGIC;
     pg->hdr.version = NVRM_SURF_META_VERSION;
     pg->hdr.buckets = NVRM_SURF_META_BUCKETS;

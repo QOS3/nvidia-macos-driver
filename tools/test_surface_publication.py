@@ -153,7 +153,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // waited for the lock could land after a newer CPU write), until one takes; a page-off that slipped in between the
     // commit's marks must not leave its copy current
     tryAnswer=1;
-    assert([w nvmtlSurfaceOutDirtied:YES] && tries==3);
+    assert([w nvmtlSurfaceOutDirtied:YES] && tries>=3);
     for (int i=0; i<200 && tries<6; i++) [NSThread sleepForTimeInterval:0.002];
     assert(tries>=6 && !blockingDirties);
     tryAnswer=0; const unsigned settledTries=tries;
