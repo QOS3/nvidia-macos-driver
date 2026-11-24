@@ -7,6 +7,7 @@
 #include "nv-xnu.h"
 
 extern "C" void nv_xnu_power_state(bool *acPlugged, bool *haveBattery);   // nv_xnu_power.cpp
+extern "C" bool nv_xnu_chat(void);   // os-xnu2.cpp
 #include <sys/kauth.h>
 #include <mach/mach_time.h>
 #include <mach/semaphore.h>
@@ -37,13 +38,11 @@ NV_STATUS NV_API_CALL os_alloc_mem(void **address, NvU64 size)
     return NV_OK;
 }
 void  NV_API_CALL os_free_mem(void *address) { NV_XNU_TRC; if (address) kern_os_free(address); }
-void *NV_API_CALL os_mem_copy(void *dst, const void *src, NvU32 length) { static unsigned long n = 0; if (++n <= 4 || (n % 1000000) == 0) kprintf("NVRM-xnu: >os_mem_copy #%lu len=%u\n", n, length); nvx_memcpy(dst, src, length); return dst; }
+void *NV_API_CALL os_mem_copy(void *dst, const void *src, NvU32 length) { nvx_memcpy(dst, src, length); return dst; }
 NV_STATUS NV_API_CALL os_memcpy_from_user(void *dst, const void *src, NvU32 length) { NV_XNU_TRC; return copyin((user_addr_t)(uintptr_t)src, dst, length) ? NV_ERR_INVALID_ADDRESS : NV_OK; }
 NV_STATUS NV_API_CALL os_memcpy_to_user(void *dst, const void *src, NvU32 length) { NV_XNU_TRC; return copyout(src, (user_addr_t)(uintptr_t)dst, length) ? NV_ERR_INVALID_ADDRESS : NV_OK; }
 void *NV_API_CALL os_mem_set(void *dst, NvU8 c, NvU32 length)
 {
-    static unsigned long n = 0; n++;
-    if (n <= 4 || (n % 1000000) == 0) kprintf("NVRM-xnu: >os_mem_set #%lu len=%u\n", n, length);
     nvx_memset(dst, c, length);
     return dst;
 }
@@ -358,12 +357,7 @@ static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOM
 void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 {
     IOOptionBits cache = (mode == NV_MEMORY_CACHED) ? kIOMapDefaultCache : (mode == NV_MEMORY_WRITECOMBINED ? kIOMapWriteCombineCache : kIOMapInhibitCache);
-    // nitro-perf: throttle success-path map traces after early bringup so hot BAR1 maps do not contend on kprintf locks.
-    static unsigned int mapLogN = 0;
-    const unsigned int mapSeq = __atomic_add_fetch(&mapLogN, 1u, __ATOMIC_RELAXED);
-    const bool logMap = (mapSeq <= 32u) || ((mapSeq & 511u) == 0u);
-    if (logMap)
-        kprintf("NVRM-xnu: >os_map_kernel_space #%u start=0x%llx size=0x%llx mode=%u\n", mapSeq, start, size, mode);
+    if (nv_xnu_chat()) kprintf("NVRM-xnu: >os_map_kernel_space start=0x%llx size=0x%llx mode=%u\n", start, size, mode);
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
         if (ava) {
@@ -390,9 +384,8 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
         if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
         const unsigned high = nv_xnu_maps_high;
         IOLockUnlock(nv_xnu_maps_lock);
-        if (logMap)
-            kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
-                    (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
+        if (nv_xnu_chat()) kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
+                (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
         return va;
     }
     IOLockUnlock(nv_xnu_maps_lock);

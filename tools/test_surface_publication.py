@@ -70,6 +70,18 @@ static void nvmtl_vk_host_pages_key(uint32_t surface, uint64_t cookie) { (void)s
 static int busyForeign=0, busyWaits=0;
 static int nvmtl_busy_foreign(IOSurfaceRef s, NSUInteger p) { (void)s; (void)p; return busyForeign; }
 static void nvmtl_busy_wait(IOSurfaceRef s, NSUInteger p) { (void)s; (void)p; busyWaits++; }
+static void nvmtl_ic_note_vram_seed(void *vbuf, uint32_t seed) { (void)vbuf; (void)seed; }
+static os_unfair_lock g_surf_sync_lock = OS_UNFAIR_LOCK_INIT;
+static NSMapTable *g_surf_sync_monitors;
+static id nvmtl_surface_sync_for(IOSurfaceRef surf, NSUInteger plane) {
+    NSNumber *key = @(((unsigned long long)(uintptr_t)surf << 8) | ((unsigned long long)plane & 0xff));
+    os_unfair_lock_lock(&g_surf_sync_lock);
+    if (!g_surf_sync_monitors) g_surf_sync_monitors = [NSMapTable strongToWeakObjectsMapTable];
+    id monitor = [g_surf_sync_monitors objectForKey:key];
+    if (!monitor) { monitor = [NSObject new]; [g_surf_sync_monitors setObject:monitor forKey:key]; }
+    os_unfair_lock_unlock(&g_surf_sync_lock);
+    return monitor;
+}
 static void nvmtl_frame_dump(const char *tag, void *base, size_t row, unsigned w, unsigned h) {}
 #define nvlog(...) ((void)0)
 // helpers the capture path calls (NVMTLEventSync.m); WindowServer kernel marks are off here
@@ -84,14 +96,17 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
     assert(!dispatch_semaphore_wait(release_read,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)));
     memcpy(base,i->gpu,4); return 0;
 }
+typedef struct { void *buf; } nvk_buffer;
 @interface NVMTLTexture : NSObject {
-@public NVMTLTexture *_parent; IOSurfaceRef _surf; BOOL _vramOn, _surfSynced, _clientWritten; void *_hostPages;
-    uint32_t _surfSeed, _surfGen; NSUInteger _plane; Image _i; void *_q;
+@public NVMTLTexture *_parent; IOSurfaceRef _surf; BOOL _vramOn, _surfSynced, _clientWritten, _busyDoneAtWrap; void *_hostPages;
+    uint32_t _surfSeed, _surfGen; uint64_t _busyCheckedCb; NSUInteger _plane; Image _i; nvk_buffer _vramBuf; id _surfSync; void *_q;
     IOSurfaceRef _y422Surf;   // NULL: not a 4:2:2 texture
 }
 - (void)nvmtlY422SurfaceIn;
 - (BOOL)nvmtlSurfaceCopyable;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInForCbSeq:(uint64_t)cbSeq;
+- (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end
@@ -159,6 +174,17 @@ int main(int argc, char **argv) { @autoreleasepool {
     cs.seed++; busyForeign=1; [c nvmtlSurfaceIn];
     assert(busyWaits==1 && c->_clientWritten);
     busyForeign=0; cs.seed++; [c nvmtlSurfaceIn];
+    assert(busyWaits==2);
+    // reused shared-VRAM surface whose seed has not moved yet while a foreign GPU write is in flight must still wait
+    Surface vs={.seed=7}; NVMTLTexture *v=[NVMTLTexture new]; v->_surf=&vs; v->_vramOn=YES; v->_surfSynced=YES; v->_surfSeed=7; v->_i=(Image){.w=1,.h=1,.bpp=4};
+    busyWaits=0; busyForeign=1; [v nvmtlSurfaceIn];
+    assert(busyWaits==1 && v->_clientWritten);
+    busyWaits=0; [v nvmtlSurfaceInSkipBusy:YES];
+    assert(busyWaits==0);
+    // per-command-buffer deduplication via nvmtlSurfaceInForCbSeq: waits once per cbSeq, re-waits on next cbSeq
+    busyWaits=0; [v nvmtlSurfaceInForCbSeq:42]; [v nvmtlSurfaceInForCbSeq:42];
+    assert(busyWaits==1);
+    [v nvmtlSurfaceInForCbSeq:43];
     assert(busyWaits==2);
     puts("PASS: overlapping publication preserves GPU pixels; later CPU edits import; a publication after the commit's "
          "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; another process's "

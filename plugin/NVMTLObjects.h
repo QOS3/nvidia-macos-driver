@@ -66,6 +66,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void *)nvsampleview;
 - (void)nvmtlSurfaceIn;
 - (void)nvmtlSurfaceInForCbSeq:(uint64_t)cbSeq;
+- (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end

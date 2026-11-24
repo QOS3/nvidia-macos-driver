@@ -21,6 +21,8 @@
 #include <notify.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 #include <pthread.h>
@@ -536,6 +538,19 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         if (!nvmtl_nvencvt_selected(getenv("NVMTL_NVENCVT"), me, haveGen ? gen : NULL)) return;
         if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
         if (nvmtl_skip_codec_in_ui(me)) return;
+        bool decOnly = decodersOnly;
+        if (!decOnly && getenv("NVMTL_NO_NVENC")) {
+            decOnly = true;
+            nvlog("nvencvt: NVMTL_NO_NVENC set - registering decoders only in %s (keeping HW decode)", me);
+        }
+        if (decOnly && getenv("NVMTL_NO_NVDEC")) {
+            nvlog("nvencvt: NVMTL_NO_NVDEC set - not registering decoders in %s", me);
+            return;
+        }
+        if (decOnly && nvmtl_decode_is_delegated(me)) {
+            nvlog("nvencvt: %s is a sandboxed Apple process - not registering in-process decoders (delegates to VTDecoderXPCService)", me);
+            return;
+        }
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
@@ -548,14 +563,14 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvencvt: dlopen %s FAILED: %s", path, dlerror()); return; }
         typedef int32_t (*RegFn)(int);
-        const char *entry = decodersOnly ? "NVEncVT_RegisterDecoders" : "NVEncVT_Register";
+        const char *entry = decOnly ? "NVEncVT_RegisterDecoders" : "NVEncVT_Register";
         RegFn r = (RegFn)dlsym(h, entry);
         if (!r) { nvlog("nvencvt: %s has no %s", path, entry); return; }
         int rating = 1100;                           // above our own 1000, so the opt-in one wins where it is asked for
         const char *rv = getenv("NVMTL_NVENCVT_RATING");
         if (rv) { int v = atoi(rv); if (v > 0) rating = v; }
         int32_t st = r(rating);
-        nvlog("nvencvt: %s %s in %s (%s -> %d, rating %d, %s)", decodersOnly ? "decoders" : "codecs",
+        nvlog("nvencvt: %s %s in %s (%s -> %d, rating %d, %s)", decOnly ? "decoders" : "codecs",
               st ? "NOT registered" : "REGISTERED", me, entry, (int)st, rating, path);
     });
 }
@@ -1521,7 +1536,8 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
 
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
-static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
+static _Atomic unsigned long long g_surf_vram, g_surf_private;
+static unsigned long long g_surfin_skip, g_surfin_copy;
 static const CFStringRef kNvmtlVramTagKeys[4] = {
     CFSTR("NVMTLVramAt:p0"), CFSTR("NVMTLVramAt:p1"), CFSTR("NVMTLVramAt:p2"), CFSTR("NVMTLVramAt:p3")
 };
@@ -1567,9 +1583,23 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 }
 typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t pad; } nvmtl_busy_tag;
 #define NVMTL_BUSY_MAGIC 0x4255535au
-#define NVMTL_BUSY_WAIT_NS  (35ull * 1000 * 1000)
+#define NVMTL_BUSY_WAIT_NS  (12ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
+static uint64_t nvmtl_busy_wait_limit_ns(void)
+{
+    static uint64_t lim; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        uint64_t ms = 12;
+        const char *e = getenv("NVMTL_BUSY_WAIT_MS");
+        if (e && *e) {
+            unsigned long long v = strtoull(e, NULL, 10);
+            if (v >= 1 && v <= 100) ms = (uint64_t)v;
+        }
+        lim = ms * 1000000ull;
+    });
+    return lim;
+}
 static pid_t nvmtl_my_pid(void) {
     static pid_t p; static dispatch_once_t o;
     dispatch_once(&o, ^{ p = getpid(); });
@@ -1621,16 +1651,20 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
     if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == me) return;
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
+    const uint64_t wait_limit = nvmtl_busy_wait_limit_ns();
+    unsigned polls = 0;
     for (;;) {
         const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        if (now - t0 < 50000ull) {
+        if (now - t0 < 25000ull) {
             for (int spin = 0; spin < 32; spin++) __asm__ __volatile__("pause" ::: "memory");
         } else {
             usleep(NVMTL_BUSY_POLL_US);
+            polls++;
         }
         if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == me) return;
+        if (polls && (polls & 7u) == 0 && t.pid > 0 && kill(t.pid, 0) != 0 && errno == ESRCH) return;
         const uint64_t now2 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        if (now2 - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now2 && now2 - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
+        if (now2 - t0 > wait_limit || (t.stamp_ns <= now2 && now2 - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
     }
 }
 // Shared family-VRAM imports (nvmtl_import_cache.h). OFF unless NVMTL_SURF_IMPORT_CACHE=1: it is proven by
@@ -1922,23 +1956,25 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                 if (!nvmtl_ic_img_take(vb.buf, vb.mem, ikey, &t->_i) ||
                     !nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
                     memcpy(t->_pkey, ikey, sizeof ikey);
-                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
+                    t->_vramBuf = vb; t->_vramOn = YES;
+                    const unsigned long long nv = atomic_fetch_add_explicit(&g_surf_vram, 1, memory_order_relaxed) + 1;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = (has_cseed && cseed == seed) ? 1 : nvmtl_vram_tag_current(surf, 0, seed);
                     if (current) {
                         t->_surfSeed = seed; t->_surfSynced = YES;
                         if (!has_cseed || cseed != seed) nvmtl_ic_note_vram_seed(vb.buf, seed);
                     }
-                    static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                    static _Atomic unsigned n; const unsigned k = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+                    if (k < 8 || k % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
-                              w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
+                              w, h, row, current ? ", already current (no upload)" : "", nv, atomic_load_explicit(&g_surf_private, memory_order_relaxed));
                     return 0;
                 }
                 if (!nvmtl_ic_put(&vb)) nvmtl_vk_buffer_destroy(&vb);
             }
         }
     }
-    g_surf_private++;
+    atomic_fetch_add_explicit(&g_surf_private, 1, memory_order_relaxed);
     // A private image stands for the whole surface: wrappers that read it and wrappers that write it must share ONE image
     // (nvmtlNewSurfaceTexture caches it), or what one writes the other never sees. So it is made writable whenever the
     // format can be, whatever the first wrapper asked for.
@@ -2050,6 +2086,8 @@ static inline uint64_t nvmtl_sid_bloom_bit(uint32_t sid) {
         if (nvmtl_busy_probe(surf, plane, &busyDone)) {
             t->_clientWritten = YES;
             t->_busyDoneAtWrap = (busyDone != 0);
+        } else {
+            t->_busyDoneAtWrap = YES;
         }
         t->_surfSync = nvmtl_surface_sync_for(surf, plane);
     }
@@ -2060,6 +2098,7 @@ static inline uint64_t nvmtl_sid_bloom_bit(uint32_t sid) {
     nvmtl_texture_desc_swizzle(t, d);
     if (surf && !t->_vramOn) {
         if (!key) key = @[@(sid), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
+        NVMTLTexture *won = nil;
         os_unfair_lock_lock(&g_surf_priv_lock);
         if (!cache) {
             cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
@@ -2068,9 +2107,19 @@ static inline uint64_t nvmtl_sid_bloom_bit(uint32_t sid) {
                 objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
         }
-        [cache setObject:t forKey:key];
+        NVMTLTexture *existing = [cache objectForKey:key];
+        if (existing && !existing->_vramOn) won = existing;
+        else [cache setObject:t forKey:key];
         atomic_fetch_or_explicit(&g_surf_priv_bloom, nvmtl_sid_bloom_bit(sid), memory_order_release);
         os_unfair_lock_unlock(&g_surf_priv_lock);
+        if (won) {
+            NVMTLTexture *alias = (NVMTLTexture *)[won newTextureViewWithPixelFormat:d.pixelFormat];
+            if (alias) {
+                alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+                nvmtl_texture_desc_swizzle(alias, d);
+                return alias;
+            }
+        }
     }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);

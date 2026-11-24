@@ -65,6 +65,13 @@ public:
     NVRMDisplayGate() : lock(startLock()) { if (lock) IORecursiveLockLock(lock); }
     ~NVRMDisplayGate() { if (lock) IORecursiveLockUnlock(lock); }
     bool valid() const { return lock != nullptr; }
+    void release() { if (lock) { IORecursiveLockUnlock(lock); lock = nullptr; } }
+};
+class NVRMHeadFlipGuard {
+    IORecursiveLock *lock;
+public:
+    explicit NVRMHeadFlipGuard(IORecursiveLock *l) : lock(l) { if (lock) IORecursiveLockLock(lock); }
+    ~NVRMHeadFlipGuard() { if (lock) IORecursiveLockUnlock(lock); }
 };
 // The display gate with a deadline, for entry points a WindowServer thread sits in (mode changes). The recursive lock is shared by
 // every framebuffer and held across slow work (start-up enumeration, hot-plug relights, flip waits); an unbounded wait here
@@ -280,6 +287,12 @@ public:
     bool doUpdate() override { return true; }
     void free() override;
     int restoreExternal(SInt32 level);
+    void reapplyAfterWake() {
+        SInt32 target = OSAddAtomic(0, &fUserLevel);
+        if (target < 0) return;
+        fPending = target;
+        if (fApply) thread_call_enter(fApply);
+    }
 };
 OSDefineMetaClassAndStructors(NVRMBacklightHandler, IODisplayParameterHandler)
 // The internal panel's handler, for debug.nvrmfb_backlight_restore. Set by publishBacklight once the handler is
@@ -748,6 +761,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
                          unsigned w, h, pitch; UInt64 epoch, cookie; struct NvKmsKapiMemory *pin; };
     NVFlipEntry fFlipCache[16] = {};
     IOSimpleLock *fFlipCacheLock = nullptr;
+    IORecursiveLock *fHeadFlipLock = nullptr;
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
     static inline volatile SInt32 sFlipLatched[8] = {};
@@ -787,6 +801,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fPowerOn = true;                 // this framebuffer's own power state (display sleep / system sleep)
     bool fSysSlept = false;               // NVRM put the GPU in standby since this framebuffer last powered on
     uint8_t fWakeRetries = 0;
+    volatile SInt32 fGpuLost = 0;         // NVRM reported GPU lost on wake (NVRMGpuPower(2))
 
     thread_call_t fGpuWake = nullptr;
     static void gpuWakeFire(thread_call_param_t p0, thread_call_param_t);
@@ -1984,6 +1999,10 @@ void NVRMNVDAFramebuffer::surroundCheck()
         master->notifyConnectionChanged(500);
     }
 }
+// Post-resume hot-plug disconnect grace window: during the first 2.5 s after NVRM resumes the GPU, eDP/HDMI links may
+// still be retraining. Transient disconnects during this window are deferred and re-checked once after the grace expires
+// so a sleeping/retraining panel is not torn down (losing AppleBacklightDisplay or resetting external refresh rate).
+static volatile uint64_t gGpuResumeGraceUntil = 0;
 void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = gFB;
@@ -1995,6 +2014,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
     if (!dd) return;
     int added = 0;
+    const uint64_t graceUntil = __atomic_load_n(&gGpuResumeGraceUntil, __ATOMIC_ACQUIRE);
+    const bool inResumeGrace = graceUntil && mach_absolute_time() < graceUntil;
+    bool deferredDisconnect = false;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     IORecursiveLock *sl = startLock();
@@ -2010,6 +2032,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
             if (!dynOk) continue;
+            if (!dd->connected && inResumeGrace) {
+                deferredDisconnect = true;
+                FBLOG("hot-plug: display 0x%x disconnected during post-resume grace - deferring recheck", handles[i]);
+                continue;
+            }
             gDpy[kdpy].connected = dd->connected ? NV_TRUE : NV_FALSE;
             bool audioTypeChanged = false;
             if (dd->connected && kdpy >= 0) {
@@ -2079,6 +2106,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (listed) continue;
         nvu_zero(dd, sizeof *dd); dd->handle = gDpy[k].handle;
         if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;
+        if (inResumeGrace) {
+            deferredDisconnect = true;
+            FBLOG("hot-plug: omitted display 0x%x disconnected during post-resume grace - deferring recheck", gDpy[k].handle);
+            continue;
+        }
         gDpy[k].connected = false;
         for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
             NVRMNVDAFramebuffer *fb = gFBs[f];
@@ -2095,6 +2127,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
     if (sl) IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
+    if (deferredDisconnect && gHotplug) {
+        uint64_t margin = 0, recheck = graceUntil;
+        clock_interval_to_absolutetime_interval(200, kMillisecondScale, &margin);
+        recheck += margin;
+        thread_call_enter_delayed(gHotplug, recheck);
+    }
     for (unsigned f = 0; f < nnotify; f++) {
         notify[f]->notifyConnectionChanged(500);
         notify[f]->release();
@@ -2192,24 +2230,38 @@ static IORecursiveLock *startLock()
 // flicker" on a 143 Hz panel: 56 flips/s median; 540 Hz: 192/s). The flip-occurred event wakes the waiter, and the
 // pending flag (still the truth) is re-read at least every 250 us. The bound is the caller's, in microseconds: the
 // frame path passes one refresh period and a quarter (flipWaitUs), the old 100 ms is kept only as the stuck limit.
+static void nvrmFlipGateUnlockFn(void) { if (IORecursiveLock *l = startLock()) IORecursiveLockUnlock(l); }
+static void nvrmFlipGateRelockFn(void) { if (IORecursiveLock *l = startLock()) IORecursiveLockLock(l); }
 static IOLock *sFlipWaitLock;
 static volatile SInt32 sFlipWakeEv[8];
+static volatile uint32_t sFlipWakeGen[8];
+static void (*sFlipGateUnlock)(void) = nullptr;
+static void (*sFlipGateRelock)(void) = nullptr;
+static volatile SInt32 sFlipDropHead[8];
 void NVRMNVDAFramebuffer::flipWake(unsigned head)
 {
-    if (head >= 8 || !sFlipWaitLock) return;
-    IOLockLock(sFlipWaitLock);
-    OSIncrementAtomic(&sFlipWakeEv[head]);
-    IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
-    IOLockUnlock(sFlipWaitLock);
+    if (head >= 8) return;
+    IOLock *lk = __atomic_load_n(&sFlipWaitLock, __ATOMIC_ACQUIRE);
+    if (!lk) return;
+    IOLockLock(lk);
+    sFlipWakeGen[head]++;
+    IOLockWakeup(lk, (event_t)&sFlipWakeEv[head], false);
+    IOLockUnlock(lk);
 }
 bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
 {
     if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
-    uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
+    IOLock *lk = __atomic_load_n(&sFlipWaitLock, __ATOMIC_ACQUIRE);
     const unsigned h = fHead < 8 ? fHead : 0;
+    const bool dropGate = (fHead < 8 && __atomic_load_n(&sFlipDropHead[fHead], __ATOMIC_ACQUIRE) && sFlipGateUnlock && sFlipGateRelock);
+    uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
     for (;;) {
-        const SInt32 seq0 = sFlipWakeEv[h];
-        __sync_synchronize();
+        uint32_t gen = 0;
+        if (lk) {
+            IOLockLock(lk);
+            gen = sFlipWakeGen[h];
+            IOLockUnlock(lk);
+        }
         NvBool pending = NV_TRUE;
         if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
         if (!pending) return true;
@@ -2217,11 +2269,16 @@ bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
         if (now >= end) return false;
         uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
         if (next > end) next = end;
-        if (!sFlipWaitLock) { IOSleep(1); continue; }
-        IOLockLock(sFlipWaitLock);
-        if (sFlipWakeEv[h] == seq0)
-            IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[h], next, THREAD_UNINT);
-        IOLockUnlock(sFlipWaitLock);
+        if (dropGate) sFlipGateUnlock();
+        if (!lk) {
+            IOSleep(1);
+        } else {
+            IOLockLock(lk);
+            if (sFlipWakeGen[h] == gen)
+                IOLockSleepDeadline(lk, (event_t)&sFlipWakeEv[h], next, THREAD_UNINT);
+            IOLockUnlock(lk);
+        }
+        if (dropGate) sFlipGateRelock();
     }
 }
 // Flip completion-wait controls, surfaced through the debug.nvrmfb_flip_latch* sysctls registered
@@ -3029,15 +3086,18 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
               me->fHwVblCb ? "REGISTERED" : hwVblRetryDue(me->fHwVblTries, kHwVblRetryTicks) ? "REFUSED by NVKMS - timer stays, trying again" : "REFUSED by NVKMS - timer stays",
               (int)sFlipLatched[me->fHead], me->fModeSetTicks, me->fHwVblTries);
     }
-    {   uint64_t nowv = 0; clock_get_uptime(&nowv); const uint64_t per = me->vblPeriodAbs();
-        const bool hwLive = me->fHwVblLast && nowv - me->fHwVblLast < 2 * per;
-        if (!hwLive && me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; } }
-    uint64_t period = 0, now = 0;
-    period = me->vblPeriodAbs();
-    clock_get_uptime(&now);
-    if (me->fVblNext == 0) me->fVblNext = now;
-    me->fVblNext += period;
-    if (me->fVblNext <= now) me->fVblNext = now + period;
+    uint64_t now = 0; clock_get_uptime(&now);
+    const uint64_t period = me->vblPeriodAbs();
+    const bool hwLive = me->fHwVblLast && (now <= me->fHwVblLast || (now - me->fHwVblLast) < 2 * period);
+    if (!hwLive && me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; }
+    if (hwLive && me->fHwVblCb) {
+        uint64_t watchdog = 0; nanoseconds_to_absolutetime(500000000ull, &watchdog);
+        me->fVblNext = now + watchdog;
+    } else {
+        if (me->fVblNext == 0) me->fVblNext = now;
+        me->fVblNext += period;
+        if (me->fVblNext <= now) me->fVblNext = now + period;
+    }
     me->scheduleCall(me->fVblTimer, me->fVblNext);
 }
 bool NVRMNVDAFramebuffer::setHeadActive(bool active)
@@ -3201,6 +3261,10 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     fFlipCacheLock = IOSimpleLockAlloc();
     if (!fFlipCacheLock) return false;
+    fHeadFlipLock = IORecursiveLockAlloc();
+    if (!fHeadFlipLock) return false;
+    sFlipGateUnlock = nvrmFlipGateUnlockFn;
+    sFlipGateRelock = nvrmFlipGateRelockFn;
     struct NVRMDisplayPointers displayPtrs = {};
     displayPtrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
     {
@@ -3469,6 +3533,7 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
 void NVRMNVDAFramebuffer::free()
 {
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
+    if (fHeadFlipLock) { IORecursiveLockFree(fHeadFlipLock); fHeadFlipLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
     OSSafeReleaseNULL(fPxMap);
@@ -3559,6 +3624,7 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
 {
     FBLOG("fb%u setDisplayMode 0x%x depth %d (current 0x%x)", fIndex, (unsigned)mode, (int)depth, (unsigned)fCurId);
     if (fProxy) return (mode == kModeId && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupportedMode;
+    NVRMHeadFlipGuard headGuard(fHeadFlipLock);
     NVRMBoundedGate modeGate(kModeChangeGateMs);   // held to the end of the call; the inner gates are recursive
     if (!modeGate.held()) {
         FBLOG("fb%u setDisplayMode 0x%x: the display gate was not free in %u ms (another framebuffer is starting, relighting or "
@@ -3999,6 +4065,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
     struct NvKmsKapiSurface *old = fSurf;
     fScan30 = ten;
     fSurf = ns; fFrontSurf = shown; fMode = m; fW = w; fH = h; fPitch = pitch;
+    advanceFlipEpoch();
     fRasterW = m.timings.hVisible; fRasterH = m.timings.vVisible; fCurId = id; fModeSet = true; fModeSwitches++;
     fCurShownKnown = false;   // the mode set named no cursor
     publishFlipWait();
@@ -4266,6 +4333,7 @@ IOReturn NVRMNVDAFramebuffer::switchSurround(IODisplayModeID id)
     if (!ok) { if (!fSubmissionFaulted) fKms->destroySurface(fDev, ns); return kIOReturnUnsupportedMode; }
     struct NvKmsKapiSurface *old = fSurf;
     fSurf = ns; fFrontSurf = ns; fSurActive = true; fMode = fSur[0].mode; fW = w; fH = h; fPitch = pitch;
+    advanceFlipEpoch();
     fRasterW = w; fRasterH = h; fCurId = id; fModeSet = true; fModeSwitches++; fCurShownKnown = false;
     publishFlipWait(); fHwVblTries = 0; fCurTransform = 0;
     if (old && old != ns) fKms->destroySurface(fDev, old);
@@ -4919,8 +4987,6 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
             for (int i = hit + 1; i < gVramPoolN; i++) gVramPool[i - 1] = gVramPool[i];
             gVramPool[--gVramPoolN] = {};
             OSAddAtomic64(-(SInt64)want, &gVramPoolBytes);
-            nvu_zero_wide(e.kva, (size_t)want);
-            __asm__ __volatile__("sfence" ::: "memory");
             const UInt64 allocationCookie = gAllocations.insert(e.mem, want);
             if (!allocationCookie) {
                 fKms->unmapMemory(fDev, e.mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, e.kva);
@@ -4929,13 +4995,15 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
                 return false;
             }
             r->allocationCookie = allocationCookie;
-            advanceFlipEpoch();
             r->handle = e.mem; r->kva = e.kva; r->phys = (unsigned long long)e.phys;
             r->actualSize = (unsigned long long)want;
             r->mappedTotal = (unsigned long long)(OSAddAtomic64(0, &gVramMappedBytes) + gVramParkedBytes);
             fVramGrants++;
             OSAddAtomic64(1, &gCntGrant); OSAddAtomic64((SInt64)want, &gCntGrantBytes);
             OSAddAtomic64(1, &gVramPoolHits);
+            gate.release();
+            nvu_zero_wide(e.kva, (size_t)want);
+            __asm__ __volatile__("sfence" ::: "memory");
             return true;
         }
         OSAddAtomic64(1, &gVramPoolMisses);
@@ -5091,17 +5159,22 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         return false;
     }
 
+    gate.release();
     nvu_zero_wide(kva, (size_t)want);
+    __asm__ __volatile__("sfence" ::: "memory");
     volatile NvU64 *q = (volatile NvU64 *)kva;
     q[0] = 0x5A5AA5A5C0FFEE01ull;
     NvU64 back = q[0];
     q[0] = 0;
-    if (back != 0x5A5AA5A5C0FFEE01ull) {
+    NVRMDisplayGate gate2;
+    if (!gate2.valid() || back != 0x5A5AA5A5C0FFEE01ull) {
         FBLOG("nvAllocVram(%llu): kva %s phys <phys> WROTE 0x5A5AA5A5C0FFEE01 AND READ 0x%llx — "
               "the aperture is not live; refusing to hand this out",
               (unsigned long long)want, kva ? "set" : "null", (unsigned long long)back);
-        fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
-        fKms->freeMemory(fDev, mem);
+        if (gate2.valid()) {
+            fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+            fKms->freeMemory(fDev, mem);
+        }
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         return false;
     }
@@ -5112,7 +5185,6 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         fKms->freeMemory(fDev, mem); OSAddAtomic64(-(SInt64)want, &gVramMappedBytes); return false;
     }
     r->allocationCookie = allocationCookie;
-    advanceFlipEpoch();   // before the caller can see this memory, so it can never match an entry made for a freed one
     r->handle = mem; r->kva = kva; r->phys = (unsigned long long)phys;
     r->actualSize = (unsigned long long)want;
     r->mappedTotal = (unsigned long long)(before + (SInt64)want);
@@ -5131,7 +5203,6 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
     struct NvKmsKapiMemory *mem = (struct NvKmsKapiMemory *)r->handle;
     if (!mem || !fKms || !fDev) return false;
     if (!gAllocations.remove(mem, r->allocationCookie)) return false;
-    advanceFlipEpoch();   // every cached surface made before this free stops matching (see gFlipEpoch)
     if (!gVramPoolOn && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
     if (gVramPoolOn && fBarLen > (512ull << 20) && r->kva && r->actualSize > 0 && r->actualSize <= NVRM_VRAM_POOL_MAX_ENTRY && fPhysForVa) {
         const NvU64 p = fPhysForVa(r->kva);
@@ -5172,15 +5243,23 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
             if (fModeSet && fSurf) fHeadSlept = true;   // nvKmsSuspend shuts every head down
             fSysSlept = true;                            // the next power-on is a system wake (familyDidWake)
             fWakeRetries = 0;
+            __atomic_store_n(&fGpuLost, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&gGpuResumeGraceUntil, 0, __ATOMIC_RELEASE);
             if (gVramPoolN > 0 && fKms && fDev) {
                 NVRMDisplayGate gate;
                 if (gate.valid() && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
             }
             FBLOG("GPU going to standby: head %u off with it", fHead);
         } else if (st == 1) {
+            __atomic_store_n(&fGpuLost, 0, __ATOMIC_RELEASE);
+            uint64_t grace = 0;
+            clock_interval_to_deadline(2500, kMillisecondScale, &grace);
+            __atomic_store_n(&gGpuResumeGraceUntil, grace, __ATOMIC_RELEASE);
             if (fGpuWake) scheduleCall(fGpuWake, 0);
         } else {
+            __atomic_store_n(&fGpuLost, 1, __ATOMIC_RELEASE);
             FBLOG("GPU lost on wake: head %u stays dark (restart needed)", fHead);
+            if (fGpuWake) scheduleCall(fGpuWake, 0);   // Guardrail B: still release WindowServer from pagingState wait
         }
         return kIOReturnSuccess;
     }
@@ -5260,7 +5339,13 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
+    NVRMHeadFlipGuard headGuard(fHeadFlipLock);
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    struct FlipDropScope {
+        unsigned h;
+        explicit FlipDropScope(unsigned head) : h(head) { if (h < 8) __atomic_store_n(&sFlipDropHead[h], 1, __ATOMIC_RELEASE); }
+        ~FlipDropScope() { if (h < 8) __atomic_store_n(&sFlipDropHead[h], 0, __ATOMIC_RELEASE); }
+    } dropScope(fHead);
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -5295,7 +5380,12 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         unsigned slot = 16;
         for (unsigned i = 0; i < 16; ++i) if (!fFlipCache[i].surf) { slot = i; break; }
         if (slot == 16) for (unsigned i = 0; i < 16; ++i)
-            if (fFlipCache[i].surf != fFrontSurf) { slot = i; break; }
+            if (fFlipCache[i].surf != fFrontSurf &&
+                (fFlipCache[i].epoch != epoch || !gAllocations.size(fFlipCache[i].mem, fFlipCache[i].cookie))) { slot = i; break; }
+        if (slot == 16) for (unsigned k = 0; k < 16; ++k) {
+            const unsigned i = (fFlipEvict + k) & 15u;
+            if (fFlipCache[i].surf != fFrontSurf) { slot = i; fFlipEvict = (i + 1) & 15u; break; }
+        }
         if (slot == 16 || !cacheable) return false;
         NVFlipEntry &entry = fFlipCache[slot];
         if (entry.surf) {
@@ -5311,9 +5401,15 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
                 if (rcOut) *rcOut = prior == kPriorLate ? (int)NV_KMS_FLIP_RESULT_IN_PROGRESS : -1;
                 return false;
             }
-            fKms->destroySurface(fDev, entry.surf);
-            if (entry.pin) fKms->freeMemory(fDev, entry.pin);
-            entry = {};
+            struct NvKmsKapiSurface *oldSurf = entry.surf;
+            struct NvKmsKapiMemory *oldPin = entry.pin;
+            {
+                IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+                entry = {};
+                IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+            }
+            fKms->destroySurface(fDev, oldSurf);
+            if (oldPin) fKms->freeMemory(fDev, oldPin);
         }
         struct NvKmsKapiMemory *pin = fKms->dupMemory(fDev, fDev, mem);
         if (!pin) return false;
@@ -5322,9 +5418,13 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         sp.width = w; sp.height = h; sp.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
         surf = fKms->createSurface(fDev, &sp);
         if (!surf) { fKms->freeMemory(fDev, pin); return false; }
-        entry.mem = mem; entry.surf = surf; entry.pin = pin; entry.cookie = cookie; entry.epoch = epoch;
-        entry.w = w; entry.h = h; entry.pitch = pitch;
-        if (slot >= fFlipCacheN) fFlipCacheN = slot + 1;
+        {
+            IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+            entry.mem = mem; entry.surf = surf; entry.pin = pin; entry.cookie = cookie; entry.epoch = epoch;
+            entry.w = w; entry.h = h; entry.pitch = pitch;
+            if (slot >= fFlipCacheN) fFlipCacheN = slot + 1;
+            IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+        }
     }
     struct NvKmsKapiRequestedModeSetConfig *cfg =
         (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
@@ -5678,7 +5778,10 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         // PS 0, every client's last event 3 = WillSleep). Do the family's wake work here instead; it delivers
         // DidPowerOn too. Only after a real system sleep: at start pagingState is still clear too, and the wake work
         // then sent every client a DidWake at boot.
-        if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
+        if (!pagingState && fSysSlept) {
+            if (rmGpuReady()) { fSysSlept = false; familyDidWake(); }
+            else FBLOG("system wake: GPU not resumed yet - deferring familyDidWake until NVRM resumes");
+        }
         else handleEvent(kIOFBNotifyDidPowerOn);
     } else {
         handleEvent(kIOFBNotifyWillPowerOff);
@@ -5731,6 +5834,7 @@ void NVRMNVDAFramebuffer::familyDidWake()
     }
     IOReturn r = fWakeGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &NVRMNVDAFramebuffer::familyDidWakeGated));
     FBLOG("system wake: family wake work -> 0x%x", r);
+    if (fInternal && fBacklight && rmGpuReady()) fBacklight->reapplyAfterWake();
 }
 IOReturn NVRMNVDAFramebuffer::sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info)
 {
@@ -5780,30 +5884,47 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
-    bool ok = false, wakeFam = false;
+    bool ok = false, wakeFam = false, reapplyBl = false;
     {
         NVRMDisplayGate gate; if (!gate.valid()) return;
-        if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
-            FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
-            return;
-        }
-        ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
-        FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
-        if (ok) {
-            me->fWakeRetries = 0;
+        if (__atomic_load_n(&me->fGpuLost, __ATOMIC_ACQUIRE)) {
             if (!me->pagingState && me->fSysSlept) {
                 me->fSysSlept = false;
                 wakeFam = true;
             }
-        } else if (me->fWakeRetries < 3) {
-            me->fWakeRetries++;
-            uint64_t deadline = 0;
-            clock_interval_to_deadline(500u * me->fWakeRetries, kMillisecondScale, &deadline);
-            FBLOG("GPU back: head %u wake retry %u/3 scheduled in %u ms", me->fHead, (unsigned)me->fWakeRetries, 500u * me->fWakeRetries);
-            me->scheduleCall(me->fGpuWake, deadline);
+            FBLOG("GPU lost on wake: head %u stays dark%s", me->fHead, wakeFam ? " - waking family so WindowServer cannot deadlock" : "");
+        } else if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
+            if (me->fPowerOn && !me->pagingState && me->fSysSlept) {
+                me->fSysSlept = false;
+                wakeFam = true;
+            }
+            FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
+        } else {
+            ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
+            FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
+            if (ok) {
+                me->fWakeRetries = 0;
+                reapplyBl = me->fInternal && me->fBacklight != nullptr;
+                if (!me->pagingState && me->fSysSlept) {
+                    me->fSysSlept = false;
+                    wakeFam = true;
+                }
+            } else if (me->fWakeRetries < 3) {
+                me->fWakeRetries++;
+                uint64_t deadline = 0;
+                clock_interval_to_deadline(500u * me->fWakeRetries, kMillisecondScale, &deadline);
+                FBLOG("GPU back: head %u wake retry %u/3 scheduled in %u ms", me->fHead, (unsigned)me->fWakeRetries, 500u * me->fWakeRetries);
+                me->scheduleCall(me->fGpuWake, deadline);
+            } else if (!me->pagingState && me->fSysSlept) {
+                // Guardrail B: on final retry exhaustion still release WindowServer from its pagingState wait.
+                me->fSysSlept = false;
+                wakeFam = true;
+                FBLOG("GPU back: head %u wake retries exhausted - waking family so WindowServer cannot deadlock", me->fHead);
+            }
         }
     }
     if (wakeFam) me->familyDidWake();
+    else if (reapplyBl && me->fBacklight) me->fBacklight->reapplyAfterWake();
 }
 IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value)
 {

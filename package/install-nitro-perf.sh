@@ -50,13 +50,29 @@ NEWKC="$KC.nitro-perf-new"
 cleanup() { rm -rf "$T" "$NEWKC"; }
 trap cleanup EXIT
 
-echo "== 3. Installing nitro-perf userland (NVMTLDriver, translator, nvencvt, NVK, nvmtl-smi) =="
-install -m 755 -o root -g wheel "$HERE/userland/NVMTLDriver" "$GB/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver"
-install -m 755 -o root -g wheel "$HERE/userland/libnvmtl_translate.dylib" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib"
-install -m 755 -o root -g wheel "$HERE/userland/libnvencvt.dylib" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib"
-install -m 755 -o root -g wheel "$HERE/userland/libvulkan_nouveau.dylib" "$GB/nvmtl/libvulkan_nouveau.dylib"
+echo "== 3. Installing nitro-perf userland atomically (NVMTLDriver, translator, nvencvt, NVK, nvmtl-smi) =="
+stage_bin() {
+  local src="$1" dst="$2" signed tmp
+  signed="$T/$(basename "$dst").$$"
+  cp -f "$src" "$signed"
+  chmod 755 "$signed"
+  codesign --force --sign - "$signed"
+  tmp="$(dirname "$dst")/.$(basename "$dst").nitro.tmp.$$"
+  cp -pf "$signed" "$tmp"
+  chown root:wheel "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dst"
+}
+stage_bin "$HERE/userland/libnvmtl_translate.dylib" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib"
+# Refresh .sha256 sidecar atomically so NVMTLLibraryLoad's fast-path matches the newly installed translator
+shasum -a 256 "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib" | awk '{print $1}' > "$T/xlate.sha256"
+chown root:wheel "$T/xlate.sha256"; chmod 644 "$T/xlate.sha256"
+mv -f "$T/xlate.sha256" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib.sha256"
+stage_bin "$HERE/userland/libnvencvt.dylib" "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib"
+stage_bin "$HERE/userland/NVMTLDriver" "$GB/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver"
+stage_bin "$HERE/userland/libvulkan_nouveau.dylib" "$GB/nvmtl/libvulkan_nouveau.dylib"
 mkdir -p "$ST/bin" /usr/local/bin
-install -m 755 -o root -g wheel "$HERE/bin/nvmtl-smi" "$ST/bin/nvmtl-smi"
+stage_bin "$HERE/bin/nvmtl-smi" "$ST/bin/nvmtl-smi"
 ln -sf "$ST/bin/nvmtl-smi" /usr/local/bin/nvmtl-smi
 if [ -f "$HERE/nitro-perf-ctl.sh" ]; then
   install -m 755 -o root -g wheel "$HERE/nitro-perf-ctl.sh" "$ST/nitro-perf-ctl.sh"
@@ -69,11 +85,6 @@ if [ -f "$HERE/rollback-nitro-perf.sh" ]; then
   install -m 755 -o root -g wheel "$HERE/rollback-nitro-perf.sh" "$ST/rollback-nitro-perf.sh"
 fi
 
-codesign --force --sign - "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib"
-codesign --force --sign - "$GB/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib"
-codesign --force --sign - "$GB/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver"
-codesign --force --sign - "$GB/nvmtl/libvulkan_nouveau.dylib"
-
 chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt"
 chmod -R go-w,a+rX "$GB/NVMTLDriver.bundle" "$GB/nvmtl"
 chmod 644 "$GB/nvmtl-allow.txt"
@@ -82,8 +93,10 @@ mkdir -p "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache"
 chown -R _windowserver:wheel "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache"
 chmod 0755 "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache"
 
-echo "== 4. Installing nitro-perf kexts (NVRM, NVAccel, NVRMFB) =="
-for k in NVRM NVAccel NVRMFB; do
+echo "== 4. Installing nitro-perf kexts (NVRM, NVAccel, NVRMFB, NVRMAGDC) =="
+INSTALL_KEXTS="NVRM NVAccel NVRMFB"
+[ -d "$HERE/kexts/NVRMAGDC.kext" ] && INSTALL_KEXTS="$INSTALL_KEXTS NVRMAGDC"
+for k in $INSTALL_KEXTS; do
   rm -rf "$EXT/$k.kext"
   ditto "$HERE/kexts/$k.kext" "$EXT/$k.kext"
   chown -R root:wheel "$EXT/$k.kext"
@@ -93,7 +106,7 @@ for k in NVRM NVAccel NVRMFB; do
 done
 
 if [ -r "$KPDB" ] && command -v sqlite3 >/dev/null 2>&1; then
-  for k in NVRM NVAccel NVRMFB; do
+  for k in $INSTALL_KEXTS; do
     id="com.nullmoth.$k"; p="$EXT/$k.kext"
     ch=$(codesign -dvvv "$p" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')
     if printf '%s' "$ch" | grep -Eq '^[0-9a-f]{40}$'; then

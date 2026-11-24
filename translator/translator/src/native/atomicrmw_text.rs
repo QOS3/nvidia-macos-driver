@@ -42,18 +42,20 @@ fn rewrite_line(line: &str) -> Option<(String, String, String)> {
     let (value, tail) = rest.split_once(' ')?;
     let tail = tail.split(", align").next()?.trim();
     let order = tail.rsplit(' ').next()?;
-    if !matches!(
-        order,
-        "monotonic" | "acquire" | "release" | "acq_rel" | "seq_cst"
-    ) {
-        return None;
-    }
+    let air_order = match order {
+        "monotonic" => 0,
+        "acquire" => 2,
+        "release" => 3,
+        "acq_rel" => 4,
+        "seq_cst" => 5,
+        _ => return None,
+    };
     if tail != order && !tail.starts_with("syncscope(") {
         return None;
     }
     let callee = format!("air.atomic.{space}.{op}.i32");
     Some((
-        format!("{indent}{result} = call i32 @{callee}({pty} {ptr}, i32 {value}, i32 0, i32 2, i1 true)"),
+        format!("{indent}{result} = call i32 @{callee}({pty} {ptr}, i32 {value}, i32 {air_order}, i32 2, i1 true)"),
         callee,
         pty.to_string(),
     ))
@@ -111,7 +113,7 @@ mod tests {
     fn a_groupshared_interlocked_add_becomes_the_air_local_atomic() {
         let src = "  %5 = atomicrmw add i32 addrspace(3)* %4, i32 1 seq_cst, align 4\n";
         let out = lower_raw_atomicrmw(src);
-        assert!(out.contains("  %5 = call i32 @air.atomic.local.add.u.i32(i32 addrspace(3)* %4, i32 1, i32 0, i32 2, i1 true)"), "{out}");
+        assert!(out.contains("  %5 = call i32 @air.atomic.local.add.u.i32(i32 addrspace(3)* %4, i32 1, i32 5, i32 2, i1 true)"), "{out}");
         assert!(
             out.contains(
                 "declare i32 @air.atomic.local.add.u.i32(i32 addrspace(3)*, i32, i32, i32, i1)"

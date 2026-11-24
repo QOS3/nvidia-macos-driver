@@ -11,7 +11,7 @@ on:
 
 jobs:
   tests:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 25
     env:
       PYTHONDONTWRITEBYTECODE: '1'
@@ -33,6 +33,10 @@ jobs:
             test_import_cache.c \
             test_game_priority.c \
             test_fps_limit.c \
+            test_schedule_policy.c \
+            test_aircache_dir.py \
+            test_submission_copies.py \
+            test_surface_publication.py \
             test_fb_keep_front.py \
             test_fb_scaler_limit.py \
             test_fb_ddc.py \
@@ -172,7 +176,7 @@ jobs:
           export LIBCLANG_PATH="$LLVM_PREFIX/lib"
           export NVK_SYSROOT="$GITHUB_WORKSPACE/sysroot"
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK"
-          export NVK_EXTRA_PATCHES="nvk-loq-ada-perf nvk-nitro-perf"
+          export NVK_EXTRA_PATCHES="nvk-upstream-nak nvk-loq-ada-perf nvk-nitro-perf"
           export NVK_CPU_ARCH="x86-64-v3"
           export NVK_JOBS=4
           if ! bash build/build_nvk.sh "$GITHUB_WORKSPACE/mesa" "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/out" 3.0; then
@@ -191,7 +195,7 @@ jobs:
 
   nvrm:
     if: ${{ !inputs.only_plugin }}
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -207,13 +211,18 @@ jobs:
           git archive HEAD kexts/NVRM build | tar x -C src
           bash src/build/build_nvrm.sh src/kexts/NVRM "$GITHUB_WORKSPACE/work/ogkm-620.70.06" "$GITHUB_WORKSPACE/out" \
             || { cat "$GITHUB_WORKSPACE/out"/*.err 2>/dev/null; exit 1; }
+          if nm -u out/NVRM.kext/Contents/MacOS/NVRM | grep -qi thunk; then
+            echo "STOP: unexpected retpoline thunk undefined symbol in NVRM.kext"
+            nm -u out/NVRM.kext/Contents/MacOS/NVRM | grep -i thunk
+            exit 1
+          fi
           shasum -a 256 out/NVRM.kext/Contents/MacOS/NVRM
       - uses: actions/upload-artifact@v4
         with: { name: nitro-nvrm, path: out/NVRM.kext }
 
   nvaccel:
     if: ${{ !inputs.only_plugin }}
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -262,7 +271,7 @@ jobs:
 
   nvrmfb:
     if: ${{ !inputs.only_plugin }}
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -286,6 +295,25 @@ jobs:
           shasum -a 256 out/NVRMFB.kext/Contents/MacOS/NVRMFB
       - uses: actions/upload-artifact@v4
         with: { name: nitro-nvrmfb, path: out/NVRMFB.kext }
+
+  nvrmagdc:
+    if: ${{ !inputs.only_plugin }}
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick Xcode and build NVRMAGDC.kext
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          mkdir -p src out
+          git archive HEAD kexts/NVRMAGDC build | tar x -C src
+          bash src/build/build_agdc.sh src/kexts/NVRMAGDC "$GITHUB_WORKSPACE/out" \
+            || { cat "$GITHUB_WORKSPACE/out/cc.err" "$GITHUB_WORKSPACE/out/ld.err" 2>/dev/null; exit 1; }
+          shasum -a 256 out/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC
+      - uses: actions/upload-artifact@v4
+        with: { name: nitro-nvrmagdc, path: out/NVRMAGDC.kext }
 
   nvencvt:
     if: ${{ !inputs.only_plugin }}
@@ -391,8 +419,8 @@ jobs:
 
   bundle:
     if: ${{ !inputs.only_plugin }}
-    needs: [tests, plugin, translator, nvk, nvrm, nvaccel, nvrmfb, nvencvt, nvmtl-smi]
-    runs-on: macos-15
+    needs: [tests, plugin, translator, nvk, nvrm, nvaccel, nvrmfb, nvrmagdc, nvencvt, nvmtl-smi]
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -408,6 +436,7 @@ jobs:
           ditto incoming/nitro-nvrm bundle/kexts/NVRM.kext
           ditto incoming/nitro-nvaccel bundle/kexts/NVAccel.kext
           ditto incoming/nitro-nvrmfb bundle/kexts/NVRMFB.kext
+          ditto incoming/nitro-nvrmagdc bundle/kexts/NVRMAGDC.kext
           cp package/install-nitro-perf.sh package/rollback-nitro-perf.sh package/merge-shared-cache.sh package/nitro-perf-ctl.sh bundle/
           chmod 755 bundle/kexts/*.kext/Contents/MacOS/* bundle/userland/* bundle/bin/nvmtl-smi bundle/*.sh
           git rev-parse HEAD > bundle/COMMIT

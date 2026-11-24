@@ -1642,50 +1642,33 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     if (on < 0) { const char *e = getenv("NVMTL_HOST_PAGES_SHARE"); on = e && e[0] == '1'; }
     return on ? nvmtl_plane_cookie(s, YES) : 0;
 }
-// A 4:2:2 texture wrapping an IOSurface plane (video frames): the surface's packed rows are copied and decoded whenever the
-// surface has changed since the last use (the surface seed), by the CPU. The surface is never written back.
-- (void)nvmtlY422SurfaceIn {
-    @synchronized (self) {
-        if (_y422Synced && IOSurfaceGetSeed(_y422Surf) == _y422Seed) return;
-        uint32_t seed = 0;
-        if (IOSurfaceLock(_y422Surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("4:2:2 surface-in: IOSurfaceLock FAILED"); return; }
-        const uint8_t *base = IOSurfaceGetBaseAddressOfPlane(_y422Surf, (uint32_t)_y422Plane);
-        const size_t row = IOSurfaceGetBytesPerRowOfPlane(_y422Surf, (uint32_t)_y422Plane), span = nvmtl_y422_row_bytes(_i.w);
-        const size_t rows = IOSurfaceGetHeightOfPlane(_y422Surf, (uint32_t)_y422Plane);
-        if (base && row >= span && rows >= _i.h) {
-            for (uint32_t y = 0; y < _i.h; y++) memcpy((uint8_t *)_y422Raw.mutableBytes + (size_t)y * span, base + (size_t)y * row, span);
-            _y422Seed = IOSurfaceGetSeed(_y422Surf);
-        } else nvlog("4:2:2 surface-in: surface plane %lu is %zu bytes/row x %zu rows, the texture needs %zu x %u - frame skipped", (unsigned long)_y422Plane, row, rows, span, _i.h);
-        IOSurfaceUnlock(_y422Surf, kIOSurfaceLockReadOnly, &seed);
-        if (base && row >= span && rows >= _i.h) { [self nvmtlY422Upload:0 rows:_i.h]; _y422Synced = YES; }
-    }
-}
-- (void)nvmtlSurfaceIn { [self nvmtlSurfaceInForCbSeq:0]; }
-- (void)nvmtlSurfaceInForCbSeq:(uint64_t)cbSeq {
-    if (_y422Surf) { [self nvmtlY422SurfaceIn]; return; }
-    NVMTLTexture *r = _parent ? _parent : self;
+static void nvmtl_surface_in_body(NVMTLTexture *self, uint64_t cbSeq, BOOL skipBusy) {
+    if (self->_y422Surf) { [self nvmtlY422SurfaceIn]; return; }
+    NVMTLTexture *r = self->_parent ? self->_parent : self;
     if (!r->_surf) return;
     @synchronized (nvmtl_surface_sync(r)) {
-    if (r->_clientWritten) {
+    // Check foreign NVMTLBusyAt BEFORE the seed/synced early return so reused shared-VRAM surfaces (r->_vramOn)
+    // whose seed has not moved yet while another process's GPU write is in flight still synchronize cleanly.
+    // nitro-perf: deduplicate busy probes/waits per command buffer lock-free via _busyCheckedCb / _busyDoneAtWrap.
+    if (!skipBusy) {
         if (cbSeq && r->_busyCheckedCb == cbSeq) {
             // Already verified done in this command buffer.
         } else if (cbSeq && r->_busyDoneAtWrap && r->_busyCheckedCb == 0) {
             r->_busyDoneAtWrap = NO;
             r->_busyCheckedCb = cbSeq;
         } else {
-            nvmtl_busy_wait(r->_surf, r->_plane);
+            if (r->_clientWritten) {
+                nvmtl_busy_wait(r->_surf, r->_plane);
+            } else if (nvmtl_busy_foreign(r->_surf, r->_plane)) {
+                r->_clientWritten = YES;
+                nvmtl_busy_wait(r->_surf, r->_plane);
+            }
             r->_busyDoneAtWrap = NO;
             if (cbSeq) r->_busyCheckedCb = cbSeq;
         }
     }
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
-    if (!r->_clientWritten && nvmtl_busy_foreign(r->_surf, r->_plane)) {
-        r->_clientWritten = YES;
-        nvmtl_busy_wait(r->_surf, r->_plane);
-        r->_busyDoneAtWrap = NO;
-        if (cbSeq) r->_busyCheckedCb = cbSeq;
-    }
     if (r->_surfSynced && !r->_vramOn && vgen == r->_surfGen && nvmtl_plane_seed_on()) {
         // the seed moved, but only through our own surface-outs of other planes: this plane's image is still current
         const uint32_t now = IOSurfaceGetSeed(r->_surf);
@@ -1730,6 +1713,27 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
     }
 }
+// A 4:2:2 texture wrapping an IOSurface plane (video frames): the surface's packed rows are copied and decoded whenever the
+// surface has changed since the last use (the surface seed), by the CPU. The surface is never written back.
+- (void)nvmtlY422SurfaceIn {
+    @synchronized (self) {
+        if (_y422Synced && IOSurfaceGetSeed(_y422Surf) == _y422Seed) return;
+        uint32_t seed = 0;
+        if (IOSurfaceLock(_y422Surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("4:2:2 surface-in: IOSurfaceLock FAILED"); return; }
+        const uint8_t *base = IOSurfaceGetBaseAddressOfPlane(_y422Surf, (uint32_t)_y422Plane);
+        const size_t row = IOSurfaceGetBytesPerRowOfPlane(_y422Surf, (uint32_t)_y422Plane), span = nvmtl_y422_row_bytes(_i.w);
+        const size_t rows = IOSurfaceGetHeightOfPlane(_y422Surf, (uint32_t)_y422Plane);
+        if (base && row >= span && rows >= _i.h) {
+            for (uint32_t y = 0; y < _i.h; y++) memcpy((uint8_t *)_y422Raw.mutableBytes + (size_t)y * span, base + (size_t)y * row, span);
+            _y422Seed = IOSurfaceGetSeed(_y422Surf);
+        } else nvlog("4:2:2 surface-in: surface plane %lu is %zu bytes/row x %zu rows, the texture needs %zu x %u - frame skipped", (unsigned long)_y422Plane, row, rows, span, _i.h);
+        IOSurfaceUnlock(_y422Surf, kIOSurfaceLockReadOnly, &seed);
+        if (base && row >= span && rows >= _i.h) { [self nvmtlY422Upload:0 rows:_i.h]; _y422Synced = YES; }
+    }
+}
+- (void)nvmtlSurfaceIn { nvmtl_surface_in_body(self, 0, NO); }
+- (void)nvmtlSurfaceInForCbSeq:(uint64_t)cbSeq { nvmtl_surface_in_body(self, cbSeq, NO); }
+- (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy { nvmtl_surface_in_body(self, 0, skipBusy); }
 - (BOOL)nvmtlSurfaceOut { return [self nvmtlSurfaceOutDirtied:NO]; }
 // A re-mark after the commit's (nvmtlSurfaceOutDirtied:) that found the accelerator lock taken is retried here, off the
 // completion thread: a CPU lock that paged the surface off between the commit's two marks would otherwise leave its
@@ -2959,12 +2963,12 @@ extern NSData *nvmtl_compile_library_entry(NSData *, NSString *, NSString *, NSS
     }
 
     NSData *air = _fns[name];
-    NSString *ll = _airs[name], *stage = _stages[name];
+    NSString *stage = _stages[name];
     // The library index hands every library made from the same file the same bitcode objects, so the entry's SPIR-V is
     // kept on its bitcode: a library made again (VideoToolbox makes one per transfer) neither hashes nor reads it again.
     NSData *known = air ? objc_getAssociatedObject(air, &gNVMTLEntrySpvAssoc) : nil;
     NSString *why = nil;
-    NSData *spv = known ?: nvmtl_compile_library_entry(air, ll, stage, name, &why);
+    NSData *spv = known ?: nvmtl_compile_library_entry(air, _airs[name], stage, name, &why);
     if (!spv) {
         if (error) *error = [NSError errorWithDomain:@"NVMTL" code:3
                                            userInfo:@{NSLocalizedDescriptionKey:why ?: @"entry translation failed"}];
@@ -2983,10 +2987,15 @@ extern NSData *nvmtl_compile_library_entry(NSData *, NSString *, NSString *, NSS
 - (id<MTLDevice>)device { return (id<MTLDevice>)gNVMTLMainDevice; }
 // NVMTL_AIR_DUMP=<dir>: write each function's AIR text, once, as <dir>/<name>.ll when an app first asks for it, so an
 // app that builds its libraries from memory can be studied offline kernel by kernel. Nothing is written when unset.
-static void nvmtl_air_dump(NSString *name, NSString *air)
+static const char *nvmtl_air_dump_dir(void)
 {
     static const char *dir; static dispatch_once_t once;
     dispatch_once(&once, ^{ dir = getenv("NVMTL_AIR_DUMP"); if (dir && !*dir) dir = NULL; });
+    return dir;
+}
+static void nvmtl_air_dump(NSString *name, NSString *air)
+{
+    const char *dir = nvmtl_air_dump_dir();
     if (!dir || !air.length || !name.length || [name containsString:@"/"]) return;
     NSString *path = [[@(dir) stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"ll"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return;
@@ -2996,7 +3005,7 @@ static void nvmtl_air_dump(NSString *name, NSString *air)
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
     NSData *spv = [_fns objectForKey:name];
     if (!spv && !_airs[name]) { nvlog("library: no function \"%s\" (this library holds %lu, externs %lu)", name.UTF8String, (unsigned long)(_fns.count + _airs.count), (unsigned long)_externs.count); return nil; }
-    nvmtl_air_dump(name, _airs[name]);
+    if (nvmtl_air_dump_dir()) nvmtl_air_dump(name, _airs[name]);
     if (spv && ([_stages[name] isEqualToString:@"mesh"] || [_stages[name] isEqualToString:@"object"])) {
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fname = name; f->_stage = _stages[name];
         f->_air = _airs[name]; f->_lib = self; return f;
@@ -3046,7 +3055,7 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)cv error:(NSError **)error {
     if (error) *error = nil;
     NSData *spv = [_fns objectForKey:name];
-    nvmtl_air_dump(name, _airs[name]);
+    if (nvmtl_air_dump_dir()) nvmtl_air_dump(name, _airs[name]);
     if (!spv && _airs[name]) {
         if (cv) nvlog("library: visible function \"%s\" asked with constant values — carried on the function",
                       name.UTF8String);
@@ -4035,40 +4044,103 @@ static void nvmtl_tile_ignored(const char *what) { static _Atomic unsigned n; if
 }
 - (unsigned long long)globalTraceObjectID { return nvmtl_global_trace_id(self); }
 static NSMutableDictionary *g_sampvar; static pthread_mutex_t g_sampvar_lock = PTHREAD_MUTEX_INITIALIZER;
-extern unsigned char *CC_SHA256(const void *data, uint32_t len, unsigned char *md);
-static char kNVMTLSampvarAir;
-static NSString *nvmtl_air_digest(NVMTLFunction *f) {
-    if (!f) return @"-";
-    NSString *h = objc_getAssociatedObject(f, &kNVMTLSampvarAir); if (h) return h;
-    NSData *u = [f->_air dataUsingEncoding:NSUTF8StringEncoding]; unsigned char md[32];
-    CC_SHA256(u.bytes, (uint32_t)u.length, md);
-    NSMutableString *x = [NSMutableString stringWithCapacity:64]; for (int i = 0; i < 32; i++) [x appendFormat:@"%02x", md[i]];
-    objc_setAssociatedObject(f, &kNVMTLSampvarAir, x, OBJC_ASSOCIATION_RETAIN_NONATOMIC); return x;
+static void nvmtl_sampvar_hash_str(CC_SHA256_CTX *ctx, NSString *s) {
+    const char *u = s ? s.UTF8String : "";
+    const uint32_t len = (uint32_t)strlen(u);
+    CC_SHA256_Update(ctx, &len, sizeof len);
+    if (len) CC_SHA256_Update(ctx, u, len);
 }
-static NSString *nvmtl_sampvar_key(MTLRenderPipelineDescriptor *d, NVMTLFunction *vf, NVMTLFunction *ff, NSData *skey) {
+static BOOL nvmtl_sampvar_hash_fn(CC_SHA256_CTX *ctx, NVMTLFunction *f) {
+    const uint8_t present = f != nil;
+    CC_SHA256_Update(ctx, &present, sizeof present);
+    if (!f) return YES;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    if (!nvmtl_air_state_digest(f->_air, digest)) return NO;
+    CC_SHA256_Update(ctx, digest, sizeof digest);
+    nvmtl_sampvar_hash_str(ctx, f->_fname);
+    nvmtl_sampvar_hash_str(ctx, f->_stage);
+    NSData *fcJson = f->_fc.count ? [NSJSONSerialization dataWithJSONObject:f->_fc options:NSJSONWritingSortedKeys error:NULL] : nil;
+    const uint32_t fclen = (uint32_t)fcJson.length;
+    CC_SHA256_Update(ctx, &fclen, sizeof fclen);
+    if (fclen) CC_SHA256_Update(ctx, fcJson.bytes, fclen);
+    return YES;
+}
+static NSData *nvmtl_sampvar_key(MTLRenderPipelineDescriptor *d, NVMTLFunction *vf, NVMTLFunction *ff, NSData *skey) {
     static int off = -1; if (off < 0) off = getenv("NVMTL_NO_SAMPVAR") != NULL;
     if (off || !d || !vf || !vf->_air || (ff && !ff->_air)) return nil;
-    MTLRenderPipelineDescriptor *c = [d copy]; c.vertexFunction = nil; c.fragmentFunction = nil; c.label = @"";
-    for (MTLLinkedFunctions *lf in @[NVMTL_SINCE(12.0, id, c.vertexLinkedFunctions, nil) ?: (id)[NSNull null], NVMTL_SINCE(12.0, id, c.fragmentLinkedFunctions, nil) ?: (id)[NSNull null]]) {
+    for (MTLLinkedFunctions *lf in @[NVMTL_SINCE(12.0, id, d.vertexLinkedFunctions, nil) ?: (id)[NSNull null],
+                                     NVMTL_SINCE(12.0, id, d.fragmentLinkedFunctions, nil) ?: (id)[NSNull null]]) {
         if ((id)lf == [NSNull null]) continue;
         if (lf.functions.count || NVMTL_SINCE(11.0, NSUInteger, lf.binaryFunctions.count, 0) || lf.groups.count || NVMTL_SINCE(12.0, NSUInteger, lf.privateFunctions.count, 0)) return nil;
     }
-    NSString *ds = c.description; NSRange nl = [ds rangeOfString:@"\n"];
-    if (nl.location != NSNotFound) ds = [ds substringFromIndex:nl.location];
-    static NSRegularExpression *addr; static dispatch_once_t once;
-    dispatch_once(&once, ^{ addr = [NSRegularExpression regularExpressionWithPattern:@"0x[0-9a-fA-F]+" options:0 error:NULL]; });
-    ds = [addr stringByReplacingMatchesInString:ds options:0 range:NSMakeRange(0, ds.length) withTemplate:@"@"];
-    NSString *sk = [[NSString alloc] initWithData:skey encoding:NSUTF8StringEncoding] ?: @"";
-    return [NSString stringWithFormat:@"%@|%@|%@|%@||%@|%@|%@|%@||%@||%@", nvmtl_air_digest(vf), vf->_fname, vf->_stage, vf->_fc ?: @{},
-            nvmtl_air_digest(ff), ff ? ff->_fname : @"", ff ? ff->_stage : @"", ff ? (ff->_fc ?: @{}) : @{}, sk, ds];
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    if (!nvmtl_sampvar_hash_fn(&ctx, vf) || !nvmtl_sampvar_hash_fn(&ctx, ff)) return nil;
+    const uint32_t sklen = (uint32_t)skey.length;
+    CC_SHA256_Update(&ctx, &sklen, sizeof sklen);
+    if (sklen) CC_SHA256_Update(&ctx, skey.bytes, sklen);
+    for (uint32_t i = 0; i < NVMTL_NCOL; i++) {
+        MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
+        const uint32_t pf = (uint32_t)ca.pixelFormat;
+        uint32_t cw[9] = { pf, 0, 0, 0, 0, 0, 0, 0, 0 };
+        if (pf != MTLPixelFormatInvalid) {
+            cw[1] = ca.isBlendingEnabled ? 1u : 0u;
+            cw[2] = (uint32_t)ca.sourceRGBBlendFactor; cw[3] = (uint32_t)ca.destinationRGBBlendFactor; cw[4] = (uint32_t)ca.rgbBlendOperation;
+            cw[5] = (uint32_t)ca.sourceAlphaBlendFactor; cw[6] = (uint32_t)ca.destinationAlphaBlendFactor; cw[7] = (uint32_t)ca.alphaBlendOperation;
+            cw[8] = (uint32_t)ca.writeMask;
+        }
+        CC_SHA256_Update(&ctx, cw, sizeof cw);
+    }
+    const uint32_t rsc = (uint32_t)([d respondsToSelector:@selector(rasterSampleCount)] ? d.rasterSampleCount
+                                    : ((NSUInteger (*)(id, SEL))objc_msgSend)(d, @selector(sampleCount)));
+    const uint32_t meta[16] = {
+        (uint32_t)d.depthAttachmentPixelFormat,
+        (uint32_t)d.stencilAttachmentPixelFormat,
+        d.isRasterizationEnabled ? 1u : 0u,
+        d.isAlphaToCoverageEnabled ? 1u : 0u,
+        d.isAlphaToOneEnabled ? 1u : 0u,
+        rsc,
+        (uint32_t)NVMTL_SINCE(10.15, NSUInteger, d.maxVertexAmplificationCount, 1),
+        (uint32_t)NVMTL_SINCE(10.11, NSUInteger, d.inputPrimitiveTopology, 0),
+        NVMTL_SINCE(10.14, BOOL, d.supportIndirectCommandBuffers, NO) ? 1u : 0u,
+        (uint32_t)NVMTL_SINCE(10.12, NSUInteger, d.tessellationPartitionMode, 0),
+        (uint32_t)NVMTL_SINCE(10.12, NSUInteger, d.maxTessellationFactor, 16),
+        NVMTL_SINCE(10.12, BOOL, d.isTessellationFactorScaleEnabled, NO) ? 1u : 0u,
+        (uint32_t)NVMTL_SINCE(10.12, NSUInteger, d.tessellationFactorFormat, 0),
+        (uint32_t)NVMTL_SINCE(10.12, NSUInteger, d.tessellationControlPointIndexType, 0),
+        (uint32_t)NVMTL_SINCE(10.12, NSUInteger, d.tessellationFactorStepFunction, 0),
+        (uint32_t)NVMTL_SINCE(10.12, NSUInteger, d.tessellationOutputWindingOrder, 0),
+    };
+    CC_SHA256_Update(&ctx, meta, sizeof meta);
+    MTLVertexDescriptor *vd = d.vertexDescriptor;
+    if (vd) {
+        uint32_t bufMask = 0;
+        for (uint32_t a = 0; a < NVMTL_NVIN; a++) {
+            MTLVertexAttributeDescriptor *ad = vd.attributes[a];
+            if (!ad || ad.format == MTLVertexFormatInvalid) continue;
+            const uint32_t bi = (uint32_t)ad.bufferIndex;
+            const uint32_t aw[4] = { a, (uint32_t)ad.format, (uint32_t)ad.offset, bi };
+            CC_SHA256_Update(&ctx, aw, sizeof aw);
+            if (bi < NVMTL_NVIN && !(bufMask & (1u << bi))) {
+                bufMask |= 1u << bi;
+                MTLVertexBufferLayoutDescriptor *ld = vd.layouts[bi];
+                const uint64_t lw[3] = { (uint64_t)ld.stride, (uint64_t)ld.stepFunction, (uint64_t)ld.stepRate };
+                CC_SHA256_Update(&ctx, lw, sizeof lw);
+            }
+        }
+        CC_SHA256_Update(&ctx, &bufMask, sizeof bufMask);
+    }
+    uint8_t out[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(out, &ctx);
+    return [NSData dataWithBytes:out length:sizeof out];
 }
-static id nvmtl_sampvar_get(NSString *k) {
+static id nvmtl_sampvar_get(NSData *k) {
     if (!k) return nil;
     pthread_mutex_lock(&g_sampvar_lock); id e = g_sampvar[k]; pthread_mutex_unlock(&g_sampvar_lock);
     if (e) nvlog("sampvar: device cache HIT - a new pipeline state of the same shaders + samplers + descriptor reuses its variant");
     return e;
 }
-static void nvmtl_sampvar_put(NSString *k, id ps, NVMTLFunction *vf, NVMTLFunction *ff) {
+static void nvmtl_sampvar_put(NSData *k, id ps, NVMTLFunction *vf, NVMTLFunction *ff) {
     if (!k || !ps) return;
     pthread_mutex_lock(&g_sampvar_lock);
     if (!g_sampvar) g_sampvar = [NSMutableDictionary new];
@@ -4131,13 +4203,17 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
                 if (!fS) fS=nvmtl_pixel_sampler_norm(_fragmentSamplers);
                 NVMTLFunction *vf=_ps->_linkedVert?:(id)_ps->_descriptor.vertexFunction,*ff=_ps->_linkedFrag?:(id)_ps->_descriptor.fragmentFunction;
                 NSString *why=nil;
-                NSString *gk=nvmtl_sampvar_key(_ps->_descriptor,vf,ff,key); selected=nvmtl_sampvar_get(gk);
+                NSData *gk=nvmtl_sampvar_key(_ps->_descriptor,vf,ff,key); selected=nvmtl_sampvar_get(gk);
                 const uint32_t amp=nvmtl_mv_popcount(_ps->_p.view_mask);   // an amplified pipeline's variants stay multiview shaders
                 NSData *v=selected?nil:nvmtl_translate_samplers_amp(vf,vS,0,amp,&why),*f=(selected||!v)?nil:(ff?nvmtl_translate_samplers_amp(ff,fS,_ps->_a8mask,amp,&why):[NSData data]);
                 if(v && f) {
+                    (void)nvmtl_function_reflection(vf);
+                    if (ff) (void)nvmtl_function_reflection(ff);
                     NVMTLFunction *vs=[NVMTLFunction new],*fs=ff?[NVMTLFunction new]:nil;
-                    vs->_spirv=v;vs->_fname=vf->_fname;vs->_stage=vf->_stage;
-                    if(fs){fs->_spirv=f;fs->_fname=ff->_fname;fs->_stage=ff->_stage;}
+                    vs->_spirv=v;vs->_fname=vf->_fname;vs->_stage=vf->_stage;vs->_fc=vf->_fc;
+                    vs->_refl=vf->_refl;vs->_airNames=vf->_airNames;vs->_arguments=vf->_arguments;vs->_embedded=vf->_embedded;
+                    if(fs){fs->_spirv=f;fs->_fname=ff->_fname;fs->_stage=ff->_stage;fs->_fc=ff->_fc;
+                           fs->_refl=ff->_refl;fs->_airNames=ff->_airNames;fs->_arguments=ff->_arguments;fs->_embedded=ff->_embedded;}
                     nvmtl_gl_uniform_inherit(vs, vf);
                     nvmtl_gl_uniform_inherit(fs, ff);
                     MTLRenderPipelineDescriptor *desc=[_ps->_descriptor copy];desc.vertexFunction=vs;desc.fragmentFunction=fs;
@@ -4761,46 +4837,48 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
     nvmtl_hz_encoder_end(&_cb->_c);
-    NSMutableDictionary *groups = [NSMutableDictionary new];
-    BOOL needScratch = NO;
-    for (NSArray *record in _visRecords) {
-        NSNumber *offset = record[1];
-        NSMutableArray *queries = groups[offset];
-        if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
-        [queries addObject:record[0]];
-        if (queries.count > 1) needScratch = YES;
-    }
-    NVMTLBuffer *scratch = nil;
-    if (needScratch) {
-        scratch = [NVMTLBuffer new];
-        if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
-        } else {
-            if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
-            [_cb->_scratch addObject:scratch];
+    if (_visRecords.count) {
+        NSMutableDictionary *groups = [NSMutableDictionary new];
+        BOOL needScratch = NO;
+        for (NSArray *record in _visRecords) {
+            NSNumber *offset = record[1];
+            NSMutableArray *queries = groups[offset];
+            if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
+            [queries addObject:record[0]];
+            if (queries.count > 1) needScratch = YES;
         }
-    }
-    size_t cursor = 0;
-    for (NSNumber *key in groups) {
-        NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
-        if (queries.count > 1 && !scratch) continue;
-        nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
-        size_t first = cursor;
-        for (NSNumber *value in queries) {
-            uint32_t query = value.unsignedIntValue;
-            size_t out = queries.count > 1 ? cursor++ * 8 : offset;
-            if (query == UINT32_MAX) {
-                if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
-                    nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
-                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
-            } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
-                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
+        NVMTLBuffer *scratch = nil;
+        if (needScratch) {
+            scratch = [NVMTLBuffer new];
+            if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
+                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
+            } else {
+                if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
+                [_cb->_scratch addObject:scratch];
+            }
         }
-        if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
-                                                          (uint32_t)queries.count, &_visBuf->_b, offset))
-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+        size_t cursor = 0;
+        for (NSNumber *key in groups) {
+            NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
+            if (queries.count > 1 && !scratch) continue;
+            nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
+            size_t first = cursor;
+            for (NSNumber *value in queries) {
+                uint32_t query = value.unsignedIntValue;
+                size_t out = queries.count > 1 ? cursor++ * 8 : offset;
+                if (query == UINT32_MAX) {
+                    if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
+                        nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
+                        [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
+                } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
+                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
+            }
+            if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
+                                                              (uint32_t)queries.count, &_visBuf->_b, offset))
+                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+        }
+        _visRecords = nil;
     }
-    _visRecords = nil;
     if (_begun) return;
     if (_refused) return;
     switch (nvmtl_vk_pass_kind(&_pass)) {
@@ -7664,9 +7742,15 @@ static void nvmtl_late_present(void) {
     {
         // Frame-rate limiter (NVMTL_FPS_LIMIT / NVMTL_FPS_LIMIT_BATT in nvrm610.conf; see nvmtl_fps_limit.h).
         // When both differ, checks power source at most once every 3s without touching unrelated processes.
+        // Pacing is tracked per CAMetalLayer so multi-window apps on dual displays (e.g. 144 Hz + 180 Hz)
+        // are not throttled to FPS/N on battery.
+        enum { NVMTL_FPS_SLOTS = 16 };
+        static struct { uintptr_t layer; int fps; uint64_t seen_ns; nvmtl_fps_pacer pacer; } slots[NVMTL_FPS_SLOTS];
         static int fps_init, fps_ac, fps_batt, active_fps;
         static uint64_t last_ac_check_ns;
-        static nvmtl_fps_pacer pacer; static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+        static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+        id layerObj = [drawable respondsToSelector:@selector(layer)] ? ((id (*)(id, SEL))objc_msgSend)(drawable, @selector(layer)) : nil;
+        const uintptr_t lkey = (uintptr_t)(__bridge void *)layerObj;
         uint64_t wait = 0;
         os_unfair_lock_lock(&pace_lock);
         const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -7677,18 +7761,32 @@ static void nvmtl_late_present(void) {
             fps_batt = nvmtl_fps_limit_for(getenv("NVMTL_FPS_LIMIT_BATT"), me);
             active_fps = (fps_ac != fps_batt && nvmtl_on_battery()) ? fps_batt : fps_ac;
             last_ac_check_ns = now;
-            nvmtl_fps_pacer_init(&pacer, active_fps);
             if (active_fps) nvlog("frame-rate limit %d fps for %s", active_fps, me);
         } else if (fps_ac != fps_batt && now - last_ac_check_ns >= 3000000000ull) {
             last_ac_check_ns = now;
             const int want = nvmtl_on_battery() ? fps_batt : fps_ac;
             if (want != active_fps) {
                 active_fps = want;
-                nvmtl_fps_pacer_init(&pacer, active_fps);
+                for (int si = 0; si < NVMTL_FPS_SLOTS; si++) slots[si].fps = -1;
                 nvlog("frame-rate limit switched to %d fps for %s (%s)", active_fps, getprogname(), active_fps == fps_batt ? "battery" : "AC");
             }
         }
-        if (active_fps) wait = nvmtl_fps_pace(&pacer, now);
+        if (active_fps) {
+            int pick = -1, oldest = 0;
+            for (int si = 0; si < NVMTL_FPS_SLOTS; si++) {
+                if (slots[si].seen_ns && slots[si].layer == lkey) { pick = si; break; }
+                if (!slots[si].seen_ns) { if (pick < 0) pick = si; }
+                else if (slots[si].seen_ns < slots[oldest].seen_ns) oldest = si;
+            }
+            if (pick < 0) pick = oldest;
+            if (!slots[pick].seen_ns || slots[pick].layer != lkey || slots[pick].fps != active_fps) {
+                slots[pick].layer = lkey;
+                slots[pick].fps = active_fps;
+                nvmtl_fps_pacer_init(&slots[pick].pacer, active_fps);
+            }
+            slots[pick].seen_ns = now;
+            wait = nvmtl_fps_pace(&slots[pick].pacer, now);
+        }
         os_unfair_lock_unlock(&pace_lock);
         if (wait) { struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) }; nanosleep(&ts, NULL); }
     }
