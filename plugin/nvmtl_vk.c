@@ -3213,6 +3213,17 @@ int nvmtl_vk_accel_surface_wait(void)
     IOObjectRelease(s);
     return on == 1;
 }
+static int nvmtl_dup_devnull(void)
+{
+    static int base_fd = -1;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ base_fd = open("/dev/null", O_RDONLY | O_CLOEXEC); });
+    if (base_fd >= 0) {
+        int fd = fcntl(base_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd >= 0) return fd;
+    }
+    return open("/dev/null", O_RDONLY | O_CLOEXEC);
+}
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out)
 {
     memset(out, 0, sizeof *out);
@@ -3222,7 +3233,7 @@ int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_b
     if (mt < 0) return -1;
     nvmtl_vram_rec r = { 3, surfaceID, plane, 0, (uint64_t)need };
     VkImportMemoryFdInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-                                    open("/dev/null", O_RDONLY | O_CLOEXEC) };
+                                    nvmtl_dup_devnull() };
     if (imp.fd < 0) return -1;
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, need, (uint32_t)mt };
     VkDeviceMemory m = VK_NULL_HANDLE;

@@ -1570,13 +1570,22 @@ typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint
 #define NVMTL_BUSY_WAIT_NS  (35ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
+static pid_t nvmtl_my_pid(void) {
+    static pid_t p; static dispatch_once_t o;
+    dispatch_once(&o, ^{ p = getpid(); });
+    return p;
+}
+static const CFStringRef kNvmtlBusyKeys[4] = {
+    CFSTR("NVMTLBusyAt:p0"), CFSTR("NVMTLBusyAt:p1"), CFSTR("NVMTLBusyAt:p2"), CFSTR("NVMTLBusyAt:p3")
+};
 static CFStringRef nvmtl_busy_key(NSUInteger plane) {
-    static const CFStringRef k[4] = { CFSTR("NVMTLBusyAt:p0"), CFSTR("NVMTLBusyAt:p1"), CFSTR("NVMTLBusyAt:p2"), CFSTR("NVMTLBusyAt:p3") };
-    return plane < 4 ? (CFStringRef)CFRetain(k[plane]) : CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane);
+    return plane < 4 ? (CFStringRef)CFRetain(kNvmtlBusyKeys[plane]) : CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane);
 }
 static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *out)
 {
-    CFStringRef k = nvmtl_busy_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
+    CFStringRef k = plane < 4 ? kNvmtlBusyKeys[plane] : nvmtl_busy_key(plane);
+    CFTypeRef v = IOSurfaceCopyValue(surf, k);
+    if (plane >= 4) CFRelease(k);
     nvmtl_busy_tag t = { 0, 0, 0, 0, 0, 0 };
     int ok = v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)v) == (CFIndex)sizeof t;
     if (ok) memcpy(&t, CFDataGetBytePtr((CFDataRef)v), sizeof t);
@@ -1587,19 +1596,29 @@ static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *
 }
 static void nvmtl_busy_write(IOSurfaceRef surf, NSUInteger plane, uint64_t seq, int done)
 {
-    nvmtl_busy_tag t = { NVMTL_BUSY_MAGIC, (uint32_t)done, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), seq, getpid(), 0 };
+    nvmtl_busy_tag t = { NVMTL_BUSY_MAGIC, (uint32_t)done, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), seq, (int32_t)nvmtl_my_pid(), 0 };
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_busy_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
-static int nvmtl_busy_foreign(IOSurfaceRef surf, NSUInteger plane)
+static int nvmtl_busy_probe(IOSurfaceRef surf, NSUInteger plane, int *done_out)
 {
     nvmtl_busy_tag t;
-    return nvmtl_busy_read(surf, plane, &t) && t.pid != getpid();
+    if (!nvmtl_busy_read(surf, plane, &t) || t.pid == (int32_t)nvmtl_my_pid()) {
+        if (done_out) *done_out = 0;
+        return 0;
+    }
+    if (done_out) *done_out = (t.done != 0);
+    return 1;
+}
+static int nvmtl_busy_foreign(IOSurfaceRef surf, NSUInteger plane)
+{
+    return nvmtl_busy_probe(surf, plane, NULL);
 }
 static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
 {
     nvmtl_busy_tag t;
-    if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+    const int32_t me = (int32_t)nvmtl_my_pid();
+    if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == me) return;
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
     for (;;) {
@@ -1609,18 +1628,25 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
         } else {
             usleep(NVMTL_BUSY_POLL_US);
         }
-        if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+        if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == me) return;
         const uint64_t now2 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
         if (now2 - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now2 && now2 - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
     }
 }
 // Shared family-VRAM imports (nvmtl_import_cache.h). OFF unless NVMTL_SURF_IMPORT_CACHE=1: it is proven by
 // tools/test_import_cache.c, but its effect on screen capture has to be measured on a card before it is the default.
-// NVMTL_SURF_IMPORT_CACHE_IDLE_MS (default 750) is how long an import outlives its last wrapper; surfaces larger than
-// NVMTL_SURF_IMPORT_CACHE_MAX_MB (default 64, 16 below 8 GB of VRAM) are imported per wrapper as without the cache.
+// nitro-perf v6: Each live cache slot retains IOSurfaceRef via CFRetain(surf) until evicted/expired, preventing XNU
+// IOSurfaceRoot from recycling the IOSurfaceID while cached and eliminating per-hit IOSurfaceCopyValue/SetValue IOKit traps.
+// It also caches the last known-current plane-0 VRAM seed to skip redundant nvmtl_vram_tag_current traps on unchanged frames.
 #include "nvmtl_import_cache.h"
 #include <os/lock.h>
-_Static_assert(sizeof(nvk_buffer) <= NVMTL_IC_PAYLOAD, "an import cache slot must hold a whole nvk_buffer");
+typedef struct {
+    nvk_buffer buf;
+    IOSurfaceRef surf;
+    uint32_t vram_seed;
+    uint8_t vram_seed_ok;
+} nvmtl_ic_val;
+_Static_assert(sizeof(nvmtl_ic_val) <= NVMTL_IC_PAYLOAD, "an import cache slot must hold nvmtl_ic_val");
 static nvmtl_ic g_ic;
 static os_unfair_lock g_ic_lock = OS_UNFAIR_LOCK_INIT;
 static uint64_t nvmtl_ic_env_u64(const char *name, uint64_t def)
@@ -1635,11 +1661,20 @@ static int nvmtl_ic_on(void)
                   nvlog("family VRAM import cache %s (NVMTL_SURF_IMPORT_CACHE=%s)", on ? "on" : "off", e ?: "unset"); }
     return on;
 }
-static uint64_t nvmtl_ic_idle_ns(void) { static uint64_t v; static dispatch_once_t o; dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_IDLE_MS", 2000) * 1000000ull; }); return v; }
+static uint64_t nvmtl_ic_idle_ns(void)
+{
+    static uint64_t v; static dispatch_once_t o;
+    dispatch_once(&o, ^{
+        const char *pn = getprogname();
+        const uint64_t def_ms = (pn && strcmp(pn, "WindowServer") == 0) ? 8000ull : 2000ull;
+        v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_IDLE_MS", def_ms) * 1000000ull;
+    });
+    return v;
+}
 static uint64_t nvmtl_ic_max_bytes(void)
 {
     static uint64_t v; static dispatch_once_t o;
-    dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_MAX_MB", nvmtl_vk_vram_bytes() >= (8ull << 30) ? 64 : 32) << 20; });
+    dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_MAX_MB", nvmtl_vk_vram_bytes() >= (8ull << 30) ? 64 : 48) << 20; });
     return v;
 }
 static size_t nvmtl_ic_budget_bytes(void)
@@ -1653,20 +1688,6 @@ static size_t nvmtl_ic_budget_bytes(void)
         v = (size_t)(nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_BUDGET_MB", def_mb) << 20);
     });
     return v;
-}
-// The cookie an import stores in its surface; a surface id that is reused after the surface is freed carries none.
-static CFStringRef nvmtl_ic_key(void)
-{
-    static CFStringRef k; static dispatch_once_t o;
-    dispatch_once(&o, ^{ k = CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLImport.%d"), (int)getpid()); });
-    return k;
-}
-static uint64_t nvmtl_ic_cookie_read(IOSurfaceRef surf)
-{
-    uint64_t c = 0; CFTypeRef v = IOSurfaceCopyValue(surf, nvmtl_ic_key());
-    if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &c);
-    if (v) CFRelease(v);
-    return c;
 }
 static dispatch_queue_t nvmtl_ic_reap_queue(void)
 {
@@ -1760,18 +1781,28 @@ static void nvmtl_ic_img_try_park(const nvk_buffer *vb, nvk_image *img, const ui
 }
 static void nvmtl_ic_destroy_all(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
 {
-    for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_ic_img_purge(b.buf); nvmtl_vk_buffer_destroy(&b); }
+    for (int i = 0; i < n; i++) {
+        nvmtl_ic_val v;
+        memcpy(&v, gone[i], sizeof v);
+        nvmtl_ic_img_purge(v.buf.buf);
+        nvmtl_vk_buffer_destroy(&v.buf);
+        if (v.surf) CFRelease(v.surf);
+    }
 }
-// Offload RM free ioctls for expired/evicted surface imports off WindowServer's compositor thread.
+// Offload RM free ioctls and IOSurface releases for expired/evicted surface imports off WindowServer's compositor thread.
 static void nvmtl_ic_destroy_async(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
 {
     if (n <= 0) return;
-    nvk_buffer *bufs = (nvk_buffer *)malloc((size_t)n * sizeof *bufs);
-    if (!bufs) { nvmtl_ic_destroy_all(gone, n); return; }
-    for (int i = 0; i < n; i++) memcpy(&bufs[i], gone[i], sizeof bufs[i]);
+    nvmtl_ic_val *vals = (nvmtl_ic_val *)malloc((size_t)n * sizeof *vals);
+    if (!vals) { nvmtl_ic_destroy_all(gone, n); return; }
+    for (int i = 0; i < n; i++) memcpy(&vals[i], gone[i], sizeof vals[i]);
     dispatch_async(nvmtl_ic_reap_queue(), ^{
-        for (int i = 0; i < n; i++) { nvmtl_ic_img_purge(bufs[i].buf); nvmtl_vk_buffer_destroy(&bufs[i]); }
-        free(bufs);
+        for (int i = 0; i < n; i++) {
+            nvmtl_ic_img_purge(vals[i].buf.buf);
+            nvmtl_vk_buffer_destroy(&vals[i].buf);
+            if (vals[i].surf) CFRelease(vals[i].surf);
+        }
+        free(vals);
     });
 }
 static _Atomic uint64_t g_ic_next_expire;
@@ -1806,38 +1837,59 @@ static void nvmtl_ic_flush_pressure(int critical)
         }
     } while (n == 32);
 }
+static void nvmtl_ic_note_vram_seed(void *vbuf, uint32_t seed)
+{
+    if (!vbuf || !nvmtl_ic_on()) return;
+    os_unfair_lock_lock(&g_ic_lock);
+    for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+        nvmtl_ic_slot *e = &g_ic.s[i];
+        if (e->id == (uintptr_t)vbuf && !e->stale) {
+            nvmtl_ic_val v;
+            memcpy(&v, e->payload, sizeof v);
+            v.vram_seed = seed;
+            v.vram_seed_ok = 1;
+            memcpy(e->payload, &v, sizeof v);
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&g_ic_lock);
+}
 // The plane-0 family VRAM of `surf` as a buffer: the shared import when the cache is on and has one, else a new import.
 // Release with nvmtl_ic_put. 0 = ok.
-static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
+static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out, uint32_t *cached_seed, int *has_cached_seed)
 {
+    if (has_cached_seed) *has_cached_seed = 0;
     const uint32_t sid = IOSurfaceGetID(surf);
     if (!nvmtl_ic_on() || need > nvmtl_ic_max_bytes()) return nvmtl_vk_surface_vram(sid, 0, need, out);
-    // Check in-memory table first so misses skip the IOSurfaceCopyValue IOKit trap completely.
+    // Holding CFRetain(surf) inside the live cache slot prevents XNU IOSurfaceRoot from recycling sid
+    // until after the slot is removed from g_ic, so a zero-trap user-space geometry cookie suffices.
+    const uint64_t cookie = (uint64_t)IOSurfaceGetAllocSize(surf) ^ ((uint64_t)IOSurfaceGetBytesPerRow(surf) << 32);
+    nvmtl_ic_val val;
     os_unfair_lock_lock(&g_ic_lock);
-    const int maybe = nvmtl_ic_has_sid(&g_ic, sid, need);
+    const int hit = nvmtl_ic_acquire(&g_ic, sid, need, cookie, &val, sizeof val);
     os_unfair_lock_unlock(&g_ic_lock);
-    if (maybe) {
-        const uint64_t have = nvmtl_ic_cookie_read(surf);
-        if (have) {
-            os_unfair_lock_lock(&g_ic_lock);
-            const int hit = nvmtl_ic_acquire(&g_ic, sid, need, have, out, sizeof *out);
-            os_unfair_lock_unlock(&g_ic_lock);
-            if (hit) return 0;
+    if (hit) {
+        *out = val.buf;
+        if (has_cached_seed && val.vram_seed_ok) {
+            *has_cached_seed = 1;
+            if (cached_seed) *cached_seed = val.vram_seed;
         }
+        return 0;
     }
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t next_exp = atomic_load_explicit(&g_ic_next_expire, memory_order_relaxed);
     if (now >= next_exp && atomic_compare_exchange_strong(&g_ic_next_expire, &next_exp, now + 500000000ull))
         nvmtl_ic_expire_now();
     if (nvmtl_vk_surface_vram(sid, 0, need, out)) return -1;
-    static _Atomic uint64_t next = 1;
-    const uint64_t cookie = ((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu);
-    CFNumberRef cn = CFNumberCreate(NULL, kCFNumberSInt64Type, &cookie); IOSurfaceSetValue(surf, nvmtl_ic_key(), cn); CFRelease(cn);
+    memset(&val, 0, sizeof val);
+    val.buf = *out;
+    val.surf = (IOSurfaceRef)CFRetain(surf);
     unsigned char evicted[NVMTL_IC_PAYLOAD], budget_gone[16][NVMTL_IC_PAYLOAD]; uintptr_t evicted_id = 0; int nb = 0;
     os_unfair_lock_lock(&g_ic_lock);
-    nvmtl_ic_insert(&g_ic, sid, need, cookie, (uintptr_t)out->buf, out, sizeof *out, evicted, &evicted_id);
+    const int kept = nvmtl_ic_insert(&g_ic, sid, need, cookie, (uintptr_t)out->buf, &val, sizeof val, evicted, &evicted_id);
     nb = nvmtl_ic_evict_budget(&g_ic, nvmtl_ic_budget_bytes(), budget_gone, 16);
     os_unfair_lock_unlock(&g_ic_lock);
+    if (!kept) CFRelease(val.surf);
     if (evicted_id) nvmtl_ic_destroy_async(&evicted, 1);
     if (nb) nvmtl_ic_destroy_async(budget_gone, nb);
     return 0;
@@ -1864,15 +1916,19 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
-            if (!nvmtl_ic_get(surf, row * h, &vb)) {
+            uint32_t cseed = 0; int has_cseed = 0;
+            if (!nvmtl_ic_get(surf, row * h, &vb, &cseed, &has_cseed)) {
                 const uint32_t ikey[7] = { w, h, vkf, bpp, (uint32_t)(a8 != 0), (uint32_t)(stex != 0), (uint32_t)row };
                 if (!nvmtl_ic_img_take(vb.buf, vb.mem, ikey, &t->_i) ||
                     !nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
                     memcpy(t->_pkey, ikey, sizeof ikey);
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
-                    int current = nvmtl_vram_tag_current(surf, 0, seed);
-                    if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    int current = (has_cseed && cseed == seed) ? 1 : nvmtl_vram_tag_current(surf, 0, seed);
+                    if (current) {
+                        t->_surfSeed = seed; t->_surfSynced = YES;
+                        if (!has_cseed || cseed != seed) nvmtl_ic_note_vram_seed(vb.buf, seed);
+                    }
                     static unsigned n; if (n++ < 8 || n % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
@@ -1916,18 +1972,29 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
     return usage;
 }
 
+static os_unfair_lock g_surf_sync_lock = OS_UNFAIR_LOCK_INIT;
+static NSMapTable *g_surf_sync_monitors;
+static id nvmtl_surface_sync_for(IOSurfaceRef surf, NSUInteger plane) {
+    NSNumber *key = @(((unsigned long long)IOSurfaceGetID(surf) << 8) | ((unsigned long long)plane & 0xff));
+    os_unfair_lock_lock(&g_surf_sync_lock);
+    if (!g_surf_sync_monitors) g_surf_sync_monitors = [NSMapTable strongToWeakObjectsMapTable];
+    id monitor = [g_surf_sync_monitors objectForKey:key];
+    if (!monitor) {
+        monitor = [NSObject new];
+        [g_surf_sync_monitors setObject:monitor forKey:key];
+    }
+    os_unfair_lock_unlock(&g_surf_sync_lock);
+    return monitor;
+}
+
 static char nvmtl_surface_cache_key;
 static os_unfair_lock g_surf_priv_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint64_t g_surf_priv_bloom;
+static inline uint64_t nvmtl_sid_bloom_bit(uint32_t sid) {
+    return 1ull << ((sid ^ (sid >> 6)) & 63u);
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
-    NSMapTable *cache = nil;
-    os_unfair_lock_lock(&g_surf_priv_lock);
-    cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
-    if (!cache) {
-        cache = [NSMapTable strongToWeakObjectsMapTable];
-        objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    os_unfair_lock_unlock(&g_surf_priv_lock);
-    return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
+    return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:nil];
 }
 - (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
     if (nvmtl_vk_init()) return nil;
@@ -1950,10 +2017,12 @@ static os_unfair_lock g_surf_priv_lock = OS_UNFAIR_LOCK_INIT;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     NSArray *key = nil;
     NVMTLTexture *backing = nil;
-    if (surf) {
+    const uint32_t sid = surf ? (uint32_t)IOSurfaceGetID(surf) : 0u;
+    if (surf && (atomic_load_explicit(&g_surf_priv_bloom, memory_order_acquire) & nvmtl_sid_bloom_bit(sid))) {
         os_unfair_lock_lock(&g_surf_priv_lock);
-        if (cache.count > 0) {
-            key = @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
+        if (!cache) cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+        if (cache && cache.count > 0) {
+            key = @[@(sid), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
             backing = [cache objectForKey:key];
         }
         os_unfair_lock_unlock(&g_surf_priv_lock);
@@ -1973,16 +2042,34 @@ static os_unfair_lock g_surf_priv_lock = OS_UNFAIR_LOCK_INIT;
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
-    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, plane) != 0; }
+    t->_surf = surf;
+    if (surf) {
+        CFRetain(surf);
+        t->_surfOwned = YES;
+        int busyDone = 0;
+        if (nvmtl_busy_probe(surf, plane, &busyDone)) {
+            t->_clientWritten = YES;
+            t->_busyDoneAtWrap = (busyDone != 0);
+        }
+        t->_surfSync = nvmtl_surface_sync_for(surf, plane);
+    }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage == 1;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
     if (surf && !t->_vramOn) {
-        if (!key) key = @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
+        if (!key) key = @[@(sid), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
         os_unfair_lock_lock(&g_surf_priv_lock);
+        if (!cache) {
+            cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+            if (!cache) {
+                cache = [NSMapTable strongToWeakObjectsMapTable];
+                objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
         [cache setObject:t forKey:key];
+        atomic_fetch_or_explicit(&g_surf_priv_bloom, nvmtl_sid_bloom_bit(sid), memory_order_release);
         os_unfair_lock_unlock(&g_surf_priv_lock);
     }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",

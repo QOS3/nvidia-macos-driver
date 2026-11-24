@@ -65,6 +65,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void *)nvview;
 - (void *)nvsampleview;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInForCbSeq:(uint64_t)cbSeq;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end
@@ -357,8 +358,8 @@ BOOL nvmtl_air_grid_only(NVMTLFunction *fn);
 @interface NVMTLBuffer () { @public BOOL _subPlaced; } @end
 typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_park_t;
 @interface NVMTLTexture () { @public BOOL _subPlaced, _parkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
-@interface NVMTLTexture () { @public BOOL _clientWritten; } @end
-@interface NVMTLCommandBuffer () { @public NSDictionary *_busyMarks; } @end
+@interface NVMTLTexture () { @public BOOL _clientWritten, _busyDoneAtWrap; id _surfSync; uint64_t _busyCheckedCb; } @end
+@interface NVMTLCommandBuffer () { @public NSDictionary *_busyMarks; uint64_t _cbSeq; } @end
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 // Lazy backing: _lzc = slot size (0 = the heap owns one _hm of its full size). _lzo[slot] = 1 + index into _lzm/_lzb (0 = no
 // memory yet); one backing may cover several slots (a resource larger than a slot gets one backing for all of them).

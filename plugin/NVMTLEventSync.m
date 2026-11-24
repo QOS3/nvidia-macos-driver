@@ -45,39 +45,48 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
 static NSMapTable *nvmtl_surface_writers;
+static os_unfair_lock g_surf_writers_lock = OS_UNFAIR_LOCK_INIT;
+static uint32_t g_surf_writers_entries;
+static _Atomic uint32_t g_surf_writers_count;
 // surface id and plane in one tagged NSNumber: no allocation on the per-bind path (it was a formatted string)
 static id nvmtl_surface_writer_key(NVMTLTexture *t) {
     return @(((unsigned long long)IOSurfaceGetID(t->_surf) << 8) | ((unsigned long long)t->_plane & 0xff));
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t || !t->_surf) return NO;
-    @synchronized ([NVMTLCommandBuffer class]) {
-        id key = nvmtl_surface_writer_key(t);
-        for (id queue in nvmtl_surface_writers.keyEnumerator) {
-            NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
-            NVMTLPendingSurfaceWrite *write = writes[key];
-            NVMTLCommandBuffer *writer = write ? write->buffer : nil;
-            NVMTLTexture *backing = write ? write->texture : nil;
-            const BOOL sameBacking = backing && (backing == t || (backing->_vramOn && t->_vramOn));
-            if (writer && writer != cb && sameBacking && write->seed == IOSurfaceGetSeed(t->_surf)) return YES;
-        }
-        return NO;
+    if (!atomic_load_explicit(&g_surf_writers_count, memory_order_acquire)) return NO;
+    id key = nvmtl_surface_writer_key(t);
+    const uint32_t seed = IOSurfaceGetSeed(t->_surf);
+    BOOL found = NO;
+    os_unfair_lock_lock(&g_surf_writers_lock);
+    for (id queue in nvmtl_surface_writers.keyEnumerator) {
+        NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
+        NVMTLPendingSurfaceWrite *write = writes[key];
+        NVMTLCommandBuffer *writer = write ? write->buffer : nil;
+        NVMTLTexture *backing = write ? write->texture : nil;
+        const BOOL sameBacking = backing && (backing == t || (backing->_vramOn && t->_vramOn));
+        if (writer && writer != cb && sameBacking && write->seed == seed) { found = YES; break; }
     }
+    os_unfair_lock_unlock(&g_surf_writers_lock);
+    return found;
 }
 static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
-    // The same lock as pending_write and finish_writes, taken here too: the map is shared with the completion thread, and
-    // its one caller holding this (recursive) lock today must not be what keeps WindowServer's heap intact.
-    @synchronized ([NVMTLCommandBuffer class]) {
-        if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
-        NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
-        for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
-            if (!t->_surf) continue;
-            if (!writes) { writes = [NSMutableDictionary new]; [nvmtl_surface_writers setObject:writes forKey:cb->_queue]; }
-            NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
-            write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
-            writes[nvmtl_surface_writer_key(t)] = write;
-        }
+    // Dedicated leaf lock (separate from [NVMTLCommandBuffer class]) so per-bind pending_write checks
+    // never stall behind vkQueueSubmit on nvmtl.ahead / nvmtl.execution.
+    os_unfair_lock_lock(&g_surf_writers_lock);
+    if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
+    NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+    for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
+        if (!t->_surf) continue;
+        if (!writes) { writes = [NSMutableDictionary new]; [nvmtl_surface_writers setObject:writes forKey:cb->_queue]; }
+        NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
+        write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
+        id key = nvmtl_surface_writer_key(t);
+        if (!writes[key]) g_surf_writers_entries++;
+        writes[key] = write;
     }
+    atomic_store_explicit(&g_surf_writers_count, g_surf_writers_entries, memory_order_release);
+    os_unfair_lock_unlock(&g_surf_writers_lock);
 }
 // WindowServer frame completion, with NVAccel's nvSurfGpuEscape: each surface a WindowServer command buffer renders is
 // marked pending when it commits and ready when the GPU has finished it, and the swap waits for that in the kernel, off
@@ -271,14 +280,20 @@ static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
 }
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
-    @synchronized ([NVMTLCommandBuffer class]) {
-        NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+    os_unfair_lock_lock(&g_surf_writers_lock);
+    NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+    if (writes) {
         for (id key in [writes.allKeys copy]) {
             NVMTLPendingSurfaceWrite *write = writes[key];
-            if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
+            if (!write->buffer || write->buffer == cb) {
+                [writes removeObjectForKey:key];
+                if (g_surf_writers_entries > 0) g_surf_writers_entries--;
+            }
         }
         if (!writes.count) [nvmtl_surface_writers removeObjectForKey:cb->_queue];
+        atomic_store_explicit(&g_surf_writers_count, g_surf_writers_entries, memory_order_release);
     }
+    os_unfair_lock_unlock(&g_surf_writers_lock);
 }
 
 static NSMutableDictionary *nvmtl_busy_latest;

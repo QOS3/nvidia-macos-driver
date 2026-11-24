@@ -1336,7 +1336,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     // Importing the old CPU surface here would run ahead of this buffer and
     // overwrite that earlier GPU write. Queue order or the application's event supplies the dependency.
     if (nvmtl_surface_pending_write(cb, r)) return;
-    [t nvmtlSurfaceIn];
+    [t nvmtlSurfaceInForCbSeq:cb ? cb->_cbSeq : 0];
 }
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
 static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -1565,19 +1565,14 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
 // this process's GPU readback and CPU import. Every wrapper of one plane must
 // use the same monitor, including wrappers of shared family VRAM.
 static id nvmtl_surface_sync(NVMTLTexture *t) {
-    static char key;
-    static NSMapTable *monitors;
-    @synchronized ([NVMTLTexture class]) {
-        id monitor = objc_getAssociatedObject(t, &key);
-        if (!monitor) {
-            if (!monitors) monitors = [NSMapTable strongToWeakObjectsMapTable];
-            NSArray *surface = @[@(IOSurfaceGetID(t->_surf)), @(t->_plane)];
-            monitor = [monitors objectForKey:surface];
-            if (!monitor) { monitor = [NSObject new]; [monitors setObject:monitor forKey:surface]; }
-            objc_setAssociatedObject(t, &key, monitor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        return monitor;
-    }
+    id monitor = t->_surfSync;
+    if (monitor) return monitor;
+    monitor = nvmtl_surface_sync_for(t->_surf, t->_plane);
+    os_unfair_lock_lock(&g_surf_sync_lock);
+    if (!t->_surfSync) t->_surfSync = monitor;
+    else monitor = t->_surfSync;
+    os_unfair_lock_unlock(&g_surf_sync_lock);
+    return monitor;
 }
 // NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages.
 // In apps (not WindowServer), planes <= NVMTL_SURFIN_HOST_MIN_KB (default 4096 KB = NVMTL_POOL_MAX) use the async
@@ -1665,15 +1660,32 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
         if (base && row >= span && rows >= _i.h) { [self nvmtlY422Upload:0 rows:_i.h]; _y422Synced = YES; }
     }
 }
-- (void)nvmtlSurfaceIn {
+- (void)nvmtlSurfaceIn { [self nvmtlSurfaceInForCbSeq:0]; }
+- (void)nvmtlSurfaceInForCbSeq:(uint64_t)cbSeq {
     if (_y422Surf) { [self nvmtlY422SurfaceIn]; return; }
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
     @synchronized (nvmtl_surface_sync(r)) {
-    if (r->_clientWritten) nvmtl_busy_wait(r->_surf, r->_plane);
+    if (r->_clientWritten) {
+        if (cbSeq && r->_busyCheckedCb == cbSeq) {
+            // Already verified done in this command buffer.
+        } else if (cbSeq && r->_busyDoneAtWrap && r->_busyCheckedCb == 0) {
+            r->_busyDoneAtWrap = NO;
+            r->_busyCheckedCb = cbSeq;
+        } else {
+            nvmtl_busy_wait(r->_surf, r->_plane);
+            r->_busyDoneAtWrap = NO;
+            if (cbSeq) r->_busyCheckedCb = cbSeq;
+        }
+    }
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
-    if (!r->_clientWritten && nvmtl_busy_foreign(r->_surf, r->_plane)) { r->_clientWritten = YES; nvmtl_busy_wait(r->_surf, r->_plane); }
+    if (!r->_clientWritten && nvmtl_busy_foreign(r->_surf, r->_plane)) {
+        r->_clientWritten = YES;
+        nvmtl_busy_wait(r->_surf, r->_plane);
+        r->_busyDoneAtWrap = NO;
+        if (cbSeq) r->_busyCheckedCb = cbSeq;
+    }
     if (r->_surfSynced && !r->_vramOn && vgen == r->_surfGen && nvmtl_plane_seed_on()) {
         // the seed moved, but only through our own surface-outs of other planes: this plane's image is still current
         const uint32_t now = IOSurfaceGetSeed(r->_surf);
@@ -1691,6 +1703,7 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     { uint32_t now = IOSurfaceGetSeed(r->_surf);
       if (r->_vramOn && nvmtl_vram_tag_current(r->_surf, r->_plane, now)) {
           r->_surfSeed = now; r->_surfSynced = YES; g_surfin_skip++;
+          if (r->_plane == 0 && r->_vramBuf.buf) nvmtl_ic_note_vram_seed(r->_vramBuf.buf, now);
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
     uint32_t seed = 0;
@@ -1709,7 +1722,11 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
     r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
-    g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+    g_surfin_copy++;
+    if (r->_vramOn) {
+        nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+        if (r->_plane == 0 && r->_vramBuf.buf) nvmtl_ic_note_vram_seed(r->_vramBuf.buf, seed);
+    }
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
     }
 }
@@ -1735,6 +1752,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
             if (r->_surfSeed != seed) return;
             const uint32_t now = IOSurfaceGetSeed(r->_surf);
             r->_surfSeed = now; r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, now);
+            if (r->_vramOn && r->_plane == 0 && r->_vramBuf.buf) nvmtl_ic_note_vram_seed(r->_vramBuf.buf, now);
         }
     });
 }
@@ -1756,6 +1774,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
         r->_surfSeed = seed; r->_surfSynced = YES;
         r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, seed);
+        if (r->_plane == 0 && r->_vramBuf.buf) nvmtl_ic_note_vram_seed(r->_vramBuf.buf, seed);
         if (dirtied && marked > 0) nvmtl_surface_remark_later(r, seed);
         static unsigned nd; if (nd++ < 6 || nd % 5000 == 0) nvlog("surface-out -> dirty, no copy (%ux%u surface %u seed %u, #%u)", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), seed, nd);
         return YES;
@@ -1785,7 +1804,10 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
     r->_surfSeed = seed; r->_surfSynced = YES;
     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
-    if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+    if (r->_vramOn && !lockopt) {
+        nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+        if (r->_plane == 0 && r->_vramBuf.buf) nvmtl_ic_note_vram_seed(r->_vramBuf.buf, seed);
+    }
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-out #%u: %ux%u surface %p seed %u, %.2f ms", n, r->_i.w, r->_i.h,
         (void *)r->_surf, seed, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6);
     return YES;
@@ -7532,6 +7554,8 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (unsigned long long)protectionOptions { return 0; }
 - (instancetype)init {
     if ((self = [super init])) {
+        static _Atomic uint64_t g_cb_seq;
+        _cbSeq = atomic_fetch_add_explicit(&g_cb_seq, 1, memory_order_relaxed) + 1;
         _completionCondition = [NSCondition new];
         // Made here, never lazily: two threads encoding into one command buffer could each find it nil and store
         // their own set, and the set that lost was freed with the resources only it held (and under the other
@@ -7832,9 +7856,11 @@ static void nvmtl_late_present(void) {
     nvmtl_res2_cb_done(self);
     if (!_committed && _c.cb) nvmtl_vk_cmd_abandon(&_c);
     [self nvmtlReleaseCapacity];
-    @synchronized ([NVMTLCommandBuffer class]) {
-        [self nvmtlReleaseReservation];
-        nvmtl_pump_buffers();
+    if (_reservation) {
+        @synchronized ([NVMTLCommandBuffer class]) {
+            [self nvmtlReleaseReservation];
+            nvmtl_pump_buffers();
+        }
     }
 }
 - (CFTimeInterval)GPUStartTime {

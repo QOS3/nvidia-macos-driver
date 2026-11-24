@@ -20,12 +20,13 @@ typedef struct {
     unsigned char payload[NVMTL_IC_PAYLOAD];
     int refs, stale; uint64_t idle_since;
 } nvmtl_ic_slot;
-typedef struct { nvmtl_ic_slot s[NVMTL_IC_SLOTS]; size_t total_bytes; } nvmtl_ic;
+typedef struct { nvmtl_ic_slot s[NVMTL_IC_SLOTS]; uint32_t sids[NVMTL_IC_SLOTS]; size_t total_bytes; } nvmtl_ic;
 
-/* Fast in-memory presence check so cache misses skip the IOSurfaceCopyValue IOKit trap completely. */
+/* Fast in-memory presence check scanning the L1-hot sids array (1 KB) before touching full slots. */
 static inline int nvmtl_ic_has_sid(const nvmtl_ic *c, uint32_t sid, size_t need)
 {
     for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+        if (c->sids[i] != sid) continue;
         const nvmtl_ic_slot *e = &c->s[i];
         if (e->id && e->sid == sid && e->need == need && !e->stale) return 1;
     }
@@ -38,9 +39,10 @@ static inline int nvmtl_ic_has_sid(const nvmtl_ic *c, uint32_t sid, size_t need)
 static inline int nvmtl_ic_acquire(nvmtl_ic *c, uint32_t sid, size_t need, uint64_t cookie, void *payload, size_t n)
 {
     for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
+        if (c->sids[i] != sid) continue;
         nvmtl_ic_slot *e = &c->s[i];
         if (!e->id || e->sid != sid || e->need != need || e->stale) continue;
-        if (e->cookie != cookie) { e->stale = 1; continue; }
+        if (e->cookie != cookie) { e->stale = 1; c->sids[i] = 0; continue; }
         e->refs++; memcpy(payload, e->payload, n < NVMTL_IC_PAYLOAD ? n : NVMTL_IC_PAYLOAD);
         return 1;
     }
@@ -65,6 +67,7 @@ static inline int nvmtl_ic_insert(nvmtl_ic *c, uint32_t sid, size_t need, uint64
     nvmtl_ic_slot *e = &c->s[slot];
     memset(e, 0, sizeof *e);
     e->sid = sid; e->need = need; e->cookie = cookie; e->id = id; e->refs = 1;
+    c->sids[slot] = sid;
     memcpy(e->payload, payload, n < NVMTL_IC_PAYLOAD ? n : NVMTL_IC_PAYLOAD);
     c->total_bytes += need;
     return 1;
@@ -81,7 +84,7 @@ static inline int nvmtl_ic_release(nvmtl_ic *c, uintptr_t id, uint64_t now, void
         e->idle_since = now;
         if (!e->stale) return 1;
         c->total_bytes = c->total_bytes >= e->need ? c->total_bytes - e->need : 0;
-        memcpy(gone, e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e);
+        memcpy(gone, e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e); c->sids[i] = 0;
         return 2;
     }
     return 0;
@@ -96,7 +99,7 @@ static inline int nvmtl_ic_expire(nvmtl_ic *c, uint64_t now, uint64_t idle_ns, i
         if (!e->id || e->refs) continue;
         if (!(all || e->stale || (now >= e->idle_since && now - e->idle_since > idle_ns))) continue;
         c->total_bytes = c->total_bytes >= e->need ? c->total_bytes - e->need : 0;
-        memcpy(out[n++], e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e);
+        memcpy(out[n++], e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e); c->sids[i] = 0;
     }
     return n;
 }
@@ -116,7 +119,7 @@ static inline int nvmtl_ic_evict_budget(nvmtl_ic *c, size_t max_total_bytes, uns
         if (pick < 0) break;
         nvmtl_ic_slot *e = &c->s[pick];
         c->total_bytes = c->total_bytes >= e->need ? c->total_bytes - e->need : 0;
-        memcpy(out[n++], e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e);
+        memcpy(out[n++], e->payload, NVMTL_IC_PAYLOAD); memset(e, 0, sizeof *e); c->sids[pick] = 0;
     }
     return n;
 }
