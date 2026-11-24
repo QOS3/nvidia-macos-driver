@@ -2642,11 +2642,99 @@ void NVRMUserClient::free(void)
 // reads the per-file list, and nv_free_user_mapping is a no-op here, so consuming the node takes nothing RM needs.
 // The pages stay alive through the descriptor, not the node (see nv_inc_alloc_refcount in os-xnu2.cpp).
 #include "nvrm_tok_table.h"
+#include "nvrm_surf_meta_abi.h"
 static const uint32_t kNvMapTokenBit = 0x80000000u;
 static const unsigned kNvMapTokensPerClient = 4096;
+
+// nitro-perf v8: Shared lock-free surface metadata page (NVRM_SURF_META_MEM_TYPE).
+// Lazily allocated once for the kext's lifetime; contains only advisory userspace metadata (no kernel pointers).
+static IOBufferMemoryDescriptor *gSurfMetaMd = nullptr;
+static nvrm_surf_meta_page *gSurfMetaPage = nullptr;
+static IOLock *gSurfMetaKLock = nullptr;
+#define NVRM_SM_KTRACK_WAYS 8u
+struct NvrmSurfKTrackEntry { uint32_t sid; uint32_t hSrcMem; };
+static NvrmSurfKTrackEntry gSurfMetaKTrack[NVRM_SURF_META_BUCKETS * NVRM_SM_KTRACK_WAYS];
+static uint8_t gSurfMetaKOverflow[NVRM_SURF_META_BUCKETS];
+static uint8_t gSurfMetaKNext[NVRM_SURF_META_BUCKETS];
+
+static IOBufferMemoryDescriptor *nvrmSurfMetaDescriptor(void)
+{
+    IOBufferMemoryDescriptor *md = __atomic_load_n(&gSurfMetaMd, __ATOMIC_ACQUIRE);
+    if (md) return md;
+    IOBufferMemoryDescriptor *cand = IOBufferMemoryDescriptor::inTaskWithOptions(
+        kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, NVRM_SURF_META_BYTES, PAGE_SIZE);
+    if (!cand) return nullptr;
+    if (cand->prepare() != kIOReturnSuccess) { cand->release(); return nullptr; }
+    nvrm_surf_meta_page *pg = (nvrm_surf_meta_page *)cand->getBytesNoCopy();
+    if (!pg) { cand->complete(); cand->release(); return nullptr; }
+    nvu_zero(pg, NVRM_SURF_META_BYTES);
+    pg->hdr.magic = NVRM_SURF_META_MAGIC;
+    pg->hdr.version = NVRM_SURF_META_VERSION;
+    pg->hdr.buckets = NVRM_SURF_META_BUCKETS;
+    pg->hdr.ways = NVRM_SURF_META_WAYS;
+    if (!__atomic_compare_exchange_n(&gSurfMetaMd, &md, cand, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        cand->complete(); cand->release();
+        return md;
+    }
+    __atomic_store_n(&gSurfMetaPage, pg, __ATOMIC_RELEASE);
+    return cand;
+}
+
+static void nvrmSurfMetaNoteVram(uint32_t sid, uint32_t plane, uint32_t hSrcMem)
+{
+    nvrm_surf_meta_page *pg = __atomic_load_n(&gSurfMetaPage, __ATOMIC_ACQUIRE);
+    if (!pg || !sid || plane != 0 || !hSrcMem) return;
+    IOLock *lk = __atomic_load_n(&gSurfMetaKLock, __ATOMIC_ACQUIRE);
+    if (!lk) {
+        IOLock *cand = IOLockAlloc();
+        if (!cand) return;
+        if (!__atomic_compare_exchange_n(&gSurfMetaKLock, &lk, cand, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+            IOLockFree(cand);
+        else
+            lk = cand;
+    }
+    const uint32_t b = nvrm_surf_meta_bucket(sid, plane);
+    const uint32_t base = b * NVRM_SM_KTRACK_WAYS;
+    bool invalidate = false;
+    IOLockLock(lk);
+    int found = -1, empty = -1;
+    for (uint32_t w = 0; w < NVRM_SM_KTRACK_WAYS; w++) {
+        if (gSurfMetaKTrack[base + w].sid == sid) { found = (int)w; break; }
+        if (empty < 0 && gSurfMetaKTrack[base + w].sid == 0) empty = (int)w;
+    }
+    if (found >= 0) {
+        if (gSurfMetaKTrack[base + (uint32_t)found].hSrcMem != hSrcMem) {
+            gSurfMetaKTrack[base + (uint32_t)found].hSrcMem = hSrcMem;
+            invalidate = true;
+        }
+    } else {
+        uint32_t dst;
+        if (empty >= 0) {
+            dst = (uint32_t)empty;
+            if (gSurfMetaKOverflow[b]) invalidate = true;
+        } else {
+            dst = gSurfMetaKNext[b]++ & (NVRM_SM_KTRACK_WAYS - 1u);
+            gSurfMetaKOverflow[b] = 1;
+            invalidate = true;
+        }
+        gSurfMetaKTrack[base + dst].sid = sid;
+        gSurfMetaKTrack[base + dst].hSrcMem = hSrcMem;
+    }
+    IOLockUnlock(lk);
+    if (invalidate) nvrm_surf_meta_kernel_invalidate_sid(pg, sid, plane);
+}
+
 IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
     Gate g(fGate);
+    if (type == NVRM_SURF_META_MEM_TYPE) {
+        IOBufferMemoryDescriptor *sMd = nvrmSurfMetaDescriptor();
+        if (!sMd) return kIOReturnNoMemory;
+        sMd->retain();
+        *options |= kIOMapDefaultCache;
+        *memory = sMd;
+        return kIOReturnSuccess;
+    }
     const bool tokenMode = (type & kNvMapTokenBit) != 0;
     // any other type keeps the original behaviour (it was never checked, so nothing is refused that was accepted)
     if (tokenMode) {
@@ -2767,11 +2855,11 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
     *memory = md;
     return kIOReturnSuccess;
 }
-// Selector 7: what this kext supports. bit0 = token mappings (clientMemoryForType above).
+// Selector 7: what this kext supports. bit0 = token mappings (clientMemoryForType above), bit1 = surface-metadata SHM page.
 IOReturn NVRMUserClient::sCaps(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
     if (!OSDynamicCast(NVRMUserClient, target)) return kIOReturnNotAttached;
-    args->scalarOutput[0] = 1;
+    args->scalarOutput[0] = 3;
     return kIOReturnSuccess;
 }
 // Selector 8: forget a token after its mapping is unmapped; drops the descriptor. An unknown token is not an error.
@@ -3005,6 +3093,7 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
             }
         }
         if (sym) accel->callPlatformFunction(sym, false, ss, (void *)current_task(), (void *)(uintptr_t)cmd, NULL);
+        if (cmd == NVRM_ESC_SURF_VRAM && ss->status == 0) nvrmSurfMetaNoteVram(ss->surfaceID, ss->plane, ss->hSrcMemory);
         return kIOReturnSuccess;
     }
     default: {

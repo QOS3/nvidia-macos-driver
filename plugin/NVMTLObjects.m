@@ -366,7 +366,7 @@ static NSMutableSet *nvmtl_identity_set(NSUInteger cap) {
 // while it is listed). Encoders add the same few buffers, pipelines and samplers draw after draw (Apple's GL rebinds its
 // vertex, index and uniform buffers for every draw), and a hit skips the set's hash lookup.
 - (void)addObject:(id)o { if (!o) return; const void *p = (__bridge const void *)o; os_unfair_lock_lock(&_lk);
-    for (unsigned k = 0; k < 8; k++) if (_mru[k] == p) { os_unfair_lock_unlock(&_lk); return; }
+    for (unsigned k = 0; k < 16; k++) if (_mru[k] == p) { os_unfair_lock_unlock(&_lk); return; }
     // A malloc_size() test used to sit here, meant to catch a freed resource before -member: calls
     // -hash on it. It cannot: a freed object's block normally stays a valid block in the default zone,
     // so malloc_size returns its old size and the test passes - while a tagged pointer, or any object
@@ -376,11 +376,11 @@ static NSMutableSet *nvmtl_identity_set(NSUInteger cap) {
     id member = [_s member:o]; BOOL had = member != nil;
     if (!had) { [_s addObject:o]; member = o; }
     // An equal object need not be the object retained by NSMutableSet. Cache only the retained member's address.
-    _mru[_mruNext++ & 7] = (__bridge const void *)member;
+    _mru[_mruNext++ & 15] = (__bridge const void *)member;
     os_unfair_lock_unlock(&_lk); if (!had) nvmtl_resref(o, 1); }
 - (void)removeObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); id member = [_s member:o];
     if (member) [_s removeObject:member];
-    for (unsigned k = 0; k < 8; k++) if (_mru[k] == (__bridge const void *)member) _mru[k] = NULL;
+    for (unsigned k = 0; k < 16; k++) if (_mru[k] == (__bridge const void *)member) _mru[k] = NULL;
     os_unfair_lock_unlock(&_lk); if (member) nvmtl_resref(member, -1); }
 // Clearing, copying and sealing never go through -allObjects. That array is autoreleased into the CALLER's pool, and
 // these run on the app's own commit thread: Geekbench 7 never drains that pool, so every resource a command buffer had
@@ -913,7 +913,10 @@ static void nvmtl_zero_flush(void) {
     } else if (todo.count) nvlog("zero-fill: no command buffer for %lu Private clears - they hold what VRAM held", (unsigned long)todo.count);
     gZeroInFlush = 0;
 }
-static void nvmtl_presubmit(void) { @autoreleasepool { nvmtl_zero_flush(); } @autoreleasepool { nvmtl_managed_flush(); } }
+static void nvmtl_presubmit(void) {
+    if (atomic_load_explicit(&gZeroAny, memory_order_acquire)) { @autoreleasepool { nvmtl_zero_flush(); } }
+    if (atomic_load_explicit(&gManagedAny, memory_order_acquire)) { @autoreleasepool { nvmtl_managed_flush(); } }
+}
 static int nvmtl_mzero_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_MANAGED_EAGER_ZERO"); on = !(e && e[0] == '1');

@@ -4742,7 +4742,7 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LO
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "scanout+cursor the framebuffer itself maps into BAR1");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 
-#define NVRM_VRAM_POOL_MAX_SLOTS 96
+#define NVRM_VRAM_POOL_MAX_SLOTS 128
 #define NVRM_VRAM_POOL_MAX_BYTES_4G (160ull * 1024ull * 1024ull)
 #define NVRM_VRAM_POOL_MAX_BYTES (192ull * 1024ull * 1024ull)
 #define NVRM_VRAM_POOL_MAX_ENTRY (16ull * 1024ull * 1024ull)
