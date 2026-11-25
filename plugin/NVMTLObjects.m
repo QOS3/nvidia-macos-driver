@@ -1768,15 +1768,18 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 // lock is free: a page-off waiting for another surface's pending GPU write holds that lock until the write is released,
 // by the same completion thread that would be blocked here. Taken, the commit's mark stands and the re-mark is retried
 // off this thread (nvmtl_surface_remark_later).
-- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { return [self nvmtlSurfaceOutDirtied:dirtied skipRemark:NO]; }
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied skipRemark:(BOOL)skipRemark {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return YES;
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) { nvtrace("SURFOUT surf %u %ux%u NOT copyable", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h); return NO; }
-    nvtrace("SURFOUT surf %u %ux%u vramOn %d t=%llu", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h, (int)r->_vramOn,
+    nvtrace("SURFOUT surf %u %ux%u vramOn %d skip %d t=%llu", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h, (int)r->_vramOn, (int)skipRemark,
             (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
-    const int marked = !r->_vramOn ? -1 : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)
-                                                   : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
+    const int marked = !r->_vramOn ? -1
+        : (dirtied && skipRemark) ? 0
+        : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)
+                  : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
     if (r->_vramOn && (dirtied || !marked)) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
         r->_surfSeed = seed; r->_surfSynced = YES;
@@ -4151,13 +4154,6 @@ static void nvmtl_sampvar_put(NSData *k, id ps, NVMTLFunction *vf, NVMTLFunction
     g_sampvar[k] = ps;
     pthread_mutex_unlock(&g_sampvar_lock);
 }
-static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
-    static int off = -1; if (off < 0) off = getenv("NVMTL_NO_SAMPKEY") != NULL;
-    if (off || !m.count) return m ?: @{};
-    NSMutableDictionary *o = [NSMutableDictionary dictionaryWithCapacity:m.count];
-    for (NSString *k in m) { NSMutableDictionary *st = [m[k] mutableCopy]; st[@"lod_max_clamp"] = @65504.0f; o[k] = st; }
-    return o;
-}
 // The pixel-sampler tables are keyed by the slot number as a string. Building that string cost an NSNumber and an NSString
 // on every sampler bind, ten percent of an OpenGL render thread in one profile; the sixteen slot keys are made once.
 static NSString *nvmtl_sampler_slot_key(NSUInteger i) {
@@ -4165,28 +4161,75 @@ static NSString *nvmtl_sampler_slot_key(NSUInteger i) {
     dispatch_once(&once, ^{ for (NSUInteger k = 0; k < 16; k++) keys[k] = [NSString stringWithFormat:@"%lu", (unsigned long)k]; });
     return i < 16 ? keys[i] : [NSString stringWithFormat:@"%lu", (unsigned long)i];
 }
-static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *index, NSDictionary *state) {
-    NSDictionary *old = states[index];
-    if (old == state || [old isEqual:state]) return NO;
-    if (state) states[index] = state; else [states removeObjectForKey:index];
-    return YES;
+// nitro-perf v9: process-wide canonical binary key intern table for pixel-coordinate sampler sets.
+// Eliminates per-encoder NSDictionary copies + NSJSONSerialization(SortedKeys) + CFSortIndexes on 144 Hz RunFullDisplayPipe.
+static NSData *nvmtl_pxkey_intern(const uint8_t *bytes, size_t len, uint64_t hash) {
+    enum { kPxKeyCap = 64 };
+    typedef struct { uint64_t hash; size_t len; CFTypeRef data; } nvmtl_pxkey_slot;
+    static nvmtl_pxkey_slot slots[kPxKeyCap];
+    static uint32_t count, nextEvict;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lock);
+    for (uint32_t i = 0; i < count; i++) {
+        if (slots[i].hash == hash && slots[i].len == len) {
+            NSData *d = (__bridge NSData *)slots[i].data;
+            if (memcmp(d.bytes, bytes, len) == 0) {
+                os_unfair_lock_unlock(&lock);
+                return d;
+            }
+        }
+    }
+    NSData *fresh = [NSData dataWithBytes:bytes length:len];
+    uint32_t dst = count < kPxKeyCap ? count++ : (nextEvict++ & (kPxKeyCap - 1u));
+    CFTypeRef old = slots[dst].data;
+    slots[dst].hash = hash;
+    slots[dst].len = len;
+    slots[dst].data = CFBridgingRetain(fresh);
+    os_unfair_lock_unlock(&lock);
+    if (old) CFRelease(old);
+    return fresh;
+}
+// Materialize the translator's NSDictionary form ONLY on a cold shader-variant cache miss (once per unique pipeline+sampler set).
+static NSDictionary *nvmtl_px_sig_to_dict(uint16_t mask, const nvmtl_px_sampler_sig sigs[16], BOOL norm) {
+    if (!mask) return @{};
+    static NSString *const addresses[6] = {@"ClampToEdge",@"MirrorClampToEdge",@"Repeat",@"MirroredRepeat",@"ClampToZero",@"ClampToBorder"};
+    static NSString *const compare[8] = {@"None",@"Less",@"Equal",@"LessEqual",@"Greater",@"NotEqual",@"GreaterEqual",@"Always"};
+    static NSString *const mips[3] = {@"None",@"Nearest",@"Linear"};
+    static NSString *const borders[3] = {@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"};
+    NSMutableDictionary *o = [NSMutableDictionary dictionaryWithCapacity:4];
+    for (NSUInteger i = 0; i < 16; i++) {
+        if (!(mask & (1u << i))) continue;
+        const nvmtl_px_sampler_sig s = sigs[i];
+        o[nvmtl_sampler_slot_key(i)] = @{
+            @"min_filter": s.minf ? @"Linear" : @"Nearest",
+            @"mag_filter": s.magf ? @"Linear" : @"Nearest",
+            @"mip_filter": mips[s.mipf < 3 ? s.mipf : 2],
+            @"address_mode_s": addresses[s.as < 6 ? s.as : 0],
+            @"address_mode_t": addresses[s.at < 6 ? s.at : 0],
+            @"address_mode_r": addresses[s.ar < 6 ? s.ar : 0],
+            @"coordinates": @"Pixel",
+            @"compare_function": compare[s.cmp < 8 ? s.cmp : 0],
+            @"max_anisotropy": @((NSUInteger)s.aniso),
+            @"lod_min_clamp": @(nvmtl_pxkey_bits_float(s.lminb)),
+            @"lod_max_clamp": norm ? @65504.0f : @(nvmtl_pxkey_bits_float(s.lmaxb)),
+            @"border_color": borders[s.border < 3 ? s.border : 0],
+            @"reduction": @"WeightedAverage",
+            @"lod_bias": @0
+        };
+    }
+    return o;
 }
 - (NVMTLRenderPipelineState *)nvmtlSamplerPipeline {
     NVMTLRenderPipelineState *selected=_ps;
     {
-        NSDictionary *vS=nil,*fS=nil;
+        static int noSampKey = -1;
+        if (noSampKey < 0) noSampKey = getenv("NVMTL_NO_SAMPKEY") != NULL;
+        const BOOL norm = !noSampKey;
         if (!_pixelSamplerKey) {
-            NSDictionary *vertex=_vertexSamplers ?: @{}, *fragment=_fragmentSamplers ?: @{};
-            for (NSArray *entry in _pixelSamplerKeys) {
-                if ([entry[0] isEqual:vertex] && [entry[1] isEqual:fragment]) { _pixelSamplerKey=entry[2]; break; }
-            }
-            if (!_pixelSamplerKey) {
-                vS=nvmtl_pixel_sampler_norm(vertex); fS=nvmtl_pixel_sampler_norm(fragment);
-                _pixelSamplerKey=[NSJSONSerialization dataWithJSONObject:@[vS,fS] options:NSJSONWritingSortedKeys error:NULL];
-                if (!_pixelSamplerKeys) _pixelSamplerKeys=[NSMutableArray new];
-                if (_pixelSamplerKeys.count == 8) [_pixelSamplerKeys removeObjectAtIndex:0];
-                [_pixelSamplerKeys addObject:@[[vertex copy],[fragment copy],_pixelSamplerKey]];
-            }
+            uint8_t buf[NVMTL_PXKEY_MAX_BYTES];
+            size_t len = 0;
+            const uint64_t h = nvmtl_pxkey_pack(buf, &len, _vSampMask, _vSampSig, _fSampMask, _fSampSig, norm ? 1 : 0);
+            _pixelSamplerKey = nvmtl_pxkey_intern(buf, len, h);
         }
         NSData *key=_pixelSamplerKey;
         // The same pipeline with the same sampler values as this encoder's last draw: its choice stands, with no lock and no
@@ -4202,8 +4245,8 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             selected=cached;
             if(!selected) {
                 // Reusing the key across pipelines still performs each pipeline's own variant lookup.
-                if (!vS) vS=nvmtl_pixel_sampler_norm(_vertexSamplers);
-                if (!fS) fS=nvmtl_pixel_sampler_norm(_fragmentSamplers);
+                NSDictionary *vS = nvmtl_px_sig_to_dict(_vSampMask, _vSampSig, norm);
+                NSDictionary *fS = nvmtl_px_sig_to_dict(_fSampMask, _fSampSig, norm);
                 NVMTLFunction *vf=_ps->_linkedVert?:(id)_ps->_descriptor.vertexFunction,*ff=_ps->_linkedFrag?:(id)_ps->_descriptor.fragmentFunction;
                 NSString *why=nil;
                 NSData *gk=nvmtl_sampvar_key(_ps->_descriptor,vf,ff,key); selected=nvmtl_sampvar_get(gk);
@@ -4257,7 +4300,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
       if (hzr == 1) [self nvmtlHzRestart:NO]; else if (hzr == 2) [self nvmtlHzRestart:YES];
       if (hzr && !_begun) return NO; }
     NVMTLRenderPipelineState *selected=_ps;
-    if (_vertexSamplers.count || _fragmentSamplers.count) {
+    if (_vSampMask || _fSampMask) {
         selected=[self nvmtlSamplerPipeline];
         if (!selected) return NO;
     }
@@ -4659,10 +4702,18 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     if (i >= 16 || nvmtl_vk_bind_sampler(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, ns ? &ns->_s : NULL)) {
         nvlog("setFragmentSamplerState: invalid index or bind failure"); return;
     }
-    if (!_fragmentSamplers) _fragmentSamplers=[NSMutableDictionary new];
-    NSString *key=nvmtl_sampler_slot_key(i);
-    if (nvmtl_pixel_sampler_update(_fragmentSamplers,key,ns ? ns->_pixelState : nil)) _pixelSamplerKey=nil;
-    nvtrace("FRAGMENT SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_pixelState!=nil,ns!=nil);
+    const uint16_t bit = (uint16_t)(1u << i);
+    if (ns && ns->_hasPxSig) {
+        if (!(_fSampMask & bit) || memcmp(&_fSampSig[i], &ns->_pxSig, sizeof(nvmtl_px_sampler_sig)) != 0) {
+            _fSampSig[i] = ns->_pxSig;
+            _fSampMask |= bit;
+            _pixelSamplerKey = nil;
+        }
+    } else if (_fSampMask & bit) {
+        _fSampMask &= (uint16_t)~bit;
+        _pixelSamplerKey = nil;
+    }
+    nvtrace("FRAGMENT SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_hasPxSig,ns!=nil);
     if(ns) { if (!_cb->_resources) _cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:ns]; }
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {
@@ -4670,10 +4721,18 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     if (i >= 16 || nvmtl_vk_bind_sampler(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, ns ? &ns->_s : NULL)) {
         nvlog("setVertexSamplerState: invalid index or bind failure"); return;
     }
-    if (!_vertexSamplers) _vertexSamplers=[NSMutableDictionary new];
-    NSString *key=nvmtl_sampler_slot_key(i);
-    if (nvmtl_pixel_sampler_update(_vertexSamplers,key,ns ? ns->_pixelState : nil)) _pixelSamplerKey=nil;
-    nvtrace("VERTEX SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_pixelState!=nil,ns!=nil);
+    const uint16_t bit = (uint16_t)(1u << i);
+    if (ns && ns->_hasPxSig) {
+        if (!(_vSampMask & bit) || memcmp(&_vSampSig[i], &ns->_pxSig, sizeof(nvmtl_px_sampler_sig)) != 0) {
+            _vSampSig[i] = ns->_pxSig;
+            _vSampMask |= bit;
+            _pixelSamplerKey = nil;
+        }
+    } else if (_vSampMask & bit) {
+        _vSampMask &= (uint16_t)~bit;
+        _pixelSamplerKey = nil;
+    }
+    nvtrace("VERTEX SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_hasPxSig,ns!=nil);
     if(ns) { if (!_cb->_resources) _cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:ns]; }
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
@@ -5197,20 +5256,22 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
 }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setFragmentSamplerState:ss atIndex:i];
-    NSString *key=nvmtl_sampler_slot_key(i);
-    if(_fragmentSamplers[key]) {
-        NSMutableDictionary *state=[_fragmentSamplers[key] mutableCopy];
-        state[@"lod_min_clamp"]=@(lo);state[@"lod_max_clamp"]=@(hi);
-        if (nvmtl_pixel_sampler_update(_fragmentSamplers,key,state)) _pixelSamplerKey=nil;
+    if (i < 16 && (_fSampMask & (uint16_t)(1u << i))) {
+        const uint32_t lob = nvmtl_pxkey_float_bits(lo), hib = nvmtl_pxkey_float_bits(hi);
+        if (_fSampSig[i].lminb != lob || _fSampSig[i].lmaxb != hib) {
+            _fSampSig[i].lminb = lob; _fSampSig[i].lmaxb = hib;
+            _pixelSamplerKey = nil;
+        }
     }
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setVertexSamplerState:ss atIndex:i];
-    NSString *key=nvmtl_sampler_slot_key(i);
-    if(_vertexSamplers[key]) {
-        NSMutableDictionary *state=[_vertexSamplers[key] mutableCopy];
-        state[@"lod_min_clamp"]=@(lo);state[@"lod_max_clamp"]=@(hi);
-        if (nvmtl_pixel_sampler_update(_vertexSamplers,key,state)) _pixelSamplerKey=nil;
+    if (i < 16 && (_vSampMask & (uint16_t)(1u << i))) {
+        const uint32_t lob = nvmtl_pxkey_float_bits(lo), hib = nvmtl_pxkey_float_bits(hi);
+        if (_vSampSig[i].lminb != lob || _vSampSig[i].lmaxb != hib) {
+            _vSampSig[i].lminb = lob; _vSampSig[i].lmaxb = hib;
+            _pixelSamplerKey = nil;
+        }
     }
 }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])ss lodMinClamps:(const float *)lo lodMaxClamps:(const float *)hi withRange:(NSRange)r {
@@ -7167,7 +7228,7 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
         if (ns) _sassSamplers[@(i)] = ns; else [_sassSamplers removeObjectForKey:@(i)];
     }
     if (!_samplers) _samplers = [NSMutableDictionary new];
-    NSString *key = [NSString stringWithFormat:@"%lu", (unsigned long)i];
+    NSString *key = nvmtl_sampler_slot_key(i);
     id was = _samplers[key], now = ns ? ns->_pixelState : nil;
     if (ns && ns->_pixelState) _samplers[key] = ns->_pixelState;
     else [_samplers removeObjectForKey:key];

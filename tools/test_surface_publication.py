@@ -109,6 +109,7 @@ typedef struct { void *buf; } nvk_buffer;
 - (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied skipRemark:(BOOL)skipRemark;
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
@@ -149,6 +150,11 @@ int main(int argc, char **argv) { @autoreleasepool {
     assert([w nvmtlSurfaceOutDirtied:YES] && tries==1 && !blockingDirties && w->_surfSynced && w->_surfSeed==9);
     tryAnswer=0;
     assert([w nvmtlSurfaceOutDirtied:YES] && tries==2 && !blockingDirties);
+    // nitro-perf v9: when zero page-offs and zero seed changes occurred between commit and completion,
+    // skipRemark:YES skips the redundant nvmtl_vk_surface_dirty_try ioctl while still updating seed/gen bookkeeping.
+    ws.seed=10;
+    assert([w nvmtlSurfaceOutDirtied:YES skipRemark:YES] && tries==2 && !blockingDirties && w->_surfSynced && w->_surfSeed==10);
+    ws.seed=9;
     // the lock was taken: this thread goes on, and the re-mark is retried off it, again only as tries (a mark that
     // waited for the lock could land after a newer CPU write), until one takes; a page-off that slipped in between the
     // commit's marks must not leave its copy current

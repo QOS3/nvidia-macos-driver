@@ -2416,6 +2416,7 @@ public:
 };
 OSDefineMetaClassAndStructors(IOAccelNVRMBridge, NVRMUserClient)
 
+static void nvrmSurfMetaNotePageoff(void);
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
     if (fn && fn->isEqualTo(NVRM_UTILIZATION_FN)) {
@@ -2493,6 +2494,10 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         *out = uc;
         return kIOReturnSuccess;
     }
+    if (fn && fn->isEqualTo(NVRM_SS_FN_PAGEOFF_NOTE)) {
+        nvrmSurfMetaNotePageoff();
+        return kIOReturnSuccess;
+    }
     if (fn && p1) {
         const bool rmCall = fn->isEqualTo(NVRM_GPUVA_FN_ALLOC) || fn->isEqualTo(NVRM_GPUVA_FN_MAP) || fn->isEqualTo(NVRM_GPUVA_FN_FREE)
                          || fn->isEqualTo(NVRM_SS_FN_RM) || fn->isEqualTo(NVRM_SS_FN_PAGEOFF);
@@ -2506,8 +2511,11 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
             return nvrm_gpuva_free(g)  ? kIOReturnIOError : kIOReturnSuccess;
         if (fn->isEqualTo(NVRM_SS_FN_RM))
             return nvrm_surfshare_rm((struct NVRMSurfShareRm *)p1) ? kIOReturnIOError : kIOReturnSuccess;
-        if (fn->isEqualTo(NVRM_SS_FN_PAGEOFF))
-            return nvrm_surfshare_pageoff((struct NVRMSurfPageoff *)p1, &fNv) ? kIOReturnIOError : kIOReturnSuccess;
+        if (fn->isEqualTo(NVRM_SS_FN_PAGEOFF)) {
+            int rc = nvrm_surfshare_pageoff((struct NVRMSurfPageoff *)p1, &fNv);
+            nvrmSurfMetaNotePageoff();
+            return rc ? kIOReturnIOError : kIOReturnSuccess;
+        }
     }
     if (fn && fn->isEqualTo(NVRM_DISPLAY_PTRS_FN)) {
         NVRMDisplayPointers *ptrs = (NVRMDisplayPointers *)p1;
@@ -2672,12 +2680,19 @@ static IOBufferMemoryDescriptor *nvrmSurfMetaDescriptor(void)
     pg->hdr.version = NVRM_SURF_META_VERSION;
     pg->hdr.buckets = NVRM_SURF_META_BUCKETS;
     pg->hdr.ways = NVRM_SURF_META_WAYS;
+    pg->hdr.pageoff_gen = 1u;
     if (!__atomic_compare_exchange_n(&gSurfMetaMd, &md, cand, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
         cand->complete(); cand->release();
         return md;
     }
     __atomic_store_n(&gSurfMetaPage, pg, __ATOMIC_RELEASE);
     return cand;
+}
+
+static void nvrmSurfMetaNotePageoff(void)
+{
+    nvrm_surf_meta_page *pg = __atomic_load_n(&gSurfMetaPage, __ATOMIC_ACQUIRE);
+    if (pg) nvrm_surf_meta_kernel_bump_pageoff(pg);
 }
 
 static void nvrmSurfMetaNoteVram(uint32_t sid, uint32_t plane, uint32_t hSrcMem)

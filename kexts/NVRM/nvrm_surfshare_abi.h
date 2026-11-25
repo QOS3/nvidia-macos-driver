@@ -12,7 +12,10 @@
 #define NVRM_SS_PLANE_GPU_MARK 0x80000000u
 /* NVRM_ESC_SURF_DIRTY with this plane bit gives up with NVRM_SS_BUSY instead of waiting for the accelerator lock
  * (accelerators that publish NVAccelSurfaceWait) */
-#define NVRM_SS_PLANE_TRYLOCK  0x40000000u
+#define NVRM_SS_PLANE_TRYLOCK        0x40000000u
+/* NVRM_ESC_SURF_DIRTY with this plane bit runs dirty under nvFamLock, releases nvFamLock, then marks WindowServer
+ * pending in the same ioctl (accelerators that publish NVAccelDirtyMarkFused). */
+#define NVRM_SS_PLANE_DIRTY_AND_MARK 0x20000000u
 #define NVRM_SS_BAD_VERSION   0x80000001u
 #define NVRM_SS_OFF           0x80000002u
 #define NVRM_SS_NO_SURFACE    0x80000003u
@@ -35,6 +38,7 @@ struct NVRMSurfShareEsc {
 #ifdef NVRM_SS_KERNEL_ABI
 #define NVACCEL_SS_FN   "nvSurfVram"
 #define NVRM_SS_FN_PAGEOFF "nvSurfPageoff"
+#define NVRM_SS_FN_PAGEOFF_NOTE "nvSurfPageoffNote"
 #define NVRM_SS_FN_RM   "nvSurfShareRm"
 #define NVRM_SS_RM_VERSION 2u
 enum { NVRM_SS_RM_SHARE_KAPI = 5 };

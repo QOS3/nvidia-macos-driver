@@ -125,13 +125,30 @@ static BOOL nvmtl_ws_surface_wait(void) {
     }
     return on == 1;
 }
+static BOOL nvmtl_ws_dirty_mark_fused(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *off = getenv("NVMTL_NO_FUSED_DIRTY");
+        on = (!(off && *off && *off != '0') && nvmtl_vk_accel_dirty_mark_fused()) ? 1 : 0;
+        if (on) nvlog("WindowServer surfaces: fused dirty+pending-mark ioctl ON (NVAccelDirtyMarkFused)");
+    }
+    return on == 1;
+}
+static BOOL nvmtl_ws_pageoff_skip_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *off = getenv("NVMTL_NO_PAGEOFF_SKIP");
+        on = !(off && *off && *off != '0');
+    }
+    return on == 1;
+}
 // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
 // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
-@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
+@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; NSMutableDictionary<NSNumber *, NSNumber *> *commitSeeds; uint32_t commitPoGen; BOOL early; } @end
 @implementation NVMTLSurfaceHolds @end
 // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
 // dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
-@interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied; __weak NVMTLCommandBuffer *owner; } @end
+@interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied, hasCommitSnap; uint32_t commitPoGen, commitSeed; __weak NVMTLCommandBuffer *owner; } @end
 @implementation NVMTLDeferredPublication @end
 // The kernel keeps one pending bit per surface, with no owner. WindowServer commits overlapping command buffers that
 // write the same surface, so the holders are counted here and the kernel mark is released only when the last of them has
@@ -144,12 +161,26 @@ static BOOL nvmtl_ws_surface_wait(void) {
 // a page-off waiting for a mark holds the accelerator lock, and the release it waits for must always get through.
 static NSCountedSet *nvmtl_ws_pending_holds;
 static NSMutableDictionary<NSNumber *, NSMutableArray<NVMTLDeferredPublication *> *> *nvmtl_ws_deferred;
+// Tracks recent nvmtl_ws_mark(sid, NO) releases under nvmtl_ws_lock() so fused commit-time dirty+mark can prove
+// no overlapping completion cleared sid's kernel pending mark while dirty_and_mark ran outside nvmtl_ws_lock().
+static _Atomic uint64_t g_ws_rel_epoch;
+static uint32_t g_ws_rel_ring[16];
+static BOOL nvmtl_ws_sid_released_since(uint32_t sid, uint64_t beforeEpoch) {
+    const uint64_t cur = atomic_load_explicit(&g_ws_rel_epoch, memory_order_acquire);
+    if (cur == beforeEpoch) return NO;
+    if (cur - beforeEpoch > 16u) return YES;
+    for (uint64_t k = beforeEpoch; k < cur; k++) {
+        if (g_ws_rel_ring[k & 15u] == sid) return YES;
+    }
+    return NO;
+}
 static NSObject *nvmtl_ws_lock(void) {
     static NSObject *lock; static dispatch_once_t once;
     dispatch_once(&once, ^{ lock = [NSObject new]; });
     return lock;
 }
-static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirtied, uint32_t sid) {
+static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirtied, uint32_t sid,
+                           uint32_t commitPoGen, uint32_t commitSeed, BOOL hasCommitSnap) {
     @synchronized (nvmtl_ws_lock()) {
         if (!nvmtl_ws_deferred) nvmtl_ws_deferred = [NSMutableDictionary new];
         NSMutableArray *waiting = nvmtl_ws_deferred[@(sid)];
@@ -159,6 +190,7 @@ static void nvmtl_ws_defer(NVMTLCommandBuffer *owner, NVMTLTexture *t, BOOL dirt
         for (NSUInteger i = 0; i < waiting.count; i++) if (((NVMTLDeferredPublication *)waiting[i])->texture == t) { [waiting removeObjectAtIndex:i]; break; }
         NVMTLDeferredPublication *d = [NVMTLDeferredPublication new];
         d->texture = t; d->dirtied = dirtied; d->owner = owner;
+        d->commitPoGen = commitPoGen; d->commitSeed = commitSeed; d->hasCommitSnap = hasCommitSnap;
         [waiting addObject:d];
     }
 }
@@ -171,6 +203,9 @@ static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableAr
         [nvmtl_ws_pending_holds removeObject:n];
         if ([nvmtl_ws_pending_holds countForObject:n]) return;
         nvmtl_ws_mark(sid, NO);
+        const uint64_t e = atomic_load_explicit(&g_ws_rel_epoch, memory_order_relaxed);
+        g_ws_rel_ring[e & 15u] = sid;
+        atomic_store_explicit(&g_ws_rel_epoch, e + 1u, memory_order_release);
         NSArray *waiting = nvmtl_ws_deferred[n];
         if (waiting) { [settled addObjectsFromArray:waiting]; [nvmtl_ws_deferred removeObjectForKey:n]; }
     }
@@ -179,8 +214,12 @@ static void nvmtl_ws_release(NVMTLSurfaceHolds *holds, uint32_t sid, NSMutableAr
 // published (its command buffer fails, as before); another command buffer's has already completed, so that is logged.
 static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
     BOOL ok = YES;
+    const uint32_t curPoGen = nvmtl_ws_pageoff_skip_on() ? nvmtl_surf_meta_pageoff_gen() : 0u;
     for (NVMTLDeferredPublication *d in settled) {
-        if (d->dirtied ? [d->texture nvmtlSurfaceOutDirtied:YES] : [d->texture nvmtlSurfaceOut]) continue;
+        NVMTLTexture *rt = d->texture->_parent ? d->texture->_parent : d->texture;
+        const BOOL skipRemark = d->dirtied && d->hasCommitSnap && d->commitPoGen != 0u &&
+            curPoGen == d->commitPoGen && rt->_surf && IOSurfaceGetSeed(rt->_surf) == d->commitSeed;
+        if (d->dirtied ? [d->texture nvmtlSurfaceOutDirtied:YES skipRemark:skipRemark] : [d->texture nvmtlSurfaceOut]) continue;
         if (cb && d->owner == cb) ok = NO;
         else nvlog("WindowServer surface %u: publication after its last write refused", (unsigned)IOSurfaceGetID(d->texture->_surf));
     }
@@ -216,28 +255,54 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!ids) return;
     NVMTLSurfaceHolds *holds = [NVMTLSurfaceHolds new];
     holds->ids = ids; holds->early = nvmtl_ws_surface_wait();
+    NSMutableDictionary<NSNumber *, NSNumber *> *fusedEpoch = nil;
     if (holds->early) {
         // One kernel mark per surface plane per commit. A surface that several parts of this command buffer write, or
         // that several textures (views, planes' wrappers) share, was marked once for each of them, back to back with no
         // GPU or CPU work between: each mark is an ioctl that takes the accelerator lock, and WindowServer pays them on
         // every composite (#566). The first mark's answer stands for the rest of this loop.
+        const BOOL fused = nvmtl_ws_dirty_mark_fused();
+        const uint32_t poGen = nvmtl_ws_pageoff_skip_on() ? nvmtl_surf_meta_pageoff_gen() : 0u;
+        holds->commitPoGen = poGen;
         NSMutableSet *dirtied = [NSMutableSet new];
         NSMutableDictionary<NSNumber *, NSNumber *> *marked = [NSMutableDictionary new];
+        NSMutableDictionary<NSNumber *, NSNumber *> *commitSeeds = poGen ? [NSMutableDictionary new] : nil;
+        if (fused) fusedEpoch = [NSMutableDictionary new];
         for (NVMTLSubmissionPart *part in cb->_parts) {
             if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
             for (NVMTLTexture *t in part->surfaces) {
                 if (!t->_surf || !t->_vramOn) continue;
                 const uint32_t sid = (uint32_t)IOSurfaceGetID(t->_surf), plane = (uint32_t)t->_plane;
                 NSNumber *key = @(((uint64_t)sid << 8) | (plane & 0xffu)), *done = marked[key];
-                if (!done) { done = @(nvmtl_vk_surface_dirty(sid, plane)); marked[key] = done; }
-                if (!done.intValue) [dirtied addObject:t];
+                if (!done) {
+                    NSNumber *sidKey = @(sid);
+                    if (fused && !fusedEpoch[sidKey]) {
+                        const uint64_t relBefore = atomic_load_explicit(&g_ws_rel_epoch, memory_order_acquire);
+                        const int rc = nvmtl_vk_surface_dirty_and_mark(sid, plane);
+                        done = @(rc);
+                        if (rc == 0) fusedEpoch[sidKey] = @(relBefore);
+                    } else {
+                        done = @(nvmtl_vk_surface_dirty(sid, plane));
+                    }
+                    marked[key] = done;
+                }
+                if (!done.intValue) {
+                    [dirtied addObject:t];
+                    if (commitSeeds && !commitSeeds[key]) commitSeeds[key] = @(IOSurfaceGetSeed(t->_surf));
+                }
             }
         }
         holds->dirtied = dirtied;
+        holds->commitSeeds = commitSeeds;
     }
     @synchronized (nvmtl_ws_lock()) {
         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
-        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES); }
+        for (NSNumber *n in ids) {
+            [nvmtl_ws_pending_holds addObject:n];
+            NSNumber *fe = fusedEpoch ? fusedEpoch[n] : nil;
+            if (!fe || nvmtl_ws_sid_released_since(n.unsignedIntValue, fe.unsignedLongLongValue))
+                nvmtl_ws_mark(n.unsignedIntValue, YES);
+        }
     }
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -256,8 +321,9 @@ static NSArray *nvmtl_ws_part_landed(NVMTLCommandBuffer *cb, NSUInteger index, N
     for (NVMTLTexture *t in part->surfaces) {
         if (!t->_surf) { [publish addObject:t]; continue; }
         const uint32_t sid = (uint32_t)IOSurfaceGetID(t->_surf);
+        NSNumber *cs = holds->commitSeeds ? holds->commitSeeds[@(((uint64_t)sid << 8) | ((uint64_t)t->_plane & 0xffu))] : nil;
         // deferred before the release below, so the release that turns out to be the last one publishes it
-        nvmtl_ws_defer(cb, t, [holds->dirtied containsObject:t], sid);
+        nvmtl_ws_defer(cb, t, [holds->dirtied containsObject:t], sid, holds->commitPoGen, cs ? cs.unsignedIntValue : 0u, cs != nil);
         BOOL later = NO;
         for (NSUInteger i = index + 1; i < cb->_parts.count && !later; i++) {
             NVMTLSubmissionPart *next = cb->_parts[i];
@@ -446,41 +512,66 @@ static int nvmtl_skip_empty_on(void) {
     }
     [self nvmtlSealPartWithSignal:event value:value restart:YES];
 }
-- (void)nvmtlDispatchHandlers:(NSArray *)handlers scheduled:(BOOL)scheduled {
-    if (!handlers.count) return;
-    dispatch_queue_t order;
-    dispatch_queue_t target;
-    // the class, not the queue: apps may hold @synchronized(queue) while they wait for this command buffer
-    @synchronized ([NVMTLCommandQueue class]) {
-        if (!_queue->_callbackOrderQueue)
-            _queue->_callbackOrderQueue = dispatch_queue_create("com.nvmtl.command-callbacks", DISPATCH_QUEUE_SERIAL);
-        order = _queue->_callbackOrderQueue;
-        target = _queue->_completionQueue ?: dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-    }
-    for (NSUInteger i = 0; i < handlers.count; ++i) {
+- (void)nvmtlEnterHandlerGroups:(NSUInteger)count scheduled:(BOOL)scheduled {
+    for (NSUInteger i = 0; i < count; ++i) {
         dispatch_group_enter(_callbackGroup);
         if (scheduled) dispatch_group_enter(_scheduledGroup);
     }
-    dispatch_async(order, ^{
-        dispatch_sync(target, ^{
+}
+- (void)nvmtlDispatchEnteredHandlers:(NSArray *)handlers scheduled:(BOOL)scheduled {
+    if (!handlers.count) return;
+    dispatch_queue_t order;
+    dispatch_queue_t customTarget;
+    os_unfair_lock_lock(&_queue->_callbackQueueLock);
+    if (!_queue->_callbackOrderQueue) {
+        static int hiQos = -1;
+        if (hiQos < 0) { const char *e = getenv("NVMTL_EXEC_QOS"); hiQos = !(e && e[0] == '0'); }
+        dispatch_queue_attr_t attr = hiQos
+            ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)
+            : DISPATCH_QUEUE_SERIAL;
+        _queue->_callbackOrderQueue = dispatch_queue_create("com.nvmtl.command-callbacks", attr);
+    }
+    order = _queue->_callbackOrderQueue;
+    customTarget = _queue->_completionQueue;
+    os_unfair_lock_unlock(&_queue->_callbackQueueLock);
+    if (customTarget) {
+        dispatch_async(order, ^{
+            dispatch_sync(customTarget, ^{
+                for (MTLCommandBufferHandler handler in handlers) {
+                    handler(self);
+                    if (scheduled) dispatch_group_leave(self->_scheduledGroup);
+                    dispatch_group_leave(self->_callbackGroup);
+                }
+            });
+        });
+    } else {
+        // nitro-perf v9: run directly on the USER_INTERACTIVE serial order queue (no redundant nested
+        // dispatch_sync(USER_INITIATED) hop that stalled WindowServer waitUntilScheduled in _dispatch_group_wait_slow).
+        dispatch_async(order, ^{
             for (MTLCommandBufferHandler handler in handlers) {
                 handler(self);
                 if (scheduled) dispatch_group_leave(self->_scheduledGroup);
                 dispatch_group_leave(self->_callbackGroup);
             }
         });
-    });
+    }
 }
 - (void)nvmtlMarkScheduled {
     if (_scheduleAfterPublish) return;
+    NSArray *handlers = nil;
+    BOOL fire = NO;
     [_completionCondition lock];
     if (!_wasScheduled) {
         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;
-        NSArray *handlers = [_scheduledHandlers copy]; [_scheduledHandlers removeAllObjects];
-        [self nvmtlDispatchHandlers:handlers scheduled:YES];
-        [_completionCondition broadcast];
+        handlers = [_scheduledHandlers copy]; [_scheduledHandlers removeAllObjects];
+        if (handlers.count) [self nvmtlEnterHandlerGroups:handlers.count scheduled:YES];
+        fire = YES;
     }
     [_completionCondition unlock];
+    if (fire) {
+        if (handlers.count) [self nvmtlDispatchEnteredHandlers:handlers scheduled:YES];
+        [_completionCondition broadcast];
+    }
 }
 - (void)nvmtlCollectDeviceTiming:(nvk_cmdbuf *)commands {
     if (!commands->timing.valid) { _gpuTimingInvalid = YES; return; }
@@ -580,16 +671,24 @@ static int nvmtl_skip_empty_on(void) {
             _cbtND, _cbtK[0] ? _cbtK : "-");
     [_completionCondition lock];
     NSArray *handlers = [_handlers copy]; [_handlers removeAllObjects];
-    [self nvmtlDispatchHandlers:handlers scheduled:NO];
+    if (handlers.count) [self nvmtlEnterHandlerGroups:handlers.count scheduled:NO];
     _completionReady = YES;
-    [_completionCondition broadcast]; [_completionCondition unlock];
+    [_completionCondition unlock];
+    if (handlers.count) [self nvmtlDispatchEnteredHandlers:handlers scheduled:NO];
+    [_completionCondition broadcast];
 }
 static unsigned nvmtl_gsub_cap(void) {
     static int cap = -1;
-    if (cap < 0) { const char *e = getenv("NVMTL_GSUB_INFLIGHT"); int v = e ? atoi(e) : 16;
+    if (cap < 0) {
+        const char *me = getprogname();
+        const BOOL isWs = me && !strcmp(me, "WindowServer");
+        const char *e = isWs ? getenv("NVMTL_WS_GSUB_INFLIGHT") : getenv("NVMTL_GSUB_INFLIGHT");
+        int v = (e && *e) ? atoi(e) : 16;
         cap = v < 1 ? 1 : v > 32 ? 32 : v;
-        nvlog("commit: G-SUB submit-ahead %s, at most %d parts in flight (NVMTL_GSUB_INFLIGHT=%s)",
-              nvmtl_async_commit_on() && nvmtl_g79_on(NVMTL_G79_SUB) ? "ON" : "off", cap, e ? e : "unset"); }
+        nvlog("commit: G-SUB submit-ahead %s, at most %d parts in flight (%s=%s)",
+              nvmtl_async_commit_on() && nvmtl_g79_on(NVMTL_G79_SUB) ? "ON" : "off", cap,
+              isWs ? "NVMTL_WS_GSUB_INFLIGHT" : "NVMTL_GSUB_INFLIGHT", (e && *e) ? e : "default(16)");
+    }
     return (unsigned)cap;
 }
 static BOOL nvmtl_gsub_ahead_on(void) { return nvmtl_async_commit_on() && nvmtl_g79_on(NVMTL_G79_SUB) && nvmtl_gsub_cap(); }
@@ -974,8 +1073,10 @@ static void nvmtl_pump_buffers(void) {
         nvmtl_pumping = YES;
         dispatch_async(worker, ^{
             for (;;) { @autoreleasepool {
-                nvmtl_vk_clock_refresh();
+                // nitro-perf v9: submit ahead BEFORE the periodic 1s calibrated-timestamp refresh so
+                // WindowServer's commitAndWaitUntilSubmitted / waitUntilScheduled never waits on clock calibration.
                 if (nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
+                nvmtl_vk_clock_refresh();
                 NSArray *batch; uint64_t generation;
                 @synchronized ([NVMTLCommandBuffer class]) {
                     batch = [nvmtl_pending_buffers copy]; generation = nvmtl_pump_generation;

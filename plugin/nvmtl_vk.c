@@ -474,7 +474,7 @@ void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, siz
     X(vkDestroyPipeline) X(vkDestroyRenderPass) X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdPushConstants) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkCmdBeginRenderPass) X(vkCmdBindPipeline) X(vkCmdDraw) X(vkCmdEndRenderPass) X(vkEndCommandBuffer) \
     X(vkQueueSubmit) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDestroyFence) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyBuffer) \
-    X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkDeviceWaitIdle) X(vkFreeCommandBuffers) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdBindVertexBuffers) X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkDestroyDescriptorSetLayout) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) X(vkFreeDescriptorSets) X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdFillBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetBufferDeviceAddress) X(vkCmdWriteTimestamp) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) X(vkDestroyQueryPool) X(vkResetQueryPool) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatchIndirect) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
+    X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkDeviceWaitIdle) X(vkFreeCommandBuffers) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdBindVertexBuffers) X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkDestroyDescriptorSetLayout) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) X(vkFreeDescriptorSets) X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetBufferDeviceAddress) X(vkCmdWriteTimestamp) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) X(vkDestroyQueryPool) X(vkResetQueryPool) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatchIndirect) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
     X(vkDestroyBuffer) X(vkFreeMemory) X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyFramebuffer) X(vkDestroyCommandPool) \
     X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetDepthBounds)
@@ -3194,26 +3194,30 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
+/* nitro-perf v9: fused dirty + WindowServer pending mark in one kernel trap (NVRM_SS_PLANE_DIRTY_AND_MARK). */
+int nvmtl_vk_surface_dirty_and_mark(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x20000000u); }
 // WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
     if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
     return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
 }
-/* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
-int nvmtl_vk_accel_surface_wait(void)
+static int nvmtl_vk_accel_prop_int(CFStringRef key)
 {
-    /* the card this process was bound to (nvmultigpu=1), else the first accelerator as always */
     io_service_t s = nvmtl_card_registry_id ? IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IORegistryEntryIDMatching(nvmtl_card_registry_id))
                                             : IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IOServiceMatching("NVAccel"));
     if (!s) return 0;
-    CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("NVAccelSurfaceWait"), kCFAllocatorDefault, 0);
+    CFTypeRef v = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
     int on = 0;
     if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &on);
     if (v) CFRelease(v);
     IOObjectRelease(s);
     return on == 1;
 }
+/* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
+int nvmtl_vk_accel_surface_wait(void) { return nvmtl_vk_accel_prop_int(CFSTR("NVAccelSurfaceWait")); }
+/* 1 when NVAccel publishes NVAccelDirtyMarkFused: supports NVRM_SS_PLANE_DIRTY_AND_MARK */
+int nvmtl_vk_accel_dirty_mark_fused(void) { return nvmtl_vk_accel_prop_int(CFSTR("NVAccelDirtyMarkFused")); }
 static int nvmtl_dup_devnull(void)
 {
     static int base_fd = -1;
@@ -4452,8 +4456,14 @@ static uint32_t nvmtl_wit_record(nvk_cmdbuf *c)
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toT, 0, NULL, 0, NULL);
     // NVMTL_WIT_SKIP_EVERY=N leaves every Nth witness unwritten: the test that a lost witness costs one pool, not the process
     static long skip_every = -1; if (skip_every < 0) { const char *e = getenv("NVMTL_WIT_SKIP_EVERY"); skip_every = e ? atol(e) : 0; }
-    if (!(skip_every > 0 && s % (uint32_t)skip_every == 0))
-        pvkCmdFillBuffer(c->cb, (VkBuffer)g_wit.buf, (VkDeviceSize)(s % NVMTL_WIT_SLOTS) * 4, 4, s);
+    static int use_fill = -1; if (use_fill < 0) { const char *e = getenv("NVMTL_WIT_USE_FILL"); use_fill = e && e[0] == '1'; }
+    if (!(skip_every > 0 && s % (uint32_t)skip_every == 0)) {
+        // nitro-perf v9: inline 4-byte DMA update avoids NVK's vk_meta_fill_memory compute QMD dispatch on every submit
+        if (!use_fill && pvkCmdUpdateBuffer)
+            pvkCmdUpdateBuffer(c->cb, (VkBuffer)g_wit.buf, (VkDeviceSize)(s % NVMTL_WIT_SLOTS) * 4, 4, &s);
+        else
+            pvkCmdFillBuffer(c->cb, (VkBuffer)g_wit.buf, (VkDeviceSize)(s % NVMTL_WIT_SLOTS) * 4, 4, s);
+    }
     VkMemoryBarrier toH = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toH, 0, NULL, 0, NULL);
     return s;

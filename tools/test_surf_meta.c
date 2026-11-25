@@ -141,6 +141,17 @@ int main(void)
     for (int i = 0; i < 4; i++) { pthread_join(th[i], NULL); total_bad += ctx[i].bad; }
     ARM("multi-threaded seqlock stress produces zero torn reads", total_bad == 0);
 
+    /* nitro-perf v9: pageoff_gen monotonicity and zero-skip wraparound */
+    ARM("pageoff_gen reads 0 before kernel activation", nvmtl_sm_pageoff_gen(pg) == 0u);
+    pg->hdr.pageoff_gen = 1u;
+    ARM("pageoff_gen reads 1 after activation", nvmtl_sm_pageoff_gen(pg) == 1u);
+    __atomic_add_fetch(&pg->hdr.pageoff_gen, 1u, __ATOMIC_RELEASE);
+    ARM("pageoff_gen increments cleanly", nvmtl_sm_pageoff_gen(pg) == 2u);
+    pg->hdr.pageoff_gen = UINT32_MAX;
+    if (__atomic_add_fetch(&pg->hdr.pageoff_gen, 1u, __ATOMIC_RELEASE) == 0u)
+        __atomic_add_fetch(&pg->hdr.pageoff_gen, 1u, __ATOMIC_RELEASE);
+    ARM("pageoff_gen wraparound skips 0 so active counter never looks inactive", nvmtl_sm_pageoff_gen(pg) == 1u);
+
     free(pg);
     return fails ? 1 : 0;
 }

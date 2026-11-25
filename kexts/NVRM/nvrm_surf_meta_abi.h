@@ -31,7 +31,8 @@ typedef struct nvrm_surf_meta_hdr {
     uint32_t buckets;
     uint32_t ways;
     uint32_t lru_clock;
-    uint32_t pad_hdr[11];
+    uint32_t pageoff_gen;   /* nitro-perf v9: kernel-only monotonic counter (>=1 when active), bumped on page-off/forget */
+    uint32_t pad_hdr[10];
     uint32_t bucket_lock[NVRM_SURF_META_BUCKETS];
     uint32_t pad_tail[496];
 } nvrm_surf_meta_hdr;
@@ -85,5 +86,13 @@ static inline void nvrm_surf_meta_kernel_invalidate_sid(nvrm_surf_meta_page *pg,
         if (__atomic_load_n(&s->sid, __ATOMIC_RELAXED) == sid) {
             __atomic_fetch_add(&s->kernel_inval, 1u, __ATOMIC_RELEASE);
         }
+    }
+}
+
+static inline void nvrm_surf_meta_kernel_bump_pageoff(nvrm_surf_meta_page *pg)
+{
+    if (!pg) return;
+    if (__atomic_add_fetch(&pg->hdr.pageoff_gen, 1u, __ATOMIC_RELEASE) == 0u) {
+        __atomic_add_fetch(&pg->hdr.pageoff_gen, 1u, __ATOMIC_RELEASE);
     }
 }

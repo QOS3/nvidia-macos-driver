@@ -69,6 +69,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied skipRemark:(BOOL)skipRemark;
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;
@@ -127,7 +128,7 @@ extern id gNVMTLMainDevice;
   // _resSets: the residency sets this queue was given. A set retains its allocations, so holding the
   // set is what keeps them alive; without this nobody did, and an app that handed its only reference
   // to the queue had every resource in the set freed under work the queue had not finished.
-  @public nvk_queue _q; id _dev; id _completionQueue; dispatch_queue_t _callbackOrderQueue; NSMutableArray *_reservations; dispatch_semaphore_t _capacity; NSUInteger _capacityCount; NSMutableArray *_resSets;
+  @public nvk_queue _q; id _dev; id _completionQueue; dispatch_queue_t _callbackOrderQueue; os_unfair_lock _callbackQueueLock; NSMutableArray *_reservations; dispatch_semaphore_t _capacity; NSUInteger _capacityCount; NSMutableArray *_resSets;
 } @end
 @interface NVMTLCommandBuffer : NSObject <MTLCommandBuffer> {
   NSError *_cbError;
@@ -172,7 +173,8 @@ extern id gNVMTLMainDevice;
 @end
 @interface NVMTLDepthStencilState : NSObject <MTLDepthStencilState> { @public int _write; int _compare;
   int _stencil; uint32_t _sf[6], _sb[6]; } @end
-@interface NVMTLSamplerState : NSObject <MTLSamplerState> { @public nvk_sampler _s; NSDictionary *_pixelState; uint64_t _resid; } @end
+#include "nvmtl_sampler_key.h"
+@interface NVMTLSamplerState : NSObject <MTLSamplerState> { @public nvk_sampler _s; NSDictionary *_pixelState; uint64_t _resid; nvmtl_px_sampler_sig _pxSig; BOOL _hasPxSig; } @end
 @interface NVMTLFence : NSObject <MTLFence> { @public id<MTLDevice> _dev; NSString *_label; } @end
 @interface NVMTLResidencySet : NSObject <MTLResidencySet> { @public id<MTLDevice> _dev; NSString *_label; NSMutableArray *_allocs; } @end
 @interface NVMTLEvent : NSObject <MTLEvent> { @public id<MTLDevice> _dev; NSString *_label; uint64_t _value; NSCondition *_condition; } @end
@@ -233,9 +235,9 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
   NVMTLTexture *_resolve; uint32_t _passSamples;
   int _cull; uint32_t _passFmt; int _passDepth;
   uint32_t _load; BOOL _hasVP, _hasSC; float _vp[6]; uint32_t _sc[4];
-  NSMutableDictionary *_vertexSamplers, *_fragmentSamplers;
+  uint16_t _vSampMask, _fSampMask;
+  nvmtl_px_sampler_sig _vSampSig[16], _fSampSig[16];
   NSData *_pixelSamplerKey; // sampler specialization depends on values, not the draw or pipeline
-  NSMutableArray *_pixelSamplerKeys; // at most eight recent value snapshots, owned by this encoder
   NVMTLRenderPipelineState *_svFor; NSData *_svKey; id _svSel; // the last sampler-variant choice of this encoder (NVMTL_NO_SV_MEMO)
   // the buffer and offset bound at each vertex/fragment index, read by embedded argument binding; plain arrays because
   // Apple's GL rebinds buffers for every draw, and a dictionary of (buffer, offset) arrays allocated on each one

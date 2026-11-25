@@ -35,7 +35,8 @@ typedef struct nvrm_surf_meta_hdr {
     uint32_t buckets;
     uint32_t ways;
     uint32_t lru_clock;
-    uint32_t pad_hdr[11];
+    uint32_t pageoff_gen;   /* nitro-perf v9: kernel-only monotonic counter (>=1 when active), bumped on page-off/forget */
+    uint32_t pad_hdr[10];
     uint32_t bucket_lock[NVRM_SURF_META_BUCKETS];
     uint32_t pad_tail[496];
 } nvrm_surf_meta_hdr;
@@ -64,6 +65,11 @@ typedef struct nvrm_surf_meta_page {
 _Static_assert(sizeof(nvrm_surf_meta_hdr) == NVRM_SURF_META_HDR_BYTES, "nvrm_surf_meta_hdr must be 4096 bytes");
 _Static_assert(sizeof(nvrm_surf_meta_slot) == 64u, "nvrm_surf_meta_slot must be 64 bytes");
 _Static_assert(sizeof(nvrm_surf_meta_page) == NVRM_SURF_META_BYTES, "nvrm_surf_meta_page size mismatch");
+
+static inline uint32_t nvmtl_sm_pageoff_gen(const nvrm_surf_meta_page *pg)
+{
+    return pg ? __atomic_load_n(&pg->hdr.pageoff_gen, __ATOMIC_ACQUIRE) : 0u;
+}
 
 static inline uint32_t nvmtl_sm_bucket(uint32_t sid, uint32_t plane)
 {

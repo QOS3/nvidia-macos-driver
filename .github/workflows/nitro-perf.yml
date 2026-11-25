@@ -10,6 +10,10 @@ on:
         description: 'Build only tests + plugin + NVRM + NVRMFB (~4m fast path)'
         type: boolean
         default: false
+      fast_v9:
+        description: 'Build only tests + plugin + NVRM + NVAccel (~4m fast path)'
+        type: boolean
+        default: false
   push:
     branches: [nitro-perf]
 
@@ -36,6 +40,7 @@ jobs:
             test_tree_layout.py \
             test_import_cache.c \
             test_surf_meta.c \
+            test_sampler_key.c \
             test_game_priority.c \
             test_fps_limit.c \
             test_schedule_policy.c \
@@ -94,7 +99,7 @@ jobs:
         with: { name: nitro-plugin, path: out/NVMTLDriver }
 
   translator:
-    if: ${{ !inputs.only_plugin && !inputs.fast_v8 }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v8 && !inputs.fast_v9 }}
     runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
@@ -133,7 +138,7 @@ jobs:
         with: { name: nitro-translator, path: out/libnvmtl_translate.dylib }
 
   nvk:
-    if: ${{ !inputs.only_plugin && !inputs.fast_v8 }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v8 && !inputs.fast_v9 }}
     runs-on: macos-15-intel
     timeout-minutes: 45
     steps:
@@ -275,7 +280,7 @@ jobs:
         with: { name: nitro-nvaccel, path: out/NVAccel.kext }
 
   nvrmfb:
-    if: ${{ !inputs.only_plugin }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v9 }}
     runs-on: macos-15-intel
     timeout-minutes: 25
     steps:
@@ -302,7 +307,7 @@ jobs:
         with: { name: nitro-nvrmfb, path: out/NVRMFB.kext }
 
   nvrmagdc:
-    if: ${{ !inputs.only_plugin && !inputs.fast_v8 }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v8 && !inputs.fast_v9 }}
     runs-on: macos-15-intel
     timeout-minutes: 15
     steps:
@@ -321,7 +326,7 @@ jobs:
         with: { name: nitro-nvrmagdc, path: out/NVRMAGDC.kext }
 
   nvencvt:
-    if: ${{ !inputs.only_plugin && !inputs.fast_v8 }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v8 && !inputs.fast_v9 }}
     runs-on: macos-15-intel
     timeout-minutes: 25
     steps:
@@ -364,7 +369,7 @@ jobs:
         with: { name: nitro-nvencvt, path: out/libnvencvt.dylib }
 
   nvmtl-smi:
-    if: ${{ !inputs.only_plugin && !inputs.fast_v8 }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v8 && !inputs.fast_v9 }}
     runs-on: macos-15-intel
     timeout-minutes: 25
     steps:
@@ -423,7 +428,7 @@ jobs:
         with: { name: nitro-nvmtl-smi, path: out/nvmtl-smi }
 
   bundle:
-    if: ${{ !inputs.only_plugin && !inputs.fast_v8 }}
+    if: ${{ !inputs.only_plugin && !inputs.fast_v8 && !inputs.fast_v9 }}
     needs: [tests, plugin, translator, nvk, nvrm, nvaccel, nvrmfb, nvrmagdc, nvencvt, nvmtl-smi]
     runs-on: macos-15-intel
     steps:

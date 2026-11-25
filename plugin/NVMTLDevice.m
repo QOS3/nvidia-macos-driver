@@ -1595,6 +1595,10 @@ static inline nvrm_surf_meta_page *nvmtl_surf_meta_for(IOSurfaceRef surf, NSUInt
     if (!surf || plane != 0 || IOSurfaceGetPlaneCount(surf) > 1) return NULL;
     return nvmtl_surf_meta_page();
 }
+static inline uint32_t nvmtl_surf_meta_pageoff_gen(void)
+{
+    return nvmtl_sm_pageoff_gen(nvmtl_surf_meta_page());
+}
 static pid_t nvmtl_my_pid(void) {
     static pid_t p; static dispatch_once_t o;
     dispatch_once(&o, ^{ p = getpid(); });
@@ -3241,6 +3245,14 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             .border = (uint32_t)MIN(NVMTL_SINCE(10.12, NSUInteger, sd.borderColor, 0), 2u),
             .lminb = lminb, .lmaxb = lmaxb, .aniso = sd.maxAnisotropy
         };
+        s->_pxSig = (nvmtl_px_sampler_sig){
+            .minf = pk.minf, .magf = pk.magf, .mipf = pk.mipf,
+            .as = pk.as, .at = pk.at, .ar = pk.ar,
+            .cmp = pk.cmp, .border = pk.border,
+            .lminb = nvmtl_pxkey_float_bits(lmin), .lmaxb = nvmtl_pxkey_float_bits(lmax),
+            .aniso = (uint32_t)pk.aniso, .pad = 0u
+        };
+        s->_hasPxSig = YES;
         NSDictionary *cached = nil;
         if (!getenv("NVMTL_PIXEL_SAMPLER_CACHE_OFF")) {
             os_unfair_lock_lock(&px_lock);

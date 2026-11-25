@@ -876,6 +876,7 @@ public:
             // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
             // its pixels landed, so the plugin keeps marking them after the GPU finishes.
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
+            setProperty("NVAccelDirtyMarkFused", 1ULL, 32);
             // Properties an Apple accelerator publishes that programs read when they walk the registry for the GPU in use
             // (game engines list IOAccelerator services to pick the primary GPU, and the OpenGL renderer id ties a
             // display GPU to a CGL renderer). Only added when nothing else has set them.
@@ -2064,17 +2065,36 @@ static bool nvSVPend(unsigned id, int op, NVResource *resource = nullptr)
     IOSimpleLockUnlock(gNVSVPendLock);
     return r;
 }
+static void nvAccelNotifyPageoff(NVAccel *owner)
+{
+    IOService *nvrm = nvAccelNVRM(owner);
+    if (!nvrm) return;
+    static const OSSymbol *sPoNoteSym = nullptr;
+    const OSSymbol *sym = __atomic_load_n(&sPoNoteSym, __ATOMIC_ACQUIRE);
+    if (!sym) {
+        const OSSymbol *fresh = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF_NOTE);
+        if (fresh) {
+            if (!OSCompareAndSwapPtr(nullptr, (void *)fresh, (void *volatile *)&sPoNoteSym))
+                fresh->release();
+            sym = __atomic_load_n(&sPoNoteSym, __ATOMIC_ACQUIRE);
+        }
+    }
+    if (sym) nvrm->callPlatformFunction(sym, false, nullptr, nullptr, nullptr, nullptr);
+}
 // A pending mark belongs to the resource that last dirtied the surface. Never
 // dereference a device cache during destruction, or clear a newer owner's mark.
 static void nvSVForgetResource(NVResource *resource)
 {
     if (!resource || !gNVSVPendLock) return;
+    bool forgot = false;
     IOSimpleLockLock(gNVSVPendLock);
     for (unsigned i = 0; i < kNVSVPend; i++) if (gNVSVPendResource[i] == resource) {
         gNVSVPendId[i] = 0;
         gNVSVPendResource[i] = nullptr;
+        forgot = true;
     }
     IOSimpleLockUnlock(gNVSVPendLock);
+    if (forgot) nvAccelNotifyPageoff(nullptr);
 }
 static void    *gNVSVRoot;
 static unsigned gNVSVOk, gNVSVRefused;
@@ -2147,7 +2167,21 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
     // waiting for one of those marks holds the accelerator lock, so that re-mark must not wait for the lock: it is
     // dropped instead, and the mark taken at commit stands.
     const bool tryOnly = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_TRYLOCK);
-    p->plane &= ~(NVRM_SS_PLANE_TRYLOCK | NVRM_SS_PLANE_GPU_MARK);
+    const bool dirtyAndMark = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_DIRTY_AND_MARK);
+    p->plane &= ~(NVRM_SS_PLANE_TRYLOCK | NVRM_SS_PLANE_GPU_MARK | NVRM_SS_PLANE_DIRTY_AND_MARK);
+    // nitro-perf v9: when NVRM_SS_PLANE_DIRTY_AND_MARK is set by WindowServer, arm the kernel pending mark AFTER
+    // nvFamUnlock (on scope exit) so dirty + mark(YES) execute in one single kernel trap with identical lock ordering.
+    struct NVDirtyMarkScope {
+        bool active;
+        unsigned int sid;
+        ~NVDirtyMarkScope() {
+            if (active && sid) {
+                struct NVRMSurfShareEsc m; nvSVZero(&m, sizeof m);
+                m.surfaceID = sid; m.plane = NVRM_SS_PLANE_GPU_MARK | 1u;
+                (void)nvSurfGpuEscape(&m);
+            }
+        }
+    } dirtyMarkScope { dirtyAndMark, p->surfaceID };
     // plane is a full uint32 from the caller and reaches IOGraphicsAccelerator2::deviceCacheForIOSurface
     // below. The plane > 15 refusals further down run after that call, and only on the dirty path.
     if (p->plane > 15) { p->status = NVRM_SS_NO_CACHE; return kIOReturnSuccess; }
@@ -2296,6 +2330,14 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     NVVidMemory *vm = nvres_vidmem(this);
     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
     void *surf = (r[kNvResType] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
+    // nitro-perf v9: bump the NVRM SHM pageoff_gen counter at entry and exit of any IOSurface pageoff so
+    // WindowServer can safely skip post-completion NVRM_ESC_SURF_DIRTY re-marks when zero page-offs occurred.
+    struct NVPoGenScope {
+        NVAccel *a;
+        bool active;
+        ~NVPoGenScope() { if (active) nvAccelNotifyPageoff(a); }
+    } poGenScope { fAccel, surf != nullptr };
+    if (poGenScope.active) nvAccelNotifyPageoff(fAccel);
     if (nvSVDiag()) {
         volatile unsigned short *vd = *(unsigned short *volatile *)(r + kNvResValid);
         ALOG("SVDIAG pageoff surface %u type 0x%x vm %d rm %d scanout %d valid0 %#x valid6 %#x", surf ? _ZNK9IOSurface12getSurfaceIDEv(surf) : 0u,
