@@ -2154,6 +2154,19 @@ static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
     if (p->surfaceID) nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
     return 0;
 }
+// nitro-perf v9: arms the WindowServer pending mark on scope exit (after nvFamUnlock) when
+// NVRM_SS_PLANE_DIRTY_AND_MARK is set, fusing dirty + mark(YES) into one kernel trap.
+struct NVDirtyMarkScope {
+    bool active;
+    unsigned int sid;
+    ~NVDirtyMarkScope() {
+        if (active && sid) {
+            struct NVRMSurfShareEsc m; nvSVZero(&m, sizeof m);
+            m.surfaceID = sid; m.plane = NVRM_SS_PLANE_GPU_MARK | 1u;
+            (void)nvSurfGpuEscape(&m);
+        }
+    }
+};
 static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
 {
     if (p->version == NVRM_SURFSHARE_VERSION && cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_GPU_MARK)) {
@@ -2169,19 +2182,7 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
     const bool tryOnly = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_TRYLOCK);
     const bool dirtyAndMark = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & NVRM_SS_PLANE_DIRTY_AND_MARK);
     p->plane &= ~(NVRM_SS_PLANE_TRYLOCK | NVRM_SS_PLANE_GPU_MARK | NVRM_SS_PLANE_DIRTY_AND_MARK);
-    // nitro-perf v9: when NVRM_SS_PLANE_DIRTY_AND_MARK is set by WindowServer, arm the kernel pending mark AFTER
-    // nvFamUnlock (on scope exit) so dirty + mark(YES) execute in one single kernel trap with identical lock ordering.
-    struct NVDirtyMarkScope {
-        bool active;
-        unsigned int sid;
-        ~NVDirtyMarkScope() {
-            if (active && sid) {
-                struct NVRMSurfShareEsc m; nvSVZero(&m, sizeof m);
-                m.surfaceID = sid; m.plane = NVRM_SS_PLANE_GPU_MARK | 1u;
-                (void)nvSurfGpuEscape(&m);
-            }
-        }
-    } dirtyMarkScope { dirtyAndMark, p->surfaceID };
+    NVDirtyMarkScope dirtyMarkScope { dirtyAndMark, p->surfaceID };
     // plane is a full uint32 from the caller and reaches IOGraphicsAccelerator2::deviceCacheForIOSurface
     // below. The plane > 15 refusals further down run after that call, and only on the dirty path.
     if (p->plane > 15) { p->status = NVRM_SS_NO_CACHE; return kIOReturnSuccess; }

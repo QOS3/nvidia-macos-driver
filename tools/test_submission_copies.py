@@ -56,9 +56,12 @@ static int nvmtl_vk_copy_buffer(void *q, Buffer *from, size_t off,
 // in events as "m<surface>:<pending>", and every VRAM mark as "d<surface>" and counted in dirtyCalls.
 static NSMutableArray *events; static unsigned dirtyCalls; static BOOL wsKernelWaits;
 static int nvmtl_vk_surface_dirty(uint32_t s,uint32_t p){(void)p;dirtyCalls++;if(events)[events addObject:[NSString stringWithFormat:@"d%u",s]];return 0;}
+static int nvmtl_vk_surface_dirty_and_mark(uint32_t s,uint32_t p){(void)p;dirtyCalls++;if(events){[events addObject:[NSString stringWithFormat:@"d%u",s]];[events addObject:[NSString stringWithFormat:@"m%u:1",s]];}return 0;}
 static BOOL nvmtl_ws_kernel_waits(void){return wsKernelWaits;}
 static uint32_t nvmtl_vk_surface_gpu_mark(uint32_t sid,int pending){if(events)[events addObject:[NSString stringWithFormat:@"m%u:%d",sid,pending]];return 0;}
 static int nvmtl_vk_accel_surface_wait(void){return getenv("KERNEL_HALF")&&!strcmp(getenv("KERNEL_HALF"),"1");}
+static int nvmtl_vk_accel_dirty_mark_fused(void){return 0;}
+static uint32_t nvmtl_surf_meta_pageoff_gen(void){return 0u;}
 static void nvtrace(const char *f,...){(void)f;}
 '''
 checks = r'''
@@ -132,12 +135,14 @@ typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied skipRemark:(BOOL)skipRemark;
 @end
 // every publication is logged in events as "o<tag>:<dirtied>" (dirtied: the commit's VRAM mark stands, nothing is asked
 // of the kernel again)
 @implementation NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut { return [self nvmtlSurfaceOutDirtied:NO]; }
-- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { return [self nvmtlSurfaceOutDirtied:dirtied skipRemark:NO]; }
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied skipRemark:(BOOL)skipRemark { (void)skipRemark; if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
 @end
 @interface NVMTLCommandBuffer : NSObject { @public
     BOOL _executionDone, _committed, _commitMarking, _partsRetiring; NSError *_cbError;
