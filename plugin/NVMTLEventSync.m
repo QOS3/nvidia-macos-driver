@@ -518,43 +518,81 @@ static int nvmtl_skip_empty_on(void) {
         if (scheduled) dispatch_group_enter(_scheduledGroup);
     }
 }
+static BOOL nvmtl_ws_hiprio_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_WS_HIPRIO");
+        on = nvmtl_ws_hiprio_mode(e, getprogname());
+        if (on) nvlog("commit: nitro-perf v10 WindowServer fixed-priority Mach workers ON (NVMTL_WS_HIPRIO=%s)", e ? e : "default");
+    }
+    return on == 1;
+}
+static void nvmtl_ws_run_objc_block(void *ctx) {
+    @autoreleasepool {
+        dispatch_block_t blk = (__bridge_transfer dispatch_block_t)ctx;
+        blk();
+    }
+}
+static BOOL nvmtl_ws_serial_enqueue_block(nvmtl_ws_serial_t *q, dispatch_block_t blk) {
+    if (!q || !blk) return NO;
+    void *retained = (__bridge_retained void *)[blk copy];
+    if (nvmtl_ws_serial_enqueue(q, nvmtl_ws_run_objc_block, retained) == 0) return YES;
+    (void)(__bridge_transfer dispatch_block_t)retained;
+    return NO;
+}
 - (void)nvmtlDispatchEnteredHandlers:(NSArray *)handlers scheduled:(BOOL)scheduled {
     if (!handlers.count) return;
-    dispatch_queue_t order;
+    dispatch_queue_t order = nil;
+    nvmtl_ws_serial_t *wsWorker = NULL;
     dispatch_queue_t customTarget;
+    const BOOL wsHi = nvmtl_ws_hiprio_enabled();
     os_unfair_lock_lock(&_queue->_callbackQueueLock);
-    if (!_queue->_callbackOrderQueue) {
-        static int hiQos = -1;
-        if (hiQos < 0) { const char *e = getenv("NVMTL_EXEC_QOS"); hiQos = !(e && e[0] == '0'); }
-        dispatch_queue_attr_t attr = hiQos
-            ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)
-            : DISPATCH_QUEUE_SERIAL;
-        _queue->_callbackOrderQueue = dispatch_queue_create("com.nvmtl.command-callbacks", attr);
+    if (wsHi) {
+        if (!_queue->_wsCallbackWorker && !_queue->_callbackOrderQueue) {
+            _queue->_wsCallbackWorker = nvmtl_ws_serial_create("nvmtl.ws.callbacks");
+        }
+        wsWorker = _queue->_wsCallbackWorker;
     }
-    order = _queue->_callbackOrderQueue;
+    if (!wsWorker) {
+        if (!_queue->_callbackOrderQueue) {
+            static int hiQos = -1;
+            if (hiQos < 0) { const char *e = getenv("NVMTL_EXEC_QOS"); hiQos = !(e && e[0] == '0'); }
+            dispatch_queue_attr_t attr = hiQos
+                ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)
+                : DISPATCH_QUEUE_SERIAL;
+            _queue->_callbackOrderQueue = dispatch_queue_create("com.nvmtl.command-callbacks", attr);
+        }
+        order = _queue->_callbackOrderQueue;
+    }
     customTarget = _queue->_completionQueue;
     os_unfair_lock_unlock(&_queue->_callbackQueueLock);
-    if (customTarget) {
-        dispatch_async(order, ^{
-            dispatch_sync(customTarget, ^{
-                for (MTLCommandBufferHandler handler in handlers) {
-                    handler(self);
-                    if (scheduled) dispatch_group_leave(self->_scheduledGroup);
-                    dispatch_group_leave(self->_callbackGroup);
-                }
-            });
-        });
-    } else {
-        // nitro-perf v9: run directly on the USER_INTERACTIVE serial order queue (no redundant nested
-        // dispatch_sync(USER_INITIATED) hop that stalled WindowServer waitUntilScheduled in _dispatch_group_wait_slow).
-        dispatch_async(order, ^{
+    dispatch_block_t runBlock = ^{
+        void (^execAll)(void) = ^{
             for (MTLCommandBufferHandler handler in handlers) {
                 handler(self);
                 if (scheduled) dispatch_group_leave(self->_scheduledGroup);
                 dispatch_group_leave(self->_callbackGroup);
             }
-        });
+        };
+        if (customTarget) dispatch_sync(customTarget, execAll);
+        else execAll();
+        if (scheduled) {
+            [self->_completionCondition lock];
+            self->_scheduledPendingCount = 0;
+            [self->_completionCondition unlock];
+            [self->_completionCondition broadcast];
+        }
+    };
+    if (wsWorker && nvmtl_ws_serial_enqueue_block(wsWorker, runBlock)) return;
+    if (!order) {
+        os_unfair_lock_lock(&_queue->_callbackQueueLock);
+        if (!_queue->_callbackOrderQueue)
+            _queue->_callbackOrderQueue = dispatch_queue_create("com.nvmtl.command-callbacks",
+                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        order = _queue->_callbackOrderQueue;
+        os_unfair_lock_unlock(&_queue->_callbackQueueLock);
     }
+    dispatch_async(order, runBlock);
 }
 - (void)nvmtlMarkScheduled {
     if (_scheduleAfterPublish) return;
@@ -564,13 +602,16 @@ static int nvmtl_skip_empty_on(void) {
     if (!_wasScheduled) {
         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;
         handlers = [_scheduledHandlers copy]; [_scheduledHandlers removeAllObjects];
-        if (handlers.count) [self nvmtlEnterHandlerGroups:handlers.count scheduled:YES];
+        if (handlers.count) {
+            _scheduledPendingCount = handlers.count;
+            [self nvmtlEnterHandlerGroups:handlers.count scheduled:YES];
+        }
         fire = YES;
     }
     [_completionCondition unlock];
     if (fire) {
         if (handlers.count) [self nvmtlDispatchEnteredHandlers:handlers scheduled:YES];
-        [_completionCondition broadcast];
+        else [_completionCondition broadcast];
     }
 }
 - (void)nvmtlCollectDeviceTiming:(nvk_cmdbuf *)commands {
@@ -630,13 +671,21 @@ static int nvmtl_skip_empty_on(void) {
         // deadlock (No Man's Sky with MetalForceHudEnabled: white window, main thread in waitUntilCompleted, the execution
         // queue in present). NVMTL_PRESENT_INLINE=1: the old inline presents.
         if (_present) nvmtl_present_dump(_present->_parent ?: _present);   // the finished drawable, before it is handed over
-        static dispatch_queue_t presentQ; static int inl = -1; static dispatch_once_t once;
+        static dispatch_queue_t presentQ; static nvmtl_ws_serial_t *wsPresent; static int inl = -1; static dispatch_once_t once;
         dispatch_once(&once, ^{
             const char *e = getenv("NVMTL_PRESENT_INLINE"); inl = e && *e && *e != '0';
-            presentQ = dispatch_queue_create("nvmtl.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+            if (nvmtl_ws_hiprio_enabled()) wsPresent = nvmtl_ws_serial_create("nvmtl.ws.present");
+            if (!wsPresent) presentQ = dispatch_queue_create("nvmtl.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
         });
         if (inl) { for (dispatch_block_t action in _presentations) action(); }
-        else { NSArray *actions = [_presentations copy]; dispatch_async(presentQ, ^{ for (dispatch_block_t action in actions) action(); }); }
+        else {
+            NSArray *actions = [_presentations copy];
+            dispatch_block_t runPresent = ^{ for (dispatch_block_t action in actions) action(); };
+            if (!wsPresent || !nvmtl_ws_serial_enqueue_block(wsPresent, runPresent)) {
+                if (!presentQ) presentQ = dispatch_queue_create("nvmtl.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+                dispatch_async(presentQ, runPresent);
+            }
+        }
     }
     [_presentations removeAllObjects]; _present = nil;
     double deviceStart = 0, deviceEnd = 0;
@@ -994,8 +1043,10 @@ static void nvmtl_gsub_ahead_pass1(void) {
         nvmtl_busy_mark_commit(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
-        nvmtl_pump_buffers();
     }
+    // nitro-perf v10: wake the execution / submit-ahead worker AFTER releasing the class lock so
+    // fixed-priority WindowServer workers never wake straight into a mutex collision with ws_main_thread.
+    nvmtl_pump_buffers();
 }
 @end
 
@@ -1032,10 +1083,23 @@ static BOOL nvmtl_commit_ahead_on(void) {
 }
 // The commit-time ahead pass submits (host copies in, vkQueueSubmit) with the class lock held. On the committing thread
 // that stalled WindowServer's window drags on the 2.3.6 kexts within a few thousand flips (I-069, N-160 against N-166),
-// so a commit only asks for a pass and returns; one pass at a time runs on nvmtl.ahead. A request that arrives while a
-// pass runs makes it run once more, so no commit is left waiting for the worker.
+// so a commit only asks for a pass and returns; one pass at a time runs on nvmtl.ahead (or dedicated fixed-priority
+// nvmtl.ws.ahead in WindowServer). A request that arrives while a pass runs makes it run once more.
 static atomic_int nvmtl_ahead_state; // 0 idle, 1 running, 2 running and asked again
+static void nvmtl_ahead_worker_fn(void *ctx) {
+    (void)ctx;
+    @autoreleasepool { nvmtl_gsub_ahead_pass(); }
+}
 static void nvmtl_ahead_kick(void) {
+    if (nvmtl_ws_hiprio_enabled()) {
+        static dispatch_once_t wsOnce;
+        static nvmtl_ws_kick_t wsAhead;
+        static BOOL wsOk = NO;
+        dispatch_once(&wsOnce, ^{
+            wsOk = nvmtl_ws_kick_init(&wsAhead, "nvmtl.ws.ahead", nvmtl_ahead_worker_fn, NULL) == 0;
+        });
+        if (wsOk) { nvmtl_ws_kick_signal(&wsAhead); return; }
+    }
     static dispatch_once_t once; static dispatch_queue_t ahead;
     dispatch_once(&once, ^{ ahead = dispatch_queue_create("nvmtl.ahead", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)); });
     if (atomic_exchange(&nvmtl_ahead_state, 2) != 0) return;
@@ -1048,66 +1112,78 @@ static void nvmtl_ahead_kick(void) {
         } while (1);
     });
 }
+static void nvmtl_pump_worker_fn(void *ctx) {
+    (void)ctx;
+    for (;;) { @autoreleasepool {
+        // nitro-perf v9: submit ahead BEFORE the periodic 1s calibrated-timestamp refresh so
+        // WindowServer's commitAndWaitUntilSubmitted / waitUntilScheduled never waits on clock calibration.
+        if (nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
+        nvmtl_vk_clock_refresh();
+        NSArray *batch; uint64_t generation;
+        @synchronized ([NVMTLCommandBuffer class]) {
+            batch = [nvmtl_pending_buffers copy]; generation = nvmtl_pump_generation;
+        }
+        BOOL progress = NO;
+        for (NVMTLCommandBuffer *cb in batch) {
+            BOOL eligible;
+            @synchronized ([NVMTLCommandBuffer class]) {
+                NSMutableArray *reservations = cb->_queue->_reservations;
+                while (reservations.count && !((NVMTLQueueReservation *)reservations.firstObject)->buffer)
+                    [reservations removeObjectAtIndex:0];
+                eligible = reservations.firstObject == cb->_reservation;
+            }
+            if (!eligible) continue;
+            if ([cb nvmtlAdvancePart]) progress = YES;
+            @synchronized ([NVMTLCommandBuffer class]) {
+                if (cb->_executionDone) {
+                    [cb nvmtlReleaseReservation];
+                    [nvmtl_pending_buffers removeObjectIdenticalTo:cb];
+                    [cb nvmtlFinishCallbacks];
+                }
+            }
+        }
+        @synchronized ([NVMTLCommandBuffer class]) {
+            if (!progress && generation == nvmtl_pump_generation) {
+                nvmtl_pumping = NO; return;
+            }
+        }
+    } }
+}
 static void nvmtl_pump_buffers(void) {
-    static dispatch_once_t once; static dispatch_queue_t worker;
     const BOOL async = nvmtl_async_commit_on();
-    // The worker marks command buffers scheduled and completed, and WindowServer's and every app's main thread wait for
-    // that (commitAndWaitUntilSubmitted, waitUntilScheduled). With no QoS it ran at priority 31-37 while those waiters
-    // ran at 47-79, so under load a frame waited for a low-priority thread: 35 of 1501 WindowServer main-thread samples
-    // in waitUntilScheduled during an App Store scroll. User-interactive like nvmtl.ahead and nvmtl.present.
-    // NVMTL_EXEC_QOS=0: the old default-QoS queue.
-    if (async) dispatch_once(&once, ^{
-        const char *e = getenv("NVMTL_EXEC_QOS"); const BOOL hi = !(e && e[0] == '0');
-        worker = dispatch_queue_create("nvmtl.execution", hi ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0) : DISPATCH_QUEUE_SERIAL);
-        nvlog("commit: execution worker QoS %s (NVMTL_EXEC_QOS=%s)", hi ? "user-interactive" : "default", e ? e : "unset");
-    });
     if (!async) { nvmtl_vk_clock_refresh(); nvmtl_pump_buffers_sync(); return; }
+    BOOL kickAhead = NO, startPump = NO;
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_pending_buffers.count) return;
         ++nvmtl_pump_generation;
         if (nvmtl_pumping) {
             // the worker may be blocked on an earlier part; without this the commit is scheduled only after that wait
-            if (nvmtl_commit_ahead_on() && nvmtl_gsub_ahead_on()) nvmtl_ahead_kick();
-            return;
+            kickAhead = nvmtl_commit_ahead_on() && nvmtl_gsub_ahead_on();
+        } else {
+            nvmtl_pumping = YES;
+            startPump = YES;
         }
-        nvmtl_pumping = YES;
-        dispatch_async(worker, ^{
-            for (;;) { @autoreleasepool {
-                // nitro-perf v9: submit ahead BEFORE the periodic 1s calibrated-timestamp refresh so
-                // WindowServer's commitAndWaitUntilSubmitted / waitUntilScheduled never waits on clock calibration.
-                if (nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
-                nvmtl_vk_clock_refresh();
-                NSArray *batch; uint64_t generation;
-                @synchronized ([NVMTLCommandBuffer class]) {
-                    batch = [nvmtl_pending_buffers copy]; generation = nvmtl_pump_generation;
-                }
-                BOOL progress = NO;
-                for (NVMTLCommandBuffer *cb in batch) {
-                    BOOL eligible;
-                    @synchronized ([NVMTLCommandBuffer class]) {
-                        NSMutableArray *reservations = cb->_queue->_reservations;
-                        while (reservations.count && !((NVMTLQueueReservation *)reservations.firstObject)->buffer)
-                            [reservations removeObjectAtIndex:0];
-                        eligible = reservations.firstObject == cb->_reservation;
-                    }
-                    if (!eligible) continue;
-                    if ([cb nvmtlAdvancePart]) progress = YES;
-                    @synchronized ([NVMTLCommandBuffer class]) {
-                        if (cb->_executionDone) {
-                            [cb nvmtlReleaseReservation];
-                            [nvmtl_pending_buffers removeObjectIdenticalTo:cb];
-                            [cb nvmtlFinishCallbacks];
-                        }
-                    }
-                }
-                @synchronized ([NVMTLCommandBuffer class]) {
-                    if (!progress && generation == nvmtl_pump_generation) {
-                        nvmtl_pumping = NO; return;
-                    }
-                }
-            } }
-        });
     }
+    if (kickAhead) { nvmtl_ahead_kick(); return; }
+    if (!startPump) return;
+    if (nvmtl_ws_hiprio_enabled()) {
+        static dispatch_once_t wsOnce;
+        static nvmtl_ws_kick_t wsExec;
+        static BOOL wsOk = NO;
+        dispatch_once(&wsOnce, ^{
+            wsOk = nvmtl_ws_kick_init(&wsExec, "nvmtl.ws.execution", nvmtl_pump_worker_fn, NULL) == 0;
+        });
+        if (wsOk) { nvmtl_ws_kick_signal(&wsExec); return; }
+    }
+    static dispatch_once_t once; static dispatch_queue_t worker;
+    // The worker marks command buffers scheduled and completed, and every app's main thread waits for that.
+    // User-interactive like nvmtl.ahead and nvmtl.present. NVMTL_EXEC_QOS=0: the old default-QoS queue.
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_EXEC_QOS"); const BOOL hi = !(e && e[0] == '0');
+        worker = dispatch_queue_create("nvmtl.execution", hi ? dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0) : DISPATCH_QUEUE_SERIAL);
+        nvlog("commit: execution worker QoS %s (NVMTL_EXEC_QOS=%s)", hi ? "user-interactive" : "default", e ? e : "unset");
+    });
+    dispatch_async(worker, ^{ nvmtl_pump_worker_fn(NULL); });
 }
 
 static uint64_t nvmtl_event_read(NSCondition *condition, uint64_t *storage) {

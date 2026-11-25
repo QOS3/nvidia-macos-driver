@@ -17,6 +17,7 @@
 #include "nvmtl_icb_range.h"
 #include "nvmtl_yuv422.h"
 #include "nvmtl_cmd_refusal.h"
+#include "nvmtl_ws_worker.h"
 
 static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     const NSUInteger stride = 2 * sizeof(uint32_t) + sizeof(void *) + 16;
@@ -128,7 +129,7 @@ extern id gNVMTLMainDevice;
   // _resSets: the residency sets this queue was given. A set retains its allocations, so holding the
   // set is what keeps them alive; without this nobody did, and an app that handed its only reference
   // to the queue had every resource in the set freed under work the queue had not finished.
-  @public nvk_queue _q; id _dev; id _completionQueue; dispatch_queue_t _callbackOrderQueue; os_unfair_lock _callbackQueueLock; NSMutableArray *_reservations; dispatch_semaphore_t _capacity; NSUInteger _capacityCount; NSMutableArray *_resSets;
+  @public nvk_queue _q; id _dev; id _completionQueue; dispatch_queue_t _callbackOrderQueue; nvmtl_ws_serial_t *_wsCallbackWorker; os_unfair_lock _callbackQueueLock; NSMutableArray *_reservations; dispatch_semaphore_t _capacity; NSUInteger _capacityCount; NSMutableArray *_resSets;
 } @end
 @interface NVMTLCommandBuffer : NSObject <MTLCommandBuffer> {
   NSError *_cbError;
@@ -154,6 +155,7 @@ extern id gNVMTLMainDevice;
   NSCondition *_completionCondition;
   dispatch_group_t _callbackGroup, _scheduledGroup;
   BOOL _wasScheduled, _executionDone, _completionReady, _scheduleAfterPublish;
+  NSUInteger _scheduledPendingCount;
   NSMutableArray *_signals;
   NSMutableArray *_waits;
 }

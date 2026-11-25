@@ -8021,8 +8021,8 @@ static void nvmtl_late_present(void) {
     if (_reservation) {
         @synchronized ([NVMTLCommandBuffer class]) {
             [self nvmtlReleaseReservation];
-            nvmtl_pump_buffers();
         }
+        nvmtl_pump_buffers();
     }
 }
 - (CFTimeInterval)GPUStartTime {
@@ -8047,7 +8047,7 @@ static void nvmtl_late_present(void) {
 }
 - (void)waitUntilScheduled {
     _nWait++; [_completionCondition lock];
-    while (!_wasScheduled && !_executionDone) [_completionCondition wait];
+    while ((!_wasScheduled && !_executionDone) || _scheduledPendingCount > 0) [_completionCondition wait];
     [_completionCondition unlock];
     dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER);
 }
@@ -8090,7 +8090,10 @@ static void nvmtl_late_present(void) {
     if (!r) return;
     for (NSUInteger i = 0; i < n; i++) [self removeResidencySet:r[i]];
 }
-- (void)dealloc { nvmtl_vk_queue_destroy(&_q); }
+- (void)dealloc {
+    if (_wsCallbackWorker) { nvmtl_ws_serial_destroy(_wsCallbackWorker); _wsCallbackWorker = NULL; }
+    nvmtl_vk_queue_destroy(&_q);
+}
 - (id<MTLCommandBuffer>)commandBuffer {
     dispatch_semaphore_t cap = nil;
     if (nvmtl_async_commit_on()) {

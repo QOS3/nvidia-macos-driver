@@ -41,6 +41,7 @@ jobs:
             test_import_cache.c \
             test_surf_meta.c \
             test_sampler_key.c \
+            test_ws_worker.c \
             test_game_priority.c \
             test_fps_limit.c \
             test_schedule_policy.c \
