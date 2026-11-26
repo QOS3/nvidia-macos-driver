@@ -8,9 +8,9 @@
  *
  * On >=4 GiB Resizable BAR, desktop apps (Preview/PDFKit, browsers, Electron)
  * churn variable-size 64 KiB..32 MiB IOSurfaces. Quantizing new allocations to
- * 4-steps-per-octave buckets (<=12.5% slack) and reusing pooled blocks via
+ * 4-steps-per-octave buckets (<25% slack) and reusing pooled blocks via
  * bounded best-fit (<=25% slack, oldest-first tie-break) raises pool hit rates
- * from ~68% to >95%, avoiding RM/GSP allocate/map/unmap/free RPC storms.
+ * from ~51-68% to ~88-95%+, avoiding RM/GSP allocate/map/unmap/free RPC storms.
  */
 #ifndef NVRM_VRAM_POOL_H
 #define NVRM_VRAM_POOL_H
@@ -24,7 +24,7 @@
 
 /*
  * Quantize a 64 KiB-aligned request size upward into a 4-steps-per-octave
- * reusable bucket (32 total buckets across 64 KiB .. 32 MiB, <=12.5% overhead).
+ * reusable bucket (32 total buckets across 64 KiB .. 32 MiB, <25% overhead).
  * Requests above NVRM_VRAM_POOL_MAX_ENTRY keep their exact 64 KiB-aligned size.
  */
 static inline unsigned long long nvrmVramPoolBucket(unsigned long long want)

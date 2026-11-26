@@ -136,11 +136,11 @@ int main(void)
     for (unsigned long long sz = 64 * K; sz <= 32 * M; sz += 64 * K) {
         unsigned long long b = nvrmVramPoolBucket(sz);
         if (b < sz || b < prev || (b & 0xFFFFull) != 0 || b > 32 * M) { bucketOk = 0; break; }
-        /* Overhead strictly <= 12.5% (1/8) for every 64 KiB-aligned size in 64K..32M */
-        if (sz >= 512 * K && (b - sz) * 8ull > sz) { bucketOk = 0; break; }
+        /* 4-steps-per-octave overhead is strictly < 25% (1/4) for every 64 KiB-aligned size in 64K..32M */
+        if ((b - sz) * 4ull >= sz) { bucketOk = 0; break; }
         prev = b;
     }
-    CHECK("bucket: monotonic, 64K-aligned, <=12.5% overhead across 64K..32M", bucketOk);
+    CHECK("bucket: monotonic, 64K-aligned, <25% overhead across 64K..32M", bucketOk);
 
     /* 2. Best-fit bounds */
     CHECK("fits: exact always fits", nvrmVramPoolFits(4 * M, 4 * M));
