@@ -98,7 +98,9 @@ extern "C" {
 #pragma clang diagnostic pop
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "nvrm-vram-pool.h"
 static void vramPoolDrain(const struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *dev);
+static bool vramPoolHasPending(void);
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
 // 4 GB, which is 3/4 of the 256 MB firmware window but left a 512 MB or 1 GB BAR1 no better off (issue #27).
@@ -4742,11 +4744,6 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LO
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "scanout+cursor the framebuffer itself maps into BAR1");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 
-#define NVRM_VRAM_POOL_MAX_SLOTS 128
-#define NVRM_VRAM_POOL_MAX_BYTES_4G (160ull * 1024ull * 1024ull)
-#define NVRM_VRAM_POOL_MAX_BYTES (192ull * 1024ull * 1024ull)
-#define NVRM_VRAM_POOL_MAX_ENTRY (16ull * 1024ull * 1024ull)
-#define NVRM_VRAM_POOL_COOLDOWN_NS (10ull * 1000ull * 1000ull)
 struct NVRMVramPoolEntry {
     struct NvKmsKapiDevice *dev;
     struct NvKmsKapiMemory *mem;
@@ -4760,6 +4757,7 @@ static int gVramPoolN = 0;
 static int gVramPoolOn = 1;
 static uint64_t gVramPoolCooldownAbs = 0;
 static volatile SInt64 gVramPoolBytes = 0, gVramPoolHits = 0, gVramPoolMisses = 0, gVramPoolDrains = 0, gVramPoolCooldownSkips = 0;
+static volatile SInt64 gVramPoolBestFitHits = 0, gVramAsyncFrees = 0, gVramAsyncPeakQ = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_pool, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramPoolOn, 0,
            "1 = recycle recently freed small VRAM blocks without unmapping/freeing through NVKMS");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_hits,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolHits,   "vramGrant pool hits");
@@ -4767,20 +4765,168 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_misses, CTLFLAG_RD | CTLFLAG_LOCK
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolBytes,  "bytes parked in the VRAM recycle pool");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_drains, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolDrains, "VRAM recycle pool entries returned to NVKMS");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_cooldown_skips, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolCooldownSkips, "vramGrant pool entries skipped while cooling down");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_bestfit_hits, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolBestFitHits, "vramGrant pool hits served by a slightly larger best-fit block");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_async_frees, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramAsyncFrees, "VRAM blocks unmapped and freed off the display gate by the async worker");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_async_peak_q, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramAsyncPeakQ, "peak queue depth of deferred VRAM frees");
+
+// nitro-perf v11: non-blocking deferred-free queue. Pool evictions and unpooled ReBAR releases are handed to a
+// low-priority ONCE worker that calls NVKMS unmapMemory/freeMemory WITHOUT holding NVRMDisplayGate (startLock()),
+// eliminating 20-25 ms WindowServer flip stalls during heavy PDF/surface churn. Lock hierarchy:
+//   NVRMDisplayGate -> gVramFreeLock (leaf O(1) ring lock)  |  worker/direct: never takes NVRMDisplayGate, never holds gVramFreeLock across NVKMS.
+struct NVRMVramFreeItem {
+    const struct NvKmsKapiFunctionsTable *kms;
+    struct NvKmsKapiDevice *dev;
+    struct NvKmsKapiMemory *mem;
+    void *kva;
+    NvU64 size;
+    bool fromPool;
+};
+static NVRMVramFreeItem gVramFreeQ[NVRM_VRAM_FREE_Q_CAP];
+static unsigned gVramFreeHead = 0, gVramFreeCount = 0, gVramFreeWaiters = 0, gVramDirectInFlight = 0;
+static bool gVramFreeInFlight = false;
+static struct NvKmsKapiDevice *gVramFreeInFlightDev = nullptr;
+static IOLock *gVramFreeLock = nullptr;
+static thread_call_t gVramFreeWorker = nullptr;
+
+static void vramFreeDoItem(const NVRMVramFreeItem &it)
+{
+    if (it.kms && it.dev && it.mem) {
+        if (it.kva) it.kms->unmapMemory(it.dev, it.mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, it.kva);
+        it.kms->freeMemory(it.dev, it.mem);
+    }
+    if (it.size) OSAddAtomic64(-(SInt64)it.size, &gVramMappedBytes);
+    if (it.fromPool) OSAddAtomic64(1, &gVramPoolDrains);
+}
+
+static void vramFreeWorkerRun(thread_call_param_t, thread_call_param_t)
+{
+    if (!gVramFreeLock) return;
+    for (;;) {
+        IOLockLock(gVramFreeLock);
+        if (gVramFreeCount == 0) {
+            IOLockUnlock(gVramFreeLock);
+            return;
+        }
+        const NVRMVramFreeItem it = gVramFreeQ[gVramFreeHead];
+        gVramFreeQ[gVramFreeHead] = {};
+        gVramFreeHead = (gVramFreeHead + 1u) % NVRM_VRAM_FREE_Q_CAP;
+        gVramFreeCount--;
+        gVramFreeInFlight = true;
+        gVramFreeInFlightDev = it.dev;
+        IOLockUnlock(gVramFreeLock);
+
+        vramFreeDoItem(it);
+        OSAddAtomic64(1, &gVramAsyncFrees);
+
+        IOLockLock(gVramFreeLock);
+        gVramFreeInFlight = false;
+        gVramFreeInFlightDev = nullptr;
+        if (gVramFreeWaiters > 0) IOLockWakeup(gVramFreeLock, (event_t)&gVramFreeQ, false);
+        const bool more = gVramFreeCount > 0;
+        IOLockUnlock(gVramFreeLock);
+        if (!more) return;
+    }
+}
+
+static void vramFreeInit(void)
+{
+    if (!gVramFreeLock) gVramFreeLock = IOLockAlloc();
+    if (gVramFreeLock && !gVramFreeWorker) {
+        gVramFreeWorker = thread_call_allocate_with_options(
+            vramFreeWorkerRun, nullptr, THREAD_CALL_PRIORITY_LOW, THREAD_CALL_OPTIONS_ONCE);
+    }
+}
+
+static bool vramFreeEnqueue(const NVRMVramFreeItem &it, bool *needWake)
+{
+    vramFreeInit();
+    if (!gVramFreeLock || !gVramFreeWorker) return false;
+    bool queued = false;
+    IOLockLock(gVramFreeLock);
+    if (gVramFreeCount < NVRM_VRAM_FREE_Q_CAP) {
+        const unsigned tail = (gVramFreeHead + gVramFreeCount) % NVRM_VRAM_FREE_Q_CAP;
+        gVramFreeQ[tail] = it;
+        gVramFreeCount++;
+        if ((SInt64)gVramFreeCount > gVramAsyncPeakQ) gVramAsyncPeakQ = (SInt64)gVramFreeCount;
+        queued = true;
+    }
+    IOLockUnlock(gVramFreeLock);
+    if (queued && needWake) *needWake = true;
+    return queued;
+}
+
+static bool vramPoolHasPending(void)
+{
+    if (gVramPoolN > 0) return true;
+    if (!gVramFreeLock) return false;
+    IOLockLock(gVramFreeLock);
+    const bool pending = gVramFreeCount > 0 || gVramFreeInFlight || gVramDirectInFlight > 0;
+    IOLockUnlock(gVramFreeLock);
+    return pending;
+}
+
+static void vramFreeFlushSync(struct NvKmsKapiDevice *dev)
+{
+    if (!gVramFreeLock) return;
+    for (;;) {
+        NVRMVramFreeItem it = {};
+        bool found = false;
+        IOLockLock(gVramFreeLock);
+        for (unsigned k = 0; k < gVramFreeCount; k++) {
+            const unsigned idx = (gVramFreeHead + k) % NVRM_VRAM_FREE_Q_CAP;
+            if (!dev || gVramFreeQ[idx].dev == dev) {
+                it = gVramFreeQ[idx];
+                for (unsigned j = k; j + 1u < gVramFreeCount; j++) {
+                    const unsigned dst = (gVramFreeHead + j) % NVRM_VRAM_FREE_Q_CAP;
+                    const unsigned src = (gVramFreeHead + j + 1u) % NVRM_VRAM_FREE_Q_CAP;
+                    gVramFreeQ[dst] = gVramFreeQ[src];
+                }
+                const unsigned last = (gVramFreeHead + gVramFreeCount - 1u) % NVRM_VRAM_FREE_Q_CAP;
+                gVramFreeQ[last] = {};
+                gVramFreeCount--;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if ((gVramFreeInFlight && (!dev || gVramFreeInFlightDev == dev)) || gVramDirectInFlight > 0) {
+                gVramFreeWaiters++;
+                IOLockSleep(gVramFreeLock, (event_t)&gVramFreeQ, THREAD_UNINT);
+                gVramFreeWaiters--;
+                IOLockUnlock(gVramFreeLock);
+                continue;
+            }
+            IOLockUnlock(gVramFreeLock);
+            return;
+        }
+        IOLockUnlock(gVramFreeLock);
+        vramFreeDoItem(it);
+    }
+}
+
+static NVRMVramPoolEntry vramPoolPopAt(int idx)
+{
+    const NVRMVramPoolEntry e = gVramPool[idx];
+    for (int i = idx + 1; i < gVramPoolN; i++) gVramPool[i - 1] = gVramPool[i];
+    gVramPool[--gVramPoolN] = {};
+    OSAddAtomic64(-(SInt64)e.size, &gVramPoolBytes);
+    return e;
+}
 
 static void vramPoolEvictAt(const struct NvKmsKapiFunctionsTable *kms, int idx)
 {
     if (idx < 0 || idx >= gVramPoolN) return;
-    const NVRMVramPoolEntry e = gVramPool[idx];
-    for (int i = idx + 1; i < gVramPoolN; i++) gVramPool[i - 1] = gVramPool[i];
-    gVramPool[--gVramPoolN] = {};
-    if (kms && e.dev && e.mem) {
-        if (e.kva) kms->unmapMemory(e.dev, e.mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, e.kva);
-        kms->freeMemory(e.dev, e.mem);
-    }
-    OSAddAtomic64(-(SInt64)e.size, &gVramMappedBytes);
-    OSAddAtomic64(-(SInt64)e.size, &gVramPoolBytes);
-    OSAddAtomic64(1, &gVramPoolDrains);
+    const NVRMVramPoolEntry e = vramPoolPopAt(idx);
+    const NVRMVramFreeItem it = { kms, e.dev, e.mem, e.kva, e.size, true };
+    vramFreeDoItem(it);
+}
+
+static void vramPoolEvictAsyncAt(const struct NvKmsKapiFunctionsTable *kms, int idx, bool *needWake)
+{
+    if (idx < 0 || idx >= gVramPoolN) return;
+    const NVRMVramPoolEntry e = vramPoolPopAt(idx);
+    const NVRMVramFreeItem it = { kms, e.dev, e.mem, e.kva, e.size, true };
+    if (!vramFreeEnqueue(it, needWake)) vramFreeDoItem(it);
 }
 
 static void vramPoolDrain(const struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *dev)
@@ -4788,7 +4934,16 @@ static void vramPoolDrain(const struct NvKmsKapiFunctionsTable *kms, struct NvKm
     for (int i = gVramPoolN - 1; i >= 0; i--) {
         if (!dev || gVramPool[i].dev == dev) vramPoolEvictAt(kms, i);
     }
+    vramFreeFlushSync(dev);
 }
+
+struct VramFreeWakeGuard {
+    bool wake = false;
+    void fire() {
+        if (wake && gVramFreeWorker) { wake = false; thread_call_enter(gVramFreeWorker); }
+    }
+    ~VramFreeWakeGuard() { fire(); }
+};
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -4940,6 +5095,9 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_hits);   sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_misses);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_bytes);  sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_drains);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_cooldown_skips);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_bestfit_hits);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_async_frees);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_async_peak_q);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
@@ -4955,6 +5113,7 @@ static void nvrmfbInstallSysctl(void)
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 {
+    VramFreeWakeGuard wakeGuard;
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     nvrmfbInstallSysctl();
     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
@@ -4963,50 +5122,55 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     if (!want) return false;
     if (fBarLen && fBarLen <= (512ull << 20)) want = nvrmVramSizeClass(want);   // few hole sizes in a small window (see nvrm-vram-class.h)
 
-    if (!gVramPoolOn && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
+    if (!gVramPoolOn && vramPoolHasPending()) vramPoolDrain(fKms, fDev);
     if (gVramPoolOn && fBarLen > (512ull << 20) && want <= NVRM_VRAM_POOL_MAX_ENTRY) {
         if (!gVramPoolCooldownAbs) nanoseconds_to_absolutetime(NVRM_VRAM_POOL_COOLDOWN_NS, &gVramPoolCooldownAbs);
         const uint64_t nowAbs = mach_absolute_time();
         int hit = -1;
+        NvU64 bestSize = ~0ull;
         for (int i = 0; i < gVramPoolN; i++) {
-            if (gVramPool[i].dev != fDev || gVramPool[i].size != want) continue;
+            if (gVramPool[i].dev != fDev) continue;
+            const NvU64 esz = gVramPool[i].size;
+            if (!nvrmVramPoolFits(esz, want)) continue;
             const NvU64 p = gVramPool[i].phys;
             const bool bad = !p ||
-                (fPhys && fSize && p < (fPhys + fSize) && (p + want) > fPhys) ||
-                (fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + want) > fConsPhys);
-            if (bad) { vramPoolEvictAt(fKms, i); i--; continue; }
+                (fPhys && fSize && p < (fPhys + fSize) && (p + esz) > fPhys) ||
+                (fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + esz) > fConsPhys);
+            if (bad) { vramPoolEvictAsyncAt(fKms, i, &wakeGuard.wake); i--; continue; }
             if (nowAbs >= gVramPool[i].releasedAbs && (nowAbs - gVramPool[i].releasedAbs) < gVramPoolCooldownAbs) {
                 OSAddAtomic64(1, &gVramPoolCooldownSkips);
                 continue;
             }
-            hit = i;
-            break;
+            if (hit < 0 || esz < bestSize) {
+                hit = i;
+                bestSize = esz;
+                if (bestSize == want) break;
+            }
         }
         if (hit >= 0) {
-            const NVRMVramPoolEntry e = gVramPool[hit];
-            for (int i = hit + 1; i < gVramPoolN; i++) gVramPool[i - 1] = gVramPool[i];
-            gVramPool[--gVramPoolN] = {};
-            OSAddAtomic64(-(SInt64)want, &gVramPoolBytes);
-            const UInt64 allocationCookie = gAllocations.insert(e.mem, want);
+            const NVRMVramPoolEntry e = vramPoolPopAt(hit);
+            const UInt64 allocationCookie = gAllocations.insert(e.mem, e.size);
             if (!allocationCookie) {
-                fKms->unmapMemory(fDev, e.mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, e.kva);
-                fKms->freeMemory(fDev, e.mem);
-                OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+                const NVRMVramFreeItem drop = { fKms, fDev, e.mem, e.kva, e.size, false };
+                if (!vramFreeEnqueue(drop, &wakeGuard.wake)) vramFreeDoItem(drop);
                 return false;
             }
             r->allocationCookie = allocationCookie;
             r->handle = e.mem; r->kva = e.kva; r->phys = (unsigned long long)e.phys;
-            r->actualSize = (unsigned long long)want;
+            r->actualSize = (unsigned long long)e.size;
             r->mappedTotal = (unsigned long long)(OSAddAtomic64(0, &gVramMappedBytes) + gVramParkedBytes);
             fVramGrants++;
-            OSAddAtomic64(1, &gCntGrant); OSAddAtomic64((SInt64)want, &gCntGrantBytes);
+            OSAddAtomic64(1, &gCntGrant); OSAddAtomic64((SInt64)e.size, &gCntGrantBytes);
             OSAddAtomic64(1, &gVramPoolHits);
+            if (e.size > want) OSAddAtomic64(1, &gVramPoolBestFitHits);
             gate.release();
-            nvu_zero_wide(e.kva, (size_t)want);
+            wakeGuard.fire();
+            nvu_zero_wide(e.kva, (size_t)e.size);
             __asm__ __volatile__("sfence" ::: "memory");
             return true;
         }
         OSAddAtomic64(1, &gVramPoolMisses);
+        want = nvrmVramPoolBucket(want);
     }
 
     const SInt64 budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes);
@@ -5014,7 +5178,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     // Parked blocks keep their BAR1 mapping (see below), so they count against the budget. On a 256 MB BAR1 (every
     // GTX 16, boards without Resizable BAR) the park ceiling is the smaller one, so surfaces keep most of the budget.
     SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
-    if (before + (SInt64)want > budget && gVramPoolN > 0) {
+    if (before + (SInt64)want > budget && vramPoolHasPending()) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         vramPoolDrain(fKms, fDev);
         before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
@@ -5055,7 +5219,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         // Both failures print what the budget counted at that moment: the real BAR1 limit of a 256 MB window is
         // somewhere under the budget, and only these lines can show where.
         if (!m) {
-            if (!poolRetried && gVramPoolN > 0) {
+            if (!poolRetried && vramPoolHasPending()) {
                 poolRetried = true;
                 vramPoolDrain(fKms, fDev);
                 continue;
@@ -5068,7 +5232,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         void *k = nullptr;
         if (!fKms->mapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &k) || !k) {
             fKms->freeMemory(fDev, m);
-            if (!poolRetried && gVramPoolN > 0) {
+            if (!poolRetried && vramPoolHasPending()) {
                 poolRetried = true;
                 vramPoolDrain(fKms, fDev);
                 continue;
@@ -5160,6 +5324,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     }
 
     gate.release();
+    wakeGuard.fire();
     nvu_zero_wide(kva, (size_t)want);
     __asm__ __volatile__("sfence" ::: "memory");
     volatile NvU64 *q = (volatile NvU64 *)kva;
@@ -5203,32 +5368,58 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
     struct NvKmsKapiMemory *mem = (struct NvKmsKapiMemory *)r->handle;
     if (!mem || !fKms || !fDev) return false;
     if (!gAllocations.remove(mem, r->allocationCookie)) return false;
-    if (!gVramPoolOn && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
-    if (gVramPoolOn && fBarLen > (512ull << 20) && r->kva && r->actualSize > 0 && r->actualSize <= NVRM_VRAM_POOL_MAX_ENTRY && fPhysForVa) {
-        const NvU64 p = fPhysForVa(r->kva);
-        const bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + r->actualSize) > fPhys;
-        const bool onConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + r->actualSize) > fConsPhys;
+    const NvU64 actualSize = (NvU64)r->actualSize;
+    void *const kva = r->kva;
+    const struct NvKmsKapiFunctionsTable *const kms = fKms;
+    struct NvKmsKapiDevice *const dev = fDev;
+    bool needWake = false;
+
+    if (!gVramPoolOn && vramPoolHasPending()) vramPoolDrain(kms, dev);
+    if (gVramPoolOn && fBarLen > (512ull << 20) && kva && actualSize > 0 && actualSize <= NVRM_VRAM_POOL_MAX_ENTRY && fPhysForVa) {
+        const NvU64 p = fPhysForVa(kva);
+        const bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + actualSize) > fPhys;
+        const bool onConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + actualSize) > fConsPhys;
         if (p && !onScanout && !onConsole) {
             const NvU64 poolMaxBytes = fBarLen <= (4ull << 30) ? NVRM_VRAM_POOL_MAX_BYTES_4G : NVRM_VRAM_POOL_MAX_BYTES;
             while (gVramPoolN >= NVRM_VRAM_POOL_MAX_SLOTS ||
-                   (gVramPoolN > 0 && OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)r->actualSize > (SInt64)poolMaxBytes)) {
-                vramPoolEvictAt(fKms, 0);
+                   (gVramPoolN > 0 && OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)actualSize > (SInt64)poolMaxBytes)) {
+                vramPoolEvictAsyncAt(kms, 0, &needWake);
             }
             if (gVramPoolN < NVRM_VRAM_POOL_MAX_SLOTS &&
-                OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)r->actualSize <= (SInt64)poolMaxBytes) {
-                gVramPool[gVramPoolN++] = { fDev, mem, r->kva, p, (NvU64)r->actualSize, mach_absolute_time() };
-                OSAddAtomic64((SInt64)r->actualSize, &gVramPoolBytes);
-                OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)r->actualSize, &gCntReleaseBytes);
+                OSAddAtomic64(0, &gVramPoolBytes) + (SInt64)actualSize <= (SInt64)poolMaxBytes) {
+                gVramPool[gVramPoolN++] = { dev, mem, kva, p, actualSize, mach_absolute_time() };
+                OSAddAtomic64((SInt64)actualSize, &gVramPoolBytes);
+                OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)actualSize, &gCntReleaseBytes);
                 r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
+                gate.release();
+                if (needWake && gVramFreeWorker) thread_call_enter(gVramFreeWorker);
                 return true;
             }
         }
     }
-    if (r->kva) fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r->kva);
-    fKms->freeMemory(fDev, mem);
-    if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, &gVramMappedBytes);
-    OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)r->actualSize, &gCntReleaseBytes);
+    OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)actualSize, &gCntReleaseBytes);
     r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
+    const NVRMVramFreeItem direct = { kms, dev, mem, kva, actualSize, false };
+    const bool queued = (gVramPoolOn && fBarLen > (512ull << 20)) && vramFreeEnqueue(direct, &needWake);
+    if (!queued) {
+        vramFreeInit();
+        if (gVramFreeLock) {
+            IOLockLock(gVramFreeLock);
+            gVramDirectInFlight++;
+            IOLockUnlock(gVramFreeLock);
+        }
+    }
+    gate.release();
+    if (needWake && gVramFreeWorker) thread_call_enter(gVramFreeWorker);
+    if (!queued) {
+        vramFreeDoItem(direct);
+        if (gVramFreeLock) {
+            IOLockLock(gVramFreeLock);
+            if (gVramDirectInFlight > 0) gVramDirectInFlight--;
+            if (gVramFreeWaiters > 0 && gVramDirectInFlight == 0) IOLockWakeup(gVramFreeLock, (event_t)&gVramFreeQ, false);
+            IOLockUnlock(gVramFreeLock);
+        }
+    }
     return true;
 }
 
@@ -5245,9 +5436,9 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
             fWakeRetries = 0;
             __atomic_store_n(&fGpuLost, 0, __ATOMIC_RELEASE);
             __atomic_store_n(&gGpuResumeGraceUntil, 0, __ATOMIC_RELEASE);
-            if (gVramPoolN > 0 && fKms && fDev) {
+            if (fKms && fDev && vramPoolHasPending()) {
                 NVRMDisplayGate gate;
-                if (gate.valid() && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
+                if (gate.valid() && vramPoolHasPending()) vramPoolDrain(fKms, fDev);
             }
             FBLOG("GPU going to standby: head %u off with it", fHead);
         } else if (st == 1) {
