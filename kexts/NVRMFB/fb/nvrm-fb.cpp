@@ -5251,7 +5251,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     bool poolRetried = false;
     const struct NvKmsKapiFunctionsTable *const kms = fKms;
     struct NvKmsKapiDevice *const dev = fDev;
-    NvU64 (*const physForVa)(void *) = fPhysForVa;
+    const nvrm_phys_for_va_t physForVa = fPhysForVa;
     const NvU64 scanPhys = fPhys, scanSize = fSize;
     const NvU64 consPhys = fConsPhys, consSize = fConsSize;
     const NvU64 barLen = fBarLen;
