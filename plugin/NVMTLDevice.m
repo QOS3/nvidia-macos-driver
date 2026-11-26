@@ -1768,10 +1768,11 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
     unsigned polls = 0;
     for (;;) {
         const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        if (now - t0 < 25000ull) {
+        const uint64_t elapsed = now - t0;
+        if (elapsed < 100000ull) {
             for (int spin = 0; spin < 32; spin++) __asm__ __volatile__("pause" ::: "memory");
         } else {
-            usleep(NVMTL_BUSY_POLL_US);
+            usleep(elapsed < 1000000ull ? 25u : NVMTL_BUSY_POLL_US);
             polls++;
         }
         if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == me) return;
@@ -1823,7 +1824,7 @@ static uint64_t nvmtl_ic_idle_ns(void)
 static uint64_t nvmtl_ic_max_bytes(void)
 {
     static uint64_t v; static dispatch_once_t o;
-    dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_MAX_MB", nvmtl_vk_vram_bytes() >= (8ull << 30) ? 64 : 48) << 20; });
+    dispatch_once(&o, ^{ v = nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_MAX_MB", nvmtl_vk_vram_bytes() >= (8ull << 30) ? 96 : 64) << 20; });
     return v;
 }
 static size_t nvmtl_ic_budget_bytes(void)
@@ -1833,10 +1834,10 @@ static size_t nvmtl_ic_budget_bytes(void)
         const char *pn = getprogname();
         const int is_ws = pn && strcmp(pn, "WindowServer") == 0;
         const int small_vram = nvmtl_vk_vram_bytes() < (6ull << 30);
-        // nitro-perf v8: caching family-VRAM imports allocates 0 bytes of new VRAM (only GPU VA table entries).
-        // WindowServer's active mapped windows reach ~400+ MiB, so give WS 512 MiB (768 MiB on >=6 GB) while
-        // expiring idle/closed surfaces after 3 s.
-        const uint64_t def_mb = small_vram ? (is_ws ? 512 : 64) : (is_ws ? 768 : 128);
+        // nitro-perf v12: caching family-VRAM imports allocates 0 bytes of new VRAM (only GPU VA table entries).
+        // WindowServer reaches ~400+ MiB, and Chromium/Electron/Firefox GPU helpers routinely hold 100-250 MiB of
+        // active PDF/web IOSurface tiles — capping them at 64 MiB forced continuous ic-reap + re-import thrash.
+        const uint64_t def_mb = small_vram ? (is_ws ? 512 : 256) : (is_ws ? 768 : 384);
         v = (size_t)(nvmtl_ic_env_u64("NVMTL_SURF_IMPORT_CACHE_BUDGET_MB", def_mb) << 20);
     });
     return v;
@@ -1855,7 +1856,7 @@ static dispatch_queue_t nvmtl_ic_reap_queue(void)
 // VkImage/VkImageView on dealloc (exclusive ownership, keyed by vb.buf + vb.mem + geometry/format)
 // eliminates steady-state per-frame vkCreateImage/vkBindImageMemory/vkCreateImageView/vkDestroyImage churn.
 // Every parked alias is purged BEFORE its backing nvk_buffer is destroyed (nvmtl_ic_destroy_*).
-#define NVMTL_IC_IMG_PARK_SLOTS 256
+#define NVMTL_IC_IMG_PARK_SLOTS 512
 typedef struct {
     void *vbuf, *vmem;
     uint32_t key[7];   /* w, h, vkf, bpp, a8, wantStex, row */

@@ -1588,12 +1588,10 @@ static size_t nvmtl_surfin_host_min_bytes(void) {
     if (!decided) {
         const char *u = getenv("NVMTL_SURFIN_UPLOAD");
         const char *mk = getenv("NVMTL_SURFIN_HOST_MIN_KB");
-        const char *me = getprogname();
-        const bool is_ws = me && !strcmp(me, "WindowServer");
         if (u && !strcmp(u, "cpu")) min_bytes = SIZE_MAX;
         else if (u && !strcmp(u, "host")) min_bytes = 0;
         else if (mk && *mk) { long long v = atoll(mk); min_bytes = v <= 0 ? 0 : (size_t)v << 10; }
-        else min_bytes = is_ws ? 0 : (4u << 20);
+        else min_bytes = 4u << 20;
         decided = 1;
         nvlog("surface-in host-import threshold: %s (NVMTL_SURFIN_UPLOAD=%s, NVMTL_SURFIN_HOST_MIN_KB=%s)",
               min_bytes == SIZE_MAX ? "off (cpu)" : min_bytes == 0 ? "all sizes" : "4096 KB (small planes async pooled)",

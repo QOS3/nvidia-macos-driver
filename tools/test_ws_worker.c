@@ -100,6 +100,15 @@ int main(void)
     check("default OFF when prog is NULL", nvmtl_ws_hiprio_mode(NULL, NULL) == 0);
     check("NVMTL_WS_HIPRIO=0 disables in WindowServer", nvmtl_ws_hiprio_mode("0", "WindowServer") == 0);
     check("NVMTL_WS_HIPRIO=1 enables in regular app", nvmtl_ws_hiprio_mode("1", "Telegram") == 1);
+    const char *gpu_argv[] = { "Antigravity Helper", "--type=gpu-process", "--user-data-dir=/tmp" };
+    const char *rend_argv[] = { "Antigravity Helper (Renderer)", "--type=renderer" };
+    check("tier 1 for WindowServer", nvmtl_gpu_helper_hiprio_mode(NULL, "WindowServer", 1, gpu_argv) == 1);
+    check("tier 2 for Electron --type=gpu-process", nvmtl_gpu_helper_hiprio_mode(NULL, "Antigravity Helper", 3, gpu_argv) == 2);
+    check("tier 0 for Electron --type=renderer", nvmtl_gpu_helper_hiprio_mode(NULL, "Antigravity Helper (Renderer)", 2, rend_argv) == 0);
+    check("tier 2 for Firefox GPU Helper", nvmtl_gpu_helper_hiprio_mode(NULL, "Firefox GPU Helper", 1, rend_argv) == 2);
+    check("tier 2 for Chrome Helper (GPU)", nvmtl_gpu_helper_hiprio_mode(NULL, "Google Chrome Helper (GPU)", 1, rend_argv) == 2);
+    check("tier 0 for Firefox main", nvmtl_gpu_helper_hiprio_mode(NULL, "Firefox", 1, rend_argv) == 0);
+    check("NVMTL_WS_HIPRIO=0 disables GPU helper", nvmtl_gpu_helper_hiprio_mode("0", "Antigravity Helper", 3, gpu_argv) == 0);
 
     /* 2. Kick worker: Mach fixed-priority boost + coalescing without lost final wakeup */
     kick_ctx_t kctx;

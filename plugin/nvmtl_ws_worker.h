@@ -19,6 +19,7 @@
 #ifndef NVMTL_WS_WORKER_H
 #define NVMTL_WS_WORKER_H
 
+#include <crt_externs.h>
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
@@ -34,10 +35,37 @@ static inline int nvmtl_ws_hiprio_mode(const char *env, const char *prog)
     return (prog && !strcmp(prog, "WindowServer")) ? 1 : 0;
 }
 
+/* Extended policy (nitro-perf v12):
+ *   0 = disabled (normal app/renderer — uses libdispatch)
+ *   1 = WindowServer (fixed-priority importance=48 -> 79R)
+ *   2 = Browser/Electron GPU helper process (--type=gpu-process, Firefox GPU Helper,
+ *       WebKit.GPU, *Helper (GPU)) -> fixed-priority importance=32 -> 63R so GPU
+ *       command completion never starves behind 100% CPU PDFium/JS renderer threads,
+ *       while staying strictly below WindowServer (79R). */
+static inline int nvmtl_gpu_helper_hiprio_mode(const char *env, const char *prog,
+                                               int argc, const char *const *argv)
+{
+    if (env && env[0]) {
+        if (env[0] == '0') return 0;
+        return (prog && !strcmp(prog, "WindowServer")) ? 1 : 2;
+    }
+    if (prog && !strcmp(prog, "WindowServer")) return 1;
+    if (prog && (!strcmp(prog, "Firefox GPU Helper") ||
+                 !strcmp(prog, "com.apple.WebKit.GPU") ||
+                 strstr(prog, "Helper (GPU)") != NULL))
+        return 2;
+    if (argv && argc > 1) {
+        for (int i = 1; i < argc; i++) {
+            if (argv[i] && !strcmp(argv[i], "--type=gpu-process")) return 2;
+        }
+    }
+    return 0;
+}
+
 /* Opt the calling dedicated pthread out of timesharing and raise its Mach
- * precedence to fixed-priority (63R in normal processes, up to 79R in
- * WindowServer). Returns 0 if fixed-priority policy was accepted. */
-static inline int nvmtl_ws_boost_current_thread(const char *name)
+ * precedence to fixed-priority (`importance` = 48 -> up to 79R in WindowServer,
+ * 32 -> 63R in GPU helpers). Returns 0 if fixed-priority policy was accepted. */
+static inline int nvmtl_ws_boost_current_thread_pri(const char *name, int importance)
 {
     if (name && name[0]) pthread_setname_np(name);
     const thread_t self = mach_thread_self();
@@ -46,16 +74,21 @@ static inline int nvmtl_ws_boost_current_thread(const char *name)
     const kern_return_t krExt = thread_policy_set(
         self, THREAD_EXTENDED_POLICY, (thread_policy_t)&ext, THREAD_EXTENDED_POLICY_COUNT);
     thread_precedence_policy_data_t prec;
-    prec.importance = 48;
+    prec.importance = importance > 0 ? importance : 32;
     kern_return_t krPrec = thread_policy_set(
         self, THREAD_PRECEDENCE_POLICY, (thread_policy_t)&prec, THREAD_PRECEDENCE_POLICY_COUNT);
-    if (krPrec != KERN_SUCCESS) {
+    if (krPrec != KERN_SUCCESS && prec.importance > 32) {
         prec.importance = 32;
         krPrec = thread_policy_set(
             self, THREAD_PRECEDENCE_POLICY, (thread_policy_t)&prec, THREAD_PRECEDENCE_POLICY_COUNT);
     }
     mach_port_deallocate(mach_task_self(), self);
     return (krExt == KERN_SUCCESS && krPrec == KERN_SUCCESS) ? 0 : -1;
+}
+
+static inline int nvmtl_ws_boost_current_thread(const char *name)
+{
+    return nvmtl_ws_boost_current_thread_pri(name, 48);
 }
 
 /* ---------- 1. Coalescing fixed-priority kick worker ---------- */
@@ -70,12 +103,13 @@ typedef struct nvmtl_ws_kick {
     int pending;
     int stop;
     int started;
+    int importance;
 } nvmtl_ws_kick_t;
 
 static inline void *nvmtl_ws_kick_main(void *arg)
 {
     nvmtl_ws_kick_t *w = (nvmtl_ws_kick_t *)arg;
-    (void)nvmtl_ws_boost_current_thread(w->name);
+    (void)nvmtl_ws_boost_current_thread_pri(w->name, w->importance > 0 ? w->importance : 48);
     pthread_mutex_lock(&w->mu);
     for (;;) {
         while (!w->pending && !w->stop) pthread_cond_wait(&w->cv, &w->mu);
@@ -89,13 +123,14 @@ static inline void *nvmtl_ws_kick_main(void *arg)
     return NULL;
 }
 
-static inline int nvmtl_ws_kick_init(nvmtl_ws_kick_t *w, const char *name, void (*fn)(void *), void *ctx)
+static inline int nvmtl_ws_kick_init_pri(nvmtl_ws_kick_t *w, const char *name, void (*fn)(void *), void *ctx, int importance)
 {
     if (!w || !fn) return -1;
     memset(w, 0, sizeof *w);
     w->fn = fn;
     w->ctx = ctx;
     w->name = name;
+    w->importance = importance > 0 ? importance : 48;
     if (pthread_mutex_init(&w->mu, NULL) != 0) return -1;
     if (pthread_cond_init(&w->cv, NULL) != 0) {
         pthread_mutex_destroy(&w->mu);
@@ -108,6 +143,11 @@ static inline int nvmtl_ws_kick_init(nvmtl_ws_kick_t *w, const char *name, void 
     }
     w->started = 1;
     return 0;
+}
+
+static inline int nvmtl_ws_kick_init(nvmtl_ws_kick_t *w, const char *name, void (*fn)(void *), void *ctx)
+{
+    return nvmtl_ws_kick_init_pri(w, name, fn, ctx, 48);
 }
 
 static inline void nvmtl_ws_kick_signal(nvmtl_ws_kick_t *w)
@@ -154,12 +194,13 @@ typedef struct nvmtl_ws_serial {
     nvmtl_ws_task_t slab[NVMTL_WS_SERIAL_SLAB];
     int stopping;
     int self_free;
+    int importance;
 } nvmtl_ws_serial_t;
 
 static inline void *nvmtl_ws_serial_main(void *arg)
 {
     nvmtl_ws_serial_t *q = (nvmtl_ws_serial_t *)arg;
-    (void)nvmtl_ws_boost_current_thread(q->name);
+    (void)nvmtl_ws_boost_current_thread_pri(q->name, q->importance > 0 ? q->importance : 48);
     int do_self_free = 0;
     pthread_mutex_lock(&q->mu);
     for (;;) {
@@ -192,11 +233,12 @@ static inline void *nvmtl_ws_serial_main(void *arg)
     return NULL;
 }
 
-static inline nvmtl_ws_serial_t *nvmtl_ws_serial_create(const char *name)
+static inline nvmtl_ws_serial_t *nvmtl_ws_serial_create_pri(const char *name, int importance)
 {
     nvmtl_ws_serial_t *q = (nvmtl_ws_serial_t *)calloc(1, sizeof *q);
     if (!q) return NULL;
     q->name = name;
+    q->importance = importance > 0 ? importance : 48;
     for (int i = 0; i < NVMTL_WS_SERIAL_SLAB; i++) {
         q->slab[i].from_slab = 1;
         q->slab[i].next = (i + 1 < NVMTL_WS_SERIAL_SLAB) ? &q->slab[i + 1] : NULL;
@@ -218,6 +260,11 @@ static inline nvmtl_ws_serial_t *nvmtl_ws_serial_create(const char *name)
         return NULL;
     }
     return q;
+}
+
+static inline nvmtl_ws_serial_t *nvmtl_ws_serial_create(const char *name)
+{
+    return nvmtl_ws_serial_create_pri(name, 48);
 }
 
 static inline int nvmtl_ws_serial_enqueue(nvmtl_ws_serial_t *q, void (*fn)(void *), void *arg)

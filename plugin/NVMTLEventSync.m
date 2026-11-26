@@ -518,14 +518,24 @@ static int nvmtl_skip_empty_on(void) {
         if (scheduled) dispatch_group_enter(_scheduledGroup);
     }
 }
-static BOOL nvmtl_ws_hiprio_enabled(void) {
-    static int on = -1;
-    if (on < 0) {
+static int nvmtl_ws_hiprio_tier(void) {
+    static int tier = -1;
+    if (tier < 0) {
         const char *e = getenv("NVMTL_WS_HIPRIO");
-        on = nvmtl_ws_hiprio_mode(e, getprogname());
-        if (on) nvlog("commit: nitro-perf v10 WindowServer fixed-priority Mach workers ON (NVMTL_WS_HIPRIO=%s)", e ? e : "default");
+        int *pargc = _NSGetArgc();
+        char ***pargv = _NSGetArgv();
+        const int argc = pargc ? *pargc : 0;
+        const char *const *argv = (pargv && *pargv) ? (const char *const *)*pargv : NULL;
+        tier = nvmtl_gpu_helper_hiprio_mode(e, getprogname(), argc, argv);
+        if (tier) nvlog("commit: nitro-perf v12 fixed-priority Mach workers ON tier=%d (NVMTL_WS_HIPRIO=%s)", tier, e ? e : "default");
     }
-    return on == 1;
+    return tier;
+}
+static BOOL nvmtl_ws_hiprio_enabled(void) {
+    return nvmtl_ws_hiprio_tier() != 0;
+}
+static int nvmtl_ws_hiprio_importance(void) {
+    return nvmtl_ws_hiprio_tier() == 1 ? 48 : 32;
 }
 static void nvmtl_ws_run_objc_block(void *ctx) {
     @autoreleasepool {
@@ -549,7 +559,7 @@ static BOOL nvmtl_ws_serial_enqueue_block(nvmtl_ws_serial_t *q, dispatch_block_t
     os_unfair_lock_lock(&_queue->_callbackQueueLock);
     if (wsHi) {
         if (!_queue->_wsCallbackWorker && !_queue->_callbackOrderQueue) {
-            _queue->_wsCallbackWorker = nvmtl_ws_serial_create("nvmtl.ws.callbacks");
+            _queue->_wsCallbackWorker = nvmtl_ws_serial_create_pri("nvmtl.ws.callbacks", nvmtl_ws_hiprio_importance());
         }
         wsWorker = _queue->_wsCallbackWorker;
     }
@@ -674,7 +684,7 @@ static BOOL nvmtl_ws_serial_enqueue_block(nvmtl_ws_serial_t *q, dispatch_block_t
         static dispatch_queue_t presentQ; static nvmtl_ws_serial_t *wsPresent; static int inl = -1; static dispatch_once_t once;
         dispatch_once(&once, ^{
             const char *e = getenv("NVMTL_PRESENT_INLINE"); inl = e && *e && *e != '0';
-            if (nvmtl_ws_hiprio_enabled()) wsPresent = nvmtl_ws_serial_create("nvmtl.ws.present");
+            if (nvmtl_ws_hiprio_enabled()) wsPresent = nvmtl_ws_serial_create_pri("nvmtl.ws.present", nvmtl_ws_hiprio_importance());
             if (!wsPresent) presentQ = dispatch_queue_create("nvmtl.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
         });
         if (inl) { for (dispatch_block_t action in _presentations) action(); }
@@ -1096,7 +1106,7 @@ static void nvmtl_ahead_kick(void) {
         static nvmtl_ws_kick_t wsAhead;
         static BOOL wsOk = NO;
         dispatch_once(&wsOnce, ^{
-            wsOk = nvmtl_ws_kick_init(&wsAhead, "nvmtl.ws.ahead", nvmtl_ahead_worker_fn, NULL) == 0;
+            wsOk = nvmtl_ws_kick_init_pri(&wsAhead, "nvmtl.ws.ahead", nvmtl_ahead_worker_fn, NULL, nvmtl_ws_hiprio_importance()) == 0;
         });
         if (wsOk) { nvmtl_ws_kick_signal(&wsAhead); return; }
     }
@@ -1171,7 +1181,7 @@ static void nvmtl_pump_buffers(void) {
         static nvmtl_ws_kick_t wsExec;
         static BOOL wsOk = NO;
         dispatch_once(&wsOnce, ^{
-            wsOk = nvmtl_ws_kick_init(&wsExec, "nvmtl.ws.execution", nvmtl_pump_worker_fn, NULL) == 0;
+            wsOk = nvmtl_ws_kick_init_pri(&wsExec, "nvmtl.ws.execution", nvmtl_pump_worker_fn, NULL, nvmtl_ws_hiprio_importance()) == 0;
         });
         if (wsOk) { nvmtl_ws_kick_signal(&wsExec); return; }
     }
