@@ -752,7 +752,7 @@ static unsigned nvmtl_gsub_cap(void) {
 }
 static BOOL nvmtl_gsub_ahead_on(void) { return nvmtl_async_commit_on() && nvmtl_g79_on(NVMTL_G79_SUB) && nvmtl_gsub_cap(); }
 static NSMapTable *nvmtl_evfold_submitted;
-static _Atomic unsigned long long gEvFold, gEvFoldEmpty;
+static _Atomic unsigned long long gEvFold, gEvFoldEmpty, gEvPromise;
 static BOOL nvmtl_evfold_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_EVFOLD"); on = !(e && e[0] == '0');
@@ -766,7 +766,10 @@ static uint64_t nvmtl_evfold_promised(id event) {
 static void nvmtl_evfold_promise(id event, uint64_t value) {
     if (!event || !nvmtl_evfold_on()) return;
     if (!nvmtl_evfold_submitted) nvmtl_evfold_submitted = [NSMapTable weakToStrongObjectsMapTable];
-    if (value > nvmtl_evfold_promised(event)) [nvmtl_evfold_submitted setObject:@(value) forKey:event];
+    if (value > nvmtl_evfold_promised(event)) {
+        [nvmtl_evfold_submitted setObject:@(value) forKey:event];
+        atomic_fetch_add(&gEvPromise, 1);
+    }
 }
 static void nvmtl_evfold_promise_part(NVMTLSubmissionPart *part) {
     if (part->signalEvent) nvmtl_evfold_promise(part->signalEvent, part->value);
@@ -898,9 +901,10 @@ static void nvmtl_gsub_ahead_pass1(void);
 static void nvmtl_gsub_ahead_pass(void) {
     pthread_mutex_lock(&nvmtl_ahead_submit_lock);
     for (int round = 0; round < 64; round++) {
-        const unsigned long long before = atomic_load(&gEvFold);
+        const unsigned long long beforeFold = atomic_load(&gEvFold);
+        const unsigned long long beforeProm = atomic_load(&gEvPromise);
         nvmtl_gsub_ahead_pass1();
-        if (atomic_load(&gEvFold) == before) break;
+        if (atomic_load(&gEvFold) == beforeFold && atomic_load(&gEvPromise) == beforeProm) break;
     }
     pthread_mutex_unlock(&nvmtl_ahead_submit_lock);
 }

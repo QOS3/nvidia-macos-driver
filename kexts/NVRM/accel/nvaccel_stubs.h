@@ -94,6 +94,7 @@ public:
     unsigned long long fPhys     = 0;
     unsigned long long fBytes    = 0;
     bool fScanout = false;
+    bool fAllocating = false;
     // VRAM kept across deallocPhysical/allocPhysical (debug.nvaccel_vm_sticky): see NVVidMemory::deallocPhysical
     void              *fParkHandle = nullptr;
     void              *fParkKva    = nullptr;

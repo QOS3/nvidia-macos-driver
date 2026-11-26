@@ -709,13 +709,27 @@ public:
         return false;
     }
     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
-    IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
-        if (!fFB) return kIOReturnNotAttached;
-        if (!fSymAlloc) fSymAlloc = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
-        if (!fSymFree)  fSymFree  = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
-        const OSSymbol *fn = alloc ? fSymAlloc : fSymFree;
+    const OSSymbol *vramSym(bool alloc) {
+        const OSSymbol *volatile *slot = alloc ? &fSymAlloc : &fSymFree;
+        const OSSymbol *sym = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+        if (!sym) {
+            const OSSymbol *fresh = OSSymbol::withCStringNoCopy(alloc ? NVRM_VRAM_FN_ALLOC : NVRM_VRAM_FN_FREE);
+            if (fresh) {
+                if (!OSCompareAndSwapPtr(nullptr, (void *)fresh, (void *volatile *)slot))
+                    fresh->release();
+                sym = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            }
+        }
+        return sym;
+    }
+    IOReturn askFramebufferForVramOn(IOService *fb, struct NVRMVramRequest *r, bool alloc) {
+        if (!fb) return kIOReturnNotAttached;
+        const OSSymbol *fn = vramSym(alloc);
         if (!fn) return kIOReturnNoMemory;
-        return fFB->callPlatformFunction(fn, false, r, nullptr, nullptr, nullptr);
+        return fb->callPlatformFunction(fn, false, r, nullptr, nullptr, nullptr);
+    }
+    IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
+        return askFramebufferForVramOn(fFB, r, alloc);
     }
     IOReturn askFramebufferForScanout(struct NVRMVramRequest *r, IOService *fb = nullptr) {
         if (!fb) fb = fFB;
@@ -1254,6 +1268,10 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
 }
 
 static void nvSVForgetResource(NVResource *resource);
+static bool nvFamLock(NVAccel *a, bool tryOnly);
+static void nvFamUnlock(NVAccel *a);
+static SInt64 gCntAllocUnlocked;
+static int gAllocUnlockedMaxUs;
 
 void NVResource::free()
 {
@@ -1300,7 +1318,38 @@ bool NVVidMemory::allocPhysical()
     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
     r.version = NVRM_VRAM_ABI_VERSION;
     r.size    = want;
-    IOReturn ret = owner->askFramebufferForVram(&r, true);
+    // nitro-perf v13: drop the global accelerator lock across NVRMFB::vramGrant (NVKMS allocate/map + BAR1 zeroing)
+    // whenever this thread owns it at depth 1 (same safe pattern as NVResource::pageoff), so app surface bursts
+    // never block WindowServer's dirty-marks or VRAM imports behind nvFamLock.
+    IOReturn ret = kIOReturnNotAttached;
+    if (!fAllocating && owner->mayRelease() && owner->fFB) {
+        struct NVAllocHold { OSObject *o = nullptr; ~NVAllocHold() { if (o) o->release(); } } holdVm, holdAccel, holdFb;
+        IOService *fb = owner->fFB;
+        fAllocating = true;
+        retain(); holdVm.o = this;
+        owner->retain(); holdAccel.o = owner;
+        fb->retain(); holdFb.o = fb;
+        const uint64_t t0 = mach_absolute_time();
+        nvFamUnlock(owner);
+        ret = owner->askFramebufferForVramOn(fb, &r, true);
+        nvFamLock(owner, false);
+        fAllocating = false;
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+        const int us = (int)(ns / 1000);
+        if (us > gAllocUnlockedMaxUs) gAllocUnlockedMaxUs = us;
+        OSAddAtomic64(1, &gCntAllocUnlocked);
+        const unsigned long long wantNow = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
+        if (fScanout || fRmHandle || wantNow != want) {
+            if (ret == kIOReturnSuccess && r.handle) {
+                nvFamUnlock(owner);
+                owner->askFramebufferForVramOn(fb, &r, false);
+                nvFamLock(owner, false);
+            }
+            return false;
+        }
+    } else {
+        ret = owner->askFramebufferForVram(&r, true);
+    }
     if (ret != kIOReturnSuccess || !r.handle || !r.phys) {
         // A full BAR1 window refuses every frame (~100/s on a 256 MB BAR1, a third of everything the machine logs:
         // #387). Same throttle as the framebuffer's nvAllocVram: the first eight, then every 256th with the count;
@@ -1829,6 +1878,8 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_unlocked_wait, CTLFLAG_RW | CTLFLAG
 NVACCEL_CNT(nvaccel_pageoff_unlocked_waits,   gCntPoUnlocked, "page-offs that waited for the GPU without the accelerator lock");
 NVACCEL_CNT(nvaccel_pageoff_locked_not_owner, gCntPoNotOwner, "page-offs with a pending surface that waited locked because the thread was not the lock's owner at one level");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_pageoff_unlocked_wait_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gPoUnlockedMaxUs, 0, "longest unlocked page-off wait, us");
+NVACCEL_CNT(nvaccel_alloc_unlocked_waits,     gCntAllocUnlocked,   "allocPhysical VRAM grants run without the accelerator lock");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_alloc_unlocked_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gAllocUnlockedMaxUs, 0, "longest unlocked allocPhysical VRAM grant, us");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "1 = WindowServer swaps wait for GPU completion here (same value as nvaccel_surface_gpu_on)");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "0 = WindowServer waits for its own composites again (the plugin re-asks every second)");
 NVACCEL_CNT(nvaccel_surface_gpu_marks,    gCntSurfMarks,    "pending/ready marks from WindowServer");
@@ -1888,6 +1939,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_unlocked_wait); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_unlocked_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_locked_not_owner); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_unlocked_wait_max_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_alloc_unlocked_waits); sysctl_register_oid(&sysctl__debug_nvaccel_alloc_unlocked_max_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_refused); sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_drop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);

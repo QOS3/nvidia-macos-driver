@@ -101,6 +101,7 @@ extern "C" {
 #include "nvrm-vram-pool.h"
 static void vramPoolDrain(const struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *dev);
 static bool vramPoolHasPending(void);
+static void vramAllocWaitIdle(void);
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
 // 4 GB, which is 3/4 of the 256 MB firmware window but left a 512 MB or 1 GB BAR1 no better off (issue #27).
@@ -3436,6 +3437,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
+    vramAllocWaitIdle();
     if (fIndex < sizeof gFBs / sizeof gFBs[0]) {
         IORecursiveLock *sl = startLock();
         if (sl) IORecursiveLockLock(sl);
@@ -4757,7 +4759,7 @@ static int gVramPoolN = 0;
 static int gVramPoolOn = 1;
 static uint64_t gVramPoolCooldownAbs = 0;
 static volatile SInt64 gVramPoolBytes = 0, gVramPoolHits = 0, gVramPoolMisses = 0, gVramPoolDrains = 0, gVramPoolCooldownSkips = 0;
-static volatile SInt64 gVramPoolBestFitHits = 0, gVramAsyncFrees = 0, gVramAsyncPeakQ = 0;
+static volatile SInt64 gVramPoolBestFitHits = 0, gVramAsyncFrees = 0, gVramAsyncPeakQ = 0, gVramOffgateAllocs = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_pool, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramPoolOn, 0,
            "1 = recycle recently freed small VRAM blocks without unmapping/freeing through NVKMS");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_hits,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolHits,   "vramGrant pool hits");
@@ -4768,6 +4770,7 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_cooldown_skips, CTLFLAG_RD | CTLF
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_pool_bestfit_hits, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramPoolBestFitHits, "vramGrant pool hits served by a slightly larger best-fit block");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_async_frees, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramAsyncFrees, "VRAM blocks unmapped and freed off the display gate by the async worker");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_async_peak_q, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramAsyncPeakQ, "peak queue depth of deferred VRAM frees");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_offgate_allocs, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramOffgateAllocs, "vramGrant pool-miss allocations executed off NVRMDisplayGate");
 
 // nitro-perf v11: non-blocking deferred-free queue. Pool evictions and unpooled ReBAR releases are handed to a
 // low-priority ONCE worker that calls NVKMS unmapMemory/freeMemory WITHOUT holding NVRMDisplayGate (startLock()),
@@ -4783,6 +4786,7 @@ struct NVRMVramFreeItem {
 };
 static NVRMVramFreeItem gVramFreeQ[NVRM_VRAM_FREE_Q_CAP];
 static unsigned gVramFreeHead = 0, gVramFreeCount = 0, gVramFreeWaiters = 0, gVramDirectInFlight = 0;
+static unsigned gVramAllocInFlight = 0, gVramAllocWaiters = 0;
 static bool gVramFreeInFlight = false;
 static struct NvKmsKapiDevice *gVramFreeInFlightDev = nullptr;
 static IOLock *gVramFreeLock = nullptr;
@@ -4944,6 +4948,44 @@ struct VramFreeWakeGuard {
     }
     ~VramFreeWakeGuard() { fire(); }
 };
+// nitro-perf v13: tracks off-gate vramGrant allocateMemory/mapMemory calls so stop() and NVRMGpuPower(0)
+// wait for them to finish OUTSIDE NVRMDisplayGate before tearing down or suspending fDev.
+struct VramAllocInFlightGuard {
+    bool active = false;
+    void enter() {
+        if (active) return;
+        vramFreeInit();
+        if (gVramFreeLock) {
+            IOLockLock(gVramFreeLock);
+            gVramAllocInFlight++;
+            IOLockUnlock(gVramFreeLock);
+            active = true;
+        }
+    }
+    void leave() {
+        if (!active) return;
+        active = false;
+        if (gVramFreeLock) {
+            IOLockLock(gVramFreeLock);
+            if (gVramAllocInFlight > 0) gVramAllocInFlight--;
+            if (gVramAllocWaiters > 0 && gVramAllocInFlight == 0)
+                IOLockWakeup(gVramFreeLock, (event_t)&gVramAllocInFlight, false);
+            IOLockUnlock(gVramFreeLock);
+        }
+    }
+    ~VramAllocInFlightGuard() { leave(); }
+};
+static void vramAllocWaitIdle(void)
+{
+    if (!gVramFreeLock) return;
+    IOLockLock(gVramFreeLock);
+    while (gVramAllocInFlight > 0) {
+        gVramAllocWaiters++;
+        IOLockSleep(gVramFreeLock, (event_t)&gVramAllocInFlight, THREAD_UNINT);
+        gVramAllocWaiters--;
+    }
+    IOLockUnlock(gVramFreeLock);
+}
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -5098,6 +5140,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_pool_bestfit_hits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_async_frees);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_async_peak_q);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_offgate_allocs);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
@@ -5117,7 +5160,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     nvrmfbInstallSysctl();
     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
-    if (!fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
+    if (OSAddAtomic(0, &fStopping) || fSysSlept || !fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return false;
     if (fBarLen && fBarLen <= (512ull << 20)) want = nvrmVramSizeClass(want);   // few hole sizes in a small window (see nvrm-vram-class.h)
@@ -5206,8 +5249,24 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 
     struct NvKmsKapiMemory *mem = nullptr; void *kva = nullptr; NvU64 phys = 0;
     bool poolRetried = false;
+    const struct NvKmsKapiFunctionsTable *const kms = fKms;
+    struct NvKmsKapiDevice *const dev = fDev;
+    NvU64 (*const physForVa)(void *) = fPhysForVa;
+    const NvU64 scanPhys = fPhys, scanSize = fSize;
+    const NvU64 consPhys = fConsPhys, consSize = fConsSize;
+    const NvU64 barLen = fBarLen;
+    // nitro-perf v13: execute NVKMS allocateMemory + mapMemory OFF NVRMDisplayGate so bursty app surface
+    // allocations never stall WindowServer's display flips or cursor updates on startLock().
+    VramAllocInFlightGuard allocGuard;
+    allocGuard.enter();
+    const bool offGate = allocGuard.active;
+    if (offGate) {
+        gate.release();
+        wakeGuard.fire();
+    }
 
     for (int attempt = 0; attempt < 8 && !mem; attempt++) {
+        if (OSAddAtomic(0, &fStopping) || fSysSlept) break;
         struct NvKmsKapiAllocateMemoryParams mp; nvu_zero(&mp, sizeof mp);
         NvU8 compressible = 0;
         mp.layout = NvKmsSurfaceMemoryLayoutPitch;
@@ -5215,101 +5274,145 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         mp.size   = want;
         mp.useVideoMemory = NV_TRUE;
         mp.compressible   = &compressible;
-        struct NvKmsKapiMemory *m = fKms->allocateMemory(fDev, &mp);
+        struct NvKmsKapiMemory *m = kms->allocateMemory(dev, &mp);
         // Both failures print what the budget counted at that moment: the real BAR1 limit of a 256 MB window is
         // somewhere under the budget, and only these lines can show where.
         if (!m) {
-            if (!poolRetried && vramPoolHasPending()) {
-                poolRetried = true;
-                vramPoolDrain(fKms, fDev);
-                continue;
+            if (!poolRetried) {
+                bool drained = false;
+                if (offGate) {
+                    allocGuard.leave();
+                    NVRMDisplayGate dg;
+                    if (dg.valid() && !OSAddAtomic(0, &fStopping) && !fSysSlept && fDev == dev && vramPoolHasPending()) {
+                        vramPoolDrain(kms, dev);
+                        drained = true;
+                    }
+                    if (!OSAddAtomic(0, &fStopping) && !fSysSlept && fDev == dev) allocGuard.enter();
+                } else if (vramPoolHasPending()) {
+                    vramPoolDrain(kms, dev);
+                    drained = true;
+                }
+                if (drained && (!offGate || allocGuard.active)) {
+                    poolRetried = true;
+                    continue;
+                }
             }
             FBLOG("nvAllocVram(%llu): allocateMemory failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
                   (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
-                  (unsigned long long)fBarLen);
+                  (unsigned long long)barLen);
             break;
         }
         void *k = nullptr;
-        if (!fKms->mapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &k) || !k) {
-            fKms->freeMemory(fDev, m);
-            if (!poolRetried && vramPoolHasPending()) {
-                poolRetried = true;
-                vramPoolDrain(fKms, fDev);
-                continue;
+        if (!kms->mapMemory(dev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &k) || !k) {
+            kms->freeMemory(dev, m);
+            if (!poolRetried) {
+                bool drained = false;
+                if (offGate) {
+                    allocGuard.leave();
+                    NVRMDisplayGate dg;
+                    if (dg.valid() && !OSAddAtomic(0, &fStopping) && !fSysSlept && fDev == dev && vramPoolHasPending()) {
+                        vramPoolDrain(kms, dev);
+                        drained = true;
+                    }
+                    if (!OSAddAtomic(0, &fStopping) && !fSysSlept && fDev == dev) allocGuard.enter();
+                } else if (vramPoolHasPending()) {
+                    vramPoolDrain(kms, dev);
+                    drained = true;
+                }
+                if (drained && (!offGate || allocGuard.active)) {
+                    poolRetried = true;
+                    continue;
+                }
             }
             FBLOG("nvAllocVram(%llu): mapMemory(KERNEL) failed (mapped %lld + parked %lld of %lld budget, BAR1 %llu)",
                   (unsigned long long)want, (long long)gVramMappedBytes, (long long)gVramParkedBytes, (long long)budget,
-                  (unsigned long long)fBarLen);
+                  (unsigned long long)barLen);
             break;
         }
-        NvU64 p = fPhysForVa ? fPhysForVa(k) : 0;
-        bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + want) > fPhys;
-        bool onConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + want) > fConsPhys;
+        NvU64 p = physForVa ? physForVa(k) : 0;
+        bool onScanout = p && scanPhys && scanSize && p < (scanPhys + scanSize) && (p + want) > scanPhys;
+        bool onConsole = p && consPhys && consSize && p < (consPhys + consSize) && (p + want) > consPhys;
         if (!p) {
             // No physical address means RM's mapping table could not record this mapping. Parking it would hold one
             // more mapping per attempt and the next attempt fails the same way: release it and refuse this request.
             FBLOG("nvAllocVram(%llu): attempt %d has no physical address — released, request refused (RM mapping table full?)",
                   (unsigned long long)want, attempt);
-            fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); fKms->freeMemory(fDev, m);
+            kms->unmapMemory(dev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); kms->freeMemory(dev, m);
             break;
         }
         if (onScanout || onConsole) {
             FBLOG("nvAllocVram: attempt %d phys 0x%llx %s — parking it and rolling again",
                   attempt, (unsigned long long)p,
                   !p ? "has no physical address" : onScanout ? "OVERLAPS THE SCANOUT" : "OVERLAPS THE CONSOLE");
-            if (gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
-                gVramParkedBytes + (SInt64)want <= nvrmParkCeiling(fBarLen)) {
-                // kept allocated AND mapped: the overlap is judged by the BAR1 address of this mapping, so unmapping
-                // it hands that address straight back and the next allocation lands on the console again (one machine
-                // logged the same address 600 times, every attempt refused: black screen with a cursor)
-                gParkedForever[gNParkedForever].m = m;
-                gParkedForever[gNParkedForever].k = k;
-                gParkedForever[gNParkedForever].n = want;
-                gNParkedForever++;
-                OSAddAtomic64((SInt64)want, &gVramParkedBytes);
-            } else {
-                fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); fKms->freeMemory(fDev, m);
-                // A surface larger than the park ceiling (a 3840x2560 desktop is 37.5 MB, the ceiling on a 256 MB BAR1
-                // is 32 MB) was never parked, so the same address came back on every attempt. Hold only the part of
-                // the range that overlaps instead: a guard block from this address to the end of the console or
-                // scanout, which the allocator hands out at the address just freed.
-                const NvU64 rEnd = onScanout ? fPhys + fSize : fConsPhys + fConsSize;
-                const NvU64 g = (p && rEnd > p) ? ((rEnd - p) + 0x1FFFFFull) & ~0x1FFFFFull : 0;
-                bool guarded = false;
-                if (g && g < want && gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
-                    gVramParkedBytes + (SInt64)g <= nvrmParkCeiling(fBarLen)) {
-                    struct NvKmsKapiAllocateMemoryParams gp; nvu_zero(&gp, sizeof gp);
-                    NvU8 gc = 0;
-                    gp.layout = NvKmsSurfaceMemoryLayoutPitch; gp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
-                    gp.size = g; gp.useVideoMemory = NV_TRUE; gp.compressible = &gc;
-                    struct NvKmsKapiMemory *gm = fKms->allocateMemory(fDev, &gp);
-                    void *gk = nullptr;
-                    if (gm && fKms->mapMemory(fDev, gm, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &gk) && gk) {
-                        const NvU64 gpa = fPhysForVa ? fPhysForVa(gk) : 0;
-                        const NvU64 rStart = onScanout ? fPhys : fConsPhys;
-                        if (gpa && gpa < rEnd && gpa + g > rStart) {
-                            gParkedForever[gNParkedForever].m = gm;
-                            gParkedForever[gNParkedForever].k = gk;
-                            gParkedForever[gNParkedForever].n = g;
-                            gNParkedForever++;
-                            OSAddAtomic64((SInt64)g, &gVramParkedBytes);
-                            guarded = true;
-                        } else {
-                            fKms->unmapMemory(fDev, gm, NVKMS_KAPI_MAPPING_TYPE_KERNEL, gk); fKms->freeMemory(fDev, gm);
-                        }
-                    } else if (gm) {
-                        fKms->freeMemory(fDev, gm);
+            if (offGate) allocGuard.leave();
+            {
+                NVRMDisplayGate pg;
+                if (!pg.valid() || OSAddAtomic(0, &fStopping) || fSysSlept || fDev != dev) {
+                    if (pg.valid() && !OSAddAtomic(0, &fStopping) && !fSysSlept && fDev == dev) {
+                        kms->unmapMemory(dev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); kms->freeMemory(dev, m);
                     }
+                    break;
                 }
-                FBLOG("nvAllocVram: %llu bytes cannot be parked (%lld bytes parked over %d slots) — %s",
-                      (unsigned long long)want, (long long)gVramParkedBytes, gNParkedForever,
-                      guarded ? "holding a guard block over the overlap instead" : "released, no guard block placed");
+                if (gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
+                    gVramParkedBytes + (SInt64)want <= nvrmParkCeiling(barLen)) {
+                    // kept allocated AND mapped: the overlap is judged by the BAR1 address of this mapping, so unmapping
+                    // it hands that address straight back and the next allocation lands on the console again (one machine
+                    // logged the same address 600 times, every attempt refused: black screen with a cursor)
+                    gParkedForever[gNParkedForever].m = m;
+                    gParkedForever[gNParkedForever].k = k;
+                    gParkedForever[gNParkedForever].n = want;
+                    gNParkedForever++;
+                    OSAddAtomic64((SInt64)want, &gVramParkedBytes);
+                } else {
+                    kms->unmapMemory(dev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); kms->freeMemory(dev, m);
+                    // A surface larger than the park ceiling (a 3840x2560 desktop is 37.5 MB, the ceiling on a 256 MB BAR1
+                    // is 32 MB) was never parked, so the same address came back on every attempt. Hold only the part of
+                    // the range that overlaps instead: a guard block from this address to the end of the console or
+                    // scanout, which the allocator hands out at the address just freed.
+                    const NvU64 rEnd = onScanout ? scanPhys + scanSize : consPhys + consSize;
+                    const NvU64 g = (p && rEnd > p) ? ((rEnd - p) + 0x1FFFFFull) & ~0x1FFFFFull : 0;
+                    bool guarded = false;
+                    if (g && g < want && gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
+                        gVramParkedBytes + (SInt64)g <= nvrmParkCeiling(barLen)) {
+                        struct NvKmsKapiAllocateMemoryParams gp; nvu_zero(&gp, sizeof gp);
+                        NvU8 gc = 0;
+                        gp.layout = NvKmsSurfaceMemoryLayoutPitch; gp.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+                        gp.size = g; gp.useVideoMemory = NV_TRUE; gp.compressible = &gc;
+                        struct NvKmsKapiMemory *gm = kms->allocateMemory(dev, &gp);
+                        void *gk = nullptr;
+                        if (gm && kms->mapMemory(dev, gm, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &gk) && gk) {
+                            const NvU64 gpa = physForVa ? physForVa(gk) : 0;
+                            const NvU64 rStart = onScanout ? scanPhys : consPhys;
+                            if (gpa && gpa < rEnd && gpa + g > rStart) {
+                                gParkedForever[gNParkedForever].m = gm;
+                                gParkedForever[gNParkedForever].k = gk;
+                                gParkedForever[gNParkedForever].n = g;
+                                gNParkedForever++;
+                                OSAddAtomic64((SInt64)g, &gVramParkedBytes);
+                                guarded = true;
+                            } else {
+                                kms->unmapMemory(dev, gm, NVKMS_KAPI_MAPPING_TYPE_KERNEL, gk); kms->freeMemory(dev, gm);
+                            }
+                        } else if (gm) {
+                            kms->freeMemory(dev, gm);
+                        }
+                    }
+                    FBLOG("nvAllocVram: %llu bytes cannot be parked (%lld bytes parked over %d slots) — %s",
+                          (unsigned long long)want, (long long)gVramParkedBytes, gNParkedForever,
+                          guarded ? "holding a guard block over the overlap instead" : "released, no guard block placed");
+                }
+            }
+            if (offGate) {
+                if (OSAddAtomic(0, &fStopping) || fSysSlept || fDev != dev) break;
+                allocGuard.enter();
+                if (!allocGuard.active) break;
             }
             continue;
         }
         mem = m; kva = k; phys = p;
     }
     if (!mem) {
+        allocGuard.leave();
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         // Who holds the window, once per boot: a 256 MB BAR1 that fills up cannot be told apart from a leak by the
         // failure lines alone; grants against releases can.
@@ -5319,26 +5422,30 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
                   "in %d slots, display %lld, budget %lld, BAR1 %llu",
                   (long long)gCntGrant, (long long)gCntGrantBytes, (long long)gCntRelease, (long long)gCntReleaseBytes,
                   (long long)gVramMappedBytes, (long long)gVramParkedBytes, gNParkedForever, (long long)gVramDisplayBytes,
-                  (long long)budget, (unsigned long long)fBarLen);
+                  (long long)budget, (unsigned long long)barLen);
         return false;
     }
 
-    gate.release();
-    wakeGuard.fire();
+    if (!offGate) {
+        gate.release();
+        wakeGuard.fire();
+    }
     nvu_zero_wide(kva, (size_t)want);
     __asm__ __volatile__("sfence" ::: "memory");
     volatile NvU64 *q = (volatile NvU64 *)kva;
     q[0] = 0x5A5AA5A5C0FFEE01ull;
     NvU64 back = q[0];
     q[0] = 0;
+    allocGuard.leave();
     NVRMDisplayGate gate2;
-    if (!gate2.valid() || back != 0x5A5AA5A5C0FFEE01ull) {
-        FBLOG("nvAllocVram(%llu): kva %s phys <phys> WROTE 0x5A5AA5A5C0FFEE01 AND READ 0x%llx — "
-              "the aperture is not live; refusing to hand this out",
-              (unsigned long long)want, kva ? "set" : "null", (unsigned long long)back);
-        if (gate2.valid()) {
-            fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
-            fKms->freeMemory(fDev, mem);
+    if (!gate2.valid() || OSAddAtomic(0, &fStopping) || fSysSlept || fDev != dev || back != 0x5A5AA5A5C0FFEE01ull) {
+        if (back != 0x5A5AA5A5C0FFEE01ull)
+            FBLOG("nvAllocVram(%llu): kva %s phys <phys> WROTE 0x5A5AA5A5C0FFEE01 AND READ 0x%llx — "
+                  "the aperture is not live; refusing to hand this out",
+                  (unsigned long long)want, kva ? "set" : "null", (unsigned long long)back);
+        if (gate2.valid() && !OSAddAtomic(0, &fStopping) && !fSysSlept && fDev == dev) {
+            kms->unmapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+            kms->freeMemory(dev, mem);
         }
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         return false;
@@ -5346,8 +5453,8 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 
     const UInt64 allocationCookie = gAllocations.insert(mem, want);
     if (!allocationCookie) {
-        fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
-        fKms->freeMemory(fDev, mem); OSAddAtomic64(-(SInt64)want, &gVramMappedBytes); return false;
+        kms->unmapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+        kms->freeMemory(dev, mem); OSAddAtomic64(-(SInt64)want, &gVramMappedBytes); return false;
     }
     r->allocationCookie = allocationCookie;
     r->handle = mem; r->kva = kva; r->phys = (unsigned long long)phys;
@@ -5355,6 +5462,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     r->mappedTotal = (unsigned long long)(before + (SInt64)want);
     fVramGrants++;
     OSAddAtomic64(1, &gCntGrant); OSAddAtomic64((SInt64)want, &gCntGrantBytes);
+    if (offGate) OSAddAtomic64(1, &gVramOffgateAllocs);
     if (fVramGrantLogged < 16) { fVramGrantLogged++;
         FBLOGV("nvAllocVram #%u: %llu bytes REAL VRAM — kva %s phys <phys>  [BAR1 %llu / %llu]",
               fVramGrants, (unsigned long long)want, kva ? "set" : "null",
@@ -5436,6 +5544,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
             fWakeRetries = 0;
             __atomic_store_n(&fGpuLost, 0, __ATOMIC_RELEASE);
             __atomic_store_n(&gGpuResumeGraceUntil, 0, __ATOMIC_RELEASE);
+            vramAllocWaitIdle();
             if (fKms && fDev && vramPoolHasPending()) {
                 NVRMDisplayGate gate;
                 if (gate.valid() && vramPoolHasPending()) vramPoolDrain(fKms, fDev);

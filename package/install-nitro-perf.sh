@@ -138,9 +138,9 @@ CONF="$GB/nvmtl/nvrm610.conf"
 sed -i '' '/^# --- my settings, kept on update ---$/,/^# --- end my settings ---$/d' "$CONF"
 cat <<'EOF' >> "$CONF"
 # --- my settings, kept on update ---
-NVMTL_GSUB_INFLIGHT=4
+NVMTL_GSUB_INFLIGHT=8
 NVRM_EVENT_WAIT=1
-# NVRM_EVENT_WAIT_SPIN_US=80  # nitro-perf default: 20 us WindowServer, 80 us apps
+NVRM_EVENT_WAIT_SPIN_US=20
 NVMTL_SPVCACHE_MAX_MB=4096
 NVMTL_ANGLE_METAL=1
 NVMTL_GAME_GPU_PRIORITY=1
